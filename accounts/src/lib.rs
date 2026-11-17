@@ -2,3 +2,5 @@
 //!
 //! Stage 1: the contract lives in `nixxa-contracts`. The API-key / keychain credential
 //! store arrives in Stage 3; the multi-account and switching methods arrive in Stage 8.
+
+pub mod memory;
