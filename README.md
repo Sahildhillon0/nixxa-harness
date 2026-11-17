@@ -9,7 +9,9 @@ that connects to your memory, notes, code index and docs, the accounts module th
 logins and API keys, and the harness you look at.
 Replace one, and the rest never notice.
 
-> **Status: Stage 0 — Foundations.** Design documents and folder skeleton only. No code yet.
+> **Status: Stage 1 — Contracts.** Cargo workspace with all eight crates; the `contracts` crate
+> defines every type, trait, event and error, with conformance suites. Nothing to run yet —
+> the TUI arrives in Stage 2.
 
 ---
 
@@ -90,8 +92,8 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 
 | Stage | Name | Delivers | Status |
 |---|---|---|---|
-| 0 | Foundations | Repo, docs, folder skeleton | **in progress** |
-| 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | planned |
+| 0 | Foundations | Repo, docs, folder skeleton | done |
+| 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | **in progress** |
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | planned |
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | planned |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | planned |
@@ -102,6 +104,16 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 9 | Policy & control | Approval modes, budgets, interrupts, audit log | planned |
 | 10 | Every OS | Sandbox backends for macOS and Windows | planned |
 | 11 | Hardening & release | External tools, packaging, `v0.1.0` | planned |
+
+## Building
+
+```sh
+cargo build --workspace
+cargo test --workspace --all-features   # includes the conformance suites
+./scripts/check-deps.sh                 # the dependency rule (needs jq)
+```
+
+Requires Rust 1.85+ (edition 2024).
 
 ## Documents
 

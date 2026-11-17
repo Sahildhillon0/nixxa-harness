@@ -10,4 +10,4 @@ Runs the agent loop and is the only orchestrator: asks the brain, gates every ac
 | **Depends on** | `contracts` only |
 | **Comes alive** | Minimal in Stage 2, full policy in Stage 9 |
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. Crate exists but is empty until the stage above.

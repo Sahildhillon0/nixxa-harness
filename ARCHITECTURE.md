@@ -4,7 +4,8 @@ This document describes how Nixxa is put together: the modules, the contracts be
 how data flows, how the built-in integrations plug in, where the trust boundaries are, and the
 order in which it gets built.
 
-> No code exists yet (Stage 0). Type and trait names below are design intent, not API.
+> The contracts in §3 are implemented in `contracts/src/` (Stage 1). The Rust doc comments there
+> are the authoritative API; this document is the overview.
 
 ---
 
@@ -130,7 +131,7 @@ internal is `pub(crate)`.
 
 ---
 
-## 3. Contracts (planned)
+## 3. Contracts
 
 ### Core types
 
@@ -138,11 +139,13 @@ internal is `pub(crate)`.
 |---|---|
 | `SessionId`, `TurnId`, `ActionId` | Opaque identifiers |
 | `Message` | A conversation entry: role (user / agent / system / observation) + content |
-| `Context` | Everything the brain needs for one think step: messages, tool specs, primer, instructions, limits |
+| `Context` | Everything the brain needs for one think step: account, instructions, primer, messages, available sandbox action kinds, knowledge tool specs, limits |
+| `Content` | What a `Message` carries: text, a proposed `ActionRequest`, or an `Observation` — so the brain can rebuild tool-call history |
 | `Intent` | What the brain wants: `Say(text)`, `Act(Action)`, `Done(summary)` |
 | `Action` | `Sandbox(SandboxAction)` or `Knowledge(KnowledgeAction)` — the controller routes on this |
 | `SandboxAction` | `Exec`, `ReadFile`, `WriteFile`, `ListDir`, … |
-| `KnowledgeAction` | `Query { source, tool, args }` (read) or `Record { source, entry }` (write) |
+| `KnowledgeAction` | `Call { source, tool, args }` (a source's tool; its `ToolSpec.mutating` says whether it writes) or `Record { source, entry }` (structured write-back) |
+| `ToolSpec` | A knowledge tool: source, name, description, JSON-Schema input, `mutating` flag |
 | `Primer` | Context gathered at session start from knowledge sources (recent memory, project note) |
 | `AccountRef` | Which account to use: provider id + account label (e.g. `anthropic:work`). Not a secret |
 | `Credential` | A secret wrapper (`ApiKey`, `BearerToken`, `CloudProfile`, `None`) whose `Debug`/`Display` print `***`; zeroised on drop |
@@ -158,7 +161,7 @@ internal is `pub(crate)`.
 | `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset() |
 | `Store` | `db` | create/load session; append message; append action record; list/search sessions |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
-| `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs; primer(workspace) → `Primer`; query(action) → observation; record(entry) → ack |
+| `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
 | `ApprovalPort` | `harness` | ask the human about an action → `Verdict` |
 | `EventSink` | `harness` | receive `Event`s from the controller |
 
@@ -168,13 +171,29 @@ harness at construction and asks for a credential per request, so refresh and ac
 switching just work) and managed by the harness's accounts screen. The controller only ever
 sees `AccountRef`s, never secrets.
 
+### Conventions (pinned in Stage 1)
+- **Errors vs. outcomes:** a trait error means the infrastructure failed. An action that ran but
+  did not succeed (non-zero exit, missing file, path outside the workspace, denied) is an
+  `Observation` with `Outcome::Failed` / `Outcome::Denied`, because the agent must see it.
+- **Cancellation:** dropping a returned future or stream cancels the operation.
+- **Async traits** use `async-trait` so every module can be held as `Arc<dyn Trait>`.
+- **Secrets:** `Secret` and `Credential` are not serialisable and redact themselves in `Debug`,
+  so a credential cannot reach the db, an event or a log by accident.
+- **Wire format:** all other types are serde-serialisable with stable, tagged, snake_case JSON.
+- **Ids:** `ActionId` is assigned by the brain (usually the provider's tool-call id);
+  `SessionId` by the store; `TurnId` by the controller.
+
 ### Errors
 Each trait has its own error enum in `contracts` (e.g. `BrainError::RateLimited`,
 `SandboxError::Timeout`, `KnowledgeError::SourceUnavailable`, `CredentialsError::Expired`). Modules map internal errors
 into these; internal error types never leak across a boundary.
 
 ### Conformance tests
-`contracts` ships a test suite per trait. Any implementation (real or fake) must pass it.
+`contracts` ships a test suite per trait behind the `conformance` feature
+(`nixxa_contracts::conformance::{store,sandbox,knowledge,credentials,brain}::run`). Any
+implementation (real or fake) must pass it. The contracts crate's own tests prove each suite
+is satisfiable (in-memory reference implementations pass) and has teeth (deliberately broken
+ones fail).
 
 ---
 
@@ -278,7 +297,8 @@ Logseq, a team wiki) is a new folder under `knowledge/sources/` plus a config en
 
 | Action | LOCKED | ASK (default) | AUTO |
 |---|---|---|---|
-| Query (any source) | allow | allow | allow |
+| Call a non-mutating tool (any source) | allow | allow | allow |
+| Call a mutating tool | deny | ask | allow |
 | Record / write (claude-mem, vault) by the agent | deny | ask | allow |
 | Session-end write-back (configured by the user, not proposed by the agent) | per config | per config | per config |
 
@@ -426,11 +446,11 @@ nixxa-harness/
 
 Every stage ends with something that runs and a checklist that must be true before moving on.
 
-### Stage 0 — Foundations *(current)*
+### Stage 0 — Foundations *(done)*
 - Repo, README, ARCHITECTURE, DESIGN, AGENT, one folder per module with its own README.
 - **Exit:** docs agreed; module boundaries, integrations and stage plan accepted.
 
-### Stage 1 — Contracts
+### Stage 1 — Contracts *(current)*
 - Cargo workspace with eight crates (empty bodies except `contracts`).
 - All types, traits, events and error enums from §3, including `Knowledge` and the
   `Action` split, `Credentials`, `Credential` and `AccountRef`. Conformance test suites.

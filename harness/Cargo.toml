@@ -1,0 +1,23 @@
+[package]
+name = "nixxa-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+nixxa-accounts = { path = "../accounts" }
+nixxa-brain = { path = "../brain" }
+nixxa-contracts = { path = "../contracts" }
+nixxa-controller = { path = "../controller" }
+nixxa-db = { path = "../db" }
+nixxa-knowledge = { path = "../knowledge" }
+nixxa-sandbox = { path = "../sandbox" }
+
+[[bin]]
+name = "nixxa"
+path = "src/main.rs"

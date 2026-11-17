@@ -18,4 +18,4 @@ Runs on the host; never inside, or reachable from, the sandbox.
 | CodeGraph | on, if the workspace has `.codegraph/` | executable on `PATH` |
 | Context7 | on | remote MCP endpoint (optional API key from `accounts`) |
 
-See [ARCHITECTURE.md § 5](../ARCHITECTURE.md#5-integrations-the-knowledge-module). No code yet (Stage 0).
+See [ARCHITECTURE.md § 5](../ARCHITECTURE.md#5-integrations-the-knowledge-module). Crate exists but is empty until the stage above.

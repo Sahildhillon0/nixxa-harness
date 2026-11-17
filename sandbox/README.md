@@ -10,4 +10,4 @@ Executes an `Action` in isolation and returns an `Observation`. The only place a
 | **Depends on** | `contracts` only |
 | **Comes alive** | Fake in Stage 2, isolated out-of-process on Linux in Stage 4, macOS + Windows backends in Stage 10 |
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. Crate exists but is empty until the stage above.
