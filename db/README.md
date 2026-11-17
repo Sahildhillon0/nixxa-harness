@@ -1,6 +1,6 @@
 # db — remembers
 
-Persists and retrieves sessions, transcripts, action logs and memory.
+Persists and retrieves Nixxa's own sessions, transcripts and action logs. External memory (claude-mem, Obsidian) lives in `knowledge`.
 
 | | |
 |---|---|

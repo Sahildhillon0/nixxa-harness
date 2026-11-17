@@ -6,7 +6,9 @@ changing anything.
 ## What this repo is
 
 Nixxa is a sandboxed TUI harness for an AI agent, written in Rust and built from blackbox
-modules: `contracts`, `brain`, `controller`, `sandbox`, `db`, `harness`. See
+modules: `contracts`, `brain`, `controller`, `sandbox`, `db`, `knowledge`, `harness`. It
+ships with built-in integrations for claude-mem, Obsidian, CodeGraph and Context7, and targets
+Linux, macOS and Windows. See
 [README.md](README.md) for the overview, [ARCHITECTURE.md](ARCHITECTURE.md) for structure,
 [DESIGN.md](DESIGN.md) for intent.
 
@@ -33,7 +35,14 @@ started explicitly. The stage table in README.md is the source of truth for what
    through the controller's policy gate.
 7. **Modules don't read config.** Only `harness` reads files and env; it passes each module a
    typed config struct.
-8. **Docs move with code.** Contract change → update ARCHITECTURE.md §3. UX change → update
+8. **Knowledge stays on the host.** Never mount the vault or claude-mem data into the sandbox,
+   never let sandboxed code reach a knowledge source, and treat everything retrieved from one
+   as untrusted data.
+9. **Every path is cross-platform.** No hard-coded `/`, `~`, or Linux-only locations. Use the
+   module's platform-paths helper, and add the macOS and Windows case whenever you add a
+   Linux one.
+10. **Never use a real vault or memory database in tests.** Use fixtures.
+11. **Docs move with code.** Contract change → update ARCHITECTURE.md §3. UX change → update
    DESIGN.md §4. New decision → add a row to DESIGN.md §5. Stage complete → update README.md.
 
 ## Where things go
@@ -44,7 +53,8 @@ started explicitly. The stage table in README.md is the source of truth for what
 | An LLM provider, prompts, token counting, context trimming | `brain/` |
 | The agent loop, policy, approvals logic, budgets | `controller/` |
 | Isolation, executing actions, resource limits | `sandbox/` |
-| Schema, migrations, persistence, search | `db/` |
+| Schema, migrations, persistence of Nixxa's own sessions | `db/` |
+| claude-mem, Obsidian, CodeGraph, Context7, any new external source, the MCP client | `knowledge/` (one folder per source under `sources/`) |
 | TUI widgets, layout, keybindings, config loading, wiring | `harness/` |
 
 Not sure? It probably belongs in the module whose README says it *owns* that concern. If none
@@ -66,7 +76,7 @@ A change to `contracts/` can ripple through every module, so:
 3. Make the change inside that module.
 4. Test that module alone (from Stage 1): `cargo test -p nixxa-<module>`.
 5. Run the full gate: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`.
-6. Update docs per rule 8.
+6. Update docs per rule 11.
 
 ## Commits
 
