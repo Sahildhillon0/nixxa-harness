@@ -1,0 +1,29 @@
+[package]
+name = "nixxa-contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[features]
+conformance = ["dep:futures"]
+
+[dependencies]
+async-trait = { workspace = true }
+futures-core = { workspace = true }
+futures = { version = "0.3", optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+futures = { version = "0.3" }
+
+[lints]
+workspace = true
+
+[[test]]
+name = "conformance"
+required-features = ["conformance"]
