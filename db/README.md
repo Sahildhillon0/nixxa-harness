@@ -10,4 +10,4 @@ Persists and retrieves Nixxa's own sessions, transcripts and action logs. Extern
 | **Depends on** | `contracts` only |
 | **Comes alive** | In-memory in Stage 2, SQLite in Stage 5 |
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. Crate exists but is empty until the stage above.

@@ -1,0 +1,42 @@
+[workspace]
+resolver = "3"
+members = [
+    "contracts",
+    "brain",
+    "controller",
+    "sandbox",
+    "db",
+    "knowledge",
+    "accounts",
+    "harness",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.85"
+repository = "https://github.com/Sahildhillon0/nixxa-harness"
+publish = false
+
+[workspace.dependencies]
+nixxa-accounts = { path = "accounts" }
+nixxa-brain = { path = "brain" }
+nixxa-contracts = { path = "contracts" }
+nixxa-controller = { path = "controller" }
+nixxa-db = { path = "db" }
+nixxa-knowledge = { path = "knowledge" }
+nixxa-sandbox = { path = "sandbox" }
+async-trait = "0.1"
+futures = "0.3"
+futures-core = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+zeroize = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"

@@ -14,8 +14,8 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 0 — Foundations.** Only Markdown documents exist. Do not add code until Stage 1 is
-started explicitly. The stage table in README.md is the source of truth for what is in scope.
+**Stage 1 — Contracts.** The workspace and `contracts` crate exist; the other seven crates are
+deliberately empty. Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
 
@@ -80,8 +80,10 @@ A change to `contracts/` can ripple through every module, so:
 1. Check the current stage and its exit criteria (ARCHITECTURE.md § Stages).
 2. Read the README.md inside the module you're about to change.
 3. Make the change inside that module.
-4. Test that module alone (from Stage 1): `cargo test -p nixxa-<module>`.
-5. Run the full gate: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`.
+4. Test that module alone: `cargo test -p nixxa-<module> --all-features`. Every trait
+   implementation must have a test that runs its suite from `nixxa_contracts::conformance`.
+5. Run the full gate (what CI runs on Linux, macOS and Windows):
+   `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -- -D warnings && cargo test --workspace --all-features && ./scripts/check-deps.sh`
 6. Update docs per rule 12.
 
 ## Commits

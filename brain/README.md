@@ -10,4 +10,4 @@ Turns a `Context` into a stream of brain events ending in an `Intent` (say / act
 | **Depends on** | `contracts` only (gets `Credentials` from the harness) |
 | **Comes alive** | Fake in Stage 2, first provider in Stage 3, all providers in Stage 8 |
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. Crate exists but is empty until the stage above.

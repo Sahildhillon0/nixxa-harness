@@ -10,4 +10,4 @@ The `nixxa` binary: the ratatui TUI and the composition root that picks concrete
 | **Depends on** | all modules (wiring only) |
 | **Comes alive** | Stage 2 |
 
-See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. Crate exists but is empty until the stage above.

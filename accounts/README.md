@@ -20,4 +20,4 @@ accounts per provider), and hands out a valid credential on request.
 | Env | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … (read-only) |
 
 Never hands a credential to the sandbox; never lets one reach logs, the db, the vault,
-claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md#6-accounts-and-credentials). No code yet (Stage 0).
+claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md#6-accounts-and-credentials). Crate exists but is empty until the stage above.
