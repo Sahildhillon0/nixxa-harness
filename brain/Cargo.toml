@@ -10,4 +10,4 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-nixxa-contracts = { path = "../contracts" }
+nixxa-contracts = { workspace = true }

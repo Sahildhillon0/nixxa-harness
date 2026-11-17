@@ -10,13 +10,13 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-nixxa-accounts = { path = "../accounts" }
-nixxa-brain = { path = "../brain" }
-nixxa-contracts = { path = "../contracts" }
-nixxa-controller = { path = "../controller" }
-nixxa-db = { path = "../db" }
-nixxa-knowledge = { path = "../knowledge" }
-nixxa-sandbox = { path = "../sandbox" }
+nixxa-accounts = { workspace = true }
+nixxa-brain = { workspace = true }
+nixxa-contracts = { workspace = true }
+nixxa-controller = { workspace = true }
+nixxa-db = { workspace = true }
+nixxa-knowledge = { workspace = true }
+nixxa-sandbox = { workspace = true }
 
 [[bin]]
 name = "nixxa"
