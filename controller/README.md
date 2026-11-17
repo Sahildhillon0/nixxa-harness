@@ -1,0 +1,13 @@
+# controller — decides
+
+Runs the agent loop and is the only orchestrator: asks the brain, gates every action through policy, dispatches to the sandbox, records to the db, emits events.
+
+| | |
+|---|---|
+| **Owns** | Loop state machine, policy gate (allow / ask / deny), budgets, interrupts, retries |
+| **Does not own** | How thinking, execution, storage or rendering work |
+| **Contract** | Consumes `Brain`, `Sandbox`, `Store`, `ApprovalPort`, `EventSink` |
+| **Depends on** | `contracts` only |
+| **Comes alive** | Minimal in Stage 2, full policy in Stage 6 |
+
+See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).
