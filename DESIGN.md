@@ -29,6 +29,8 @@ rewriting them.
    default and found automatically on every OS, but they stay on the host, never enter the
    sandbox, and you can always see when their content is sent to the model.
 8. **Degrade, don't fail.** A missing integration is a dimmed indicator, not an error screen.
+9. **Bring any account.** Any provider, any integration, as many accounts as you have —
+   added in the TUI, kept in the OS keychain, switchable per session.
 
 ## 3. Non-goals (for now)
 
@@ -44,7 +46,7 @@ rewriting them.
 ### Layout
 
 ```
-┌ nixxa ── 7f3a ── <model> ── sandbox ● ── mem ● vault ● graph ○ docs ● ── 12 · $0.04 ┐
+┌ nixxa ─ 7f3a ─ anthropic:work · <model> ─ sandbox ● ─ mem ● vault ● graph ○ docs ● ─ $0.04 ┐
 │ Conversation                              │ Activity                               │
 │                                           │ ✓ mem    primer: 8 observations        │
 │ you   list the project and run the tests  │ ✓ vault  primer: Projects/nixxa.md     │
@@ -62,7 +64,7 @@ rewriting them.
 └ enter send · tab focus · ctrl-c interrupt · ? help ──────────────── mode: ASK ─────┘
 ```
 
-- **Status bar (top):** session, brain/model, sandbox state, knowledge sources
+- **Status bar (top):** session, active account and model (`provider:account · model`), sandbox state, knowledge sources
   (`mem` claude-mem, `vault` Obsidian, `graph` CodeGraph, `docs` Context7: `●` ready,
   `○` missing, `✗` error), budget used. Always visible.
 - **Conversation (left):** the dialogue, streaming token by token.
@@ -112,6 +114,7 @@ The mode is always shown in the hint bar and changeable with one key.
 | `y` / `n` | approve / deny in a prompt |
 | `ctrl-s` | session list |
 | `ctrl-k` | knowledge panel: source status, paths found, enable/disable per source |
+| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account |
 | `?` | help overlay |
 
 ### Visual language
@@ -123,6 +126,26 @@ The mode is always shown in the hint bar and changeable with one key.
 - Sandbox state is unmissable: `● isolated` in green, `○ NOT ISOLATED` in red (Stages 2–3).
 - When vault or memory content is about to be sent to the model, the activity line carries a
   `↑` marker, so leaving the machine is always visible.
+
+### Accounts screen
+
+```
+┌ Accounts ──────────────────────────────────────────────────────────────┐
+│ Provider     Account     Method     Status      Used today   Default   │
+│ anthropic    work        api key    ● valid     $1.82        ★         │
+│ anthropic    personal    api key    ● valid     $0.00                  │
+│ openai       env         env var    ● valid     $0.10                  │
+│ ollama       local       local      ○ offline   —                      │
+│ context7     default     api key    ● valid     —                      │
+│                                                                        │
+│ [n] new  [enter] use for this session  [d] set default  [v] validate   │
+│ [x] remove                                                             │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+Adding an account: pick provider → pick method (only the ones that provider supports) →
+paste key (masked) / open browser / choose cloud profile → Nixxa validates it → saved. Secrets
+are never shown again after entry, only their last four characters.
 
 ### Session write-back
 
@@ -148,20 +171,25 @@ Both appear in the activity pane as the last lines of the session.
 | D-005 | Sandbox runs out of process from Stage 4 | Real isolation needs a separate process; the trait hides the move. | 0 |
 | D-006 | SQLite first | Zero-setup, single file, plenty for one user; swappable later. | 0 |
 | D-007 | Only the harness reads config | Modules stay pure and testable; one source of truth. | 0 |
-| D-008 | Linux-first sandbox (bubblewrap + Landlock + seccomp); macOS and Windows backends in Stage 9 | Strongest unprivileged isolation available; other OS backends via the same trait. Where no backend exists, sandbox actions are disabled rather than run unisolated. | 0 |
+| D-008 | Linux-first sandbox (bubblewrap + Landlock + seccomp); macOS and Windows backends in Stage 10 | Strongest unprivileged isolation available; other OS backends via the same trait. Where no backend exists, sandbox actions are disabled rather than run unisolated. | 0 |
 | D-009 | New `knowledge` module for external memory/context sources | claude-mem, Obsidian, CodeGraph and Context7 are not Nixxa's own storage (`db`) and not execution (`sandbox`); one module with one adapter per source keeps each swappable. | 0 |
 | D-010 | claude-mem, Obsidian, CodeGraph, Context7 on by default, auto-detected on Linux/macOS/Windows | Useful with zero config; missing sources degrade to a dimmed indicator. | 0 |
 | D-011 | Knowledge sources run on the host and never in, or reachable from, the sandbox | Private notes and memory must not be exposed to code the agent runs. | 0 |
 | D-012 | Obsidian accessed as plain files, vault found via Obsidian's `obsidian.json` | No plugin, works with Obsidian closed, same logic on every OS. | 0 |
 | D-013 | CodeGraph used only when `.codegraph/` already exists | Indexing a repo is the user's decision. | 0 |
 | D-014 | Supported on Linux, macOS and Windows; CI on all three from Stage 1 | Cross-platform problems are cheapest to catch early. | 0 |
+| D-015 | New `accounts` module owns all credentials for every provider and integration, many accounts per provider | One place to add, store, refresh and audit secrets; providers and sources just ask for a credential. | 0 |
+| D-016 | Secrets in the OS keychain; encrypted-file fallback only; never plain text | Keys are the most sensitive thing Nixxa holds. | 0 |
+| D-017 | Subscription sign-in only where the provider officially permits third-party apps; Anthropic via API key or cloud accounts | Anthropic does not currently allow third-party products to offer claude.ai login without approval; we stay within each provider's terms. | 0 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
 ## 6. Open questions
 
-- Which LLM provider ships first in Stage 3, and how soon do local models matter?
-- User-added external tools (Stage 10): MCP only, or also a native plugin trait?
+- Which LLM provider ships first in Stage 3? (Leaning Anthropic via API key.)
+- Which providers, if any, permit third-party subscription sign-in at the time Stage 8 starts?
+- Should an account be pinnable per workspace (e.g. this repo always uses `anthropic:work`)?
+- User-added external tools (Stage 11): MCP only, or also a native plugin trait?
 - Sandbox network policy: off / allow-list / proxy-with-log?
 - Windows sandbox backend: AppContainer, WSL2, or container-only?
 - claude-mem write-back: how should Nixxa sessions be identified so they read naturally next to
@@ -183,11 +211,12 @@ Resolved: *long-term memory as its own module?* → yes, external memory lives i
 | 0 | Documents and an empty skeleton. |
 | 1 | `cargo build` works on Linux, macOS and Windows; nothing to run yet. |
 | 2 | `nixxa` opens the full TUI; a scripted fake agent walks through a conversation with approvals and fake knowledge lookups. |
-| 3 | A real model talks back and proposes actions; execution is still simulated. |
+| 3 | Paste an API key once; a real model talks back and proposes actions; execution is still simulated. |
 | 4 | Actions really run — inside an isolated sandbox (Linux). The status bar turns green. |
 | 5 | Sessions survive restarts; a session picker appears. |
 | 6 | `mem ●` and `vault ●` light up on their own. Sessions start knowing your past work and project notes, and end with a note in your vault. |
 | 7 | `graph ●` and `docs ●` light up. The agent navigates code by meaning and reads current docs. |
-| 8 | Approval modes, per-source privacy switches, budgets and an audit view; the agent can work unattended. |
-| 9 | The sandbox works on macOS and Windows too. |
-| 10 | Installable release on all three OSs, more models and tools. |
+| 8 | Add any number of accounts for any provider from the accounts screen; switch account or model mid-session. |
+| 9 | Approval modes, per-source privacy switches, budgets (per session and per account) and an audit view; the agent can work unattended. |
+| 10 | The sandbox works on macOS and Windows too. |
+| 11 | Installable release on all three OSs, more models and tools. |

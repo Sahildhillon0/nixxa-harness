@@ -8,6 +8,6 @@ Executes an `Action` in isolation and returns an `Observation`. The only place a
 | **Does not own** | Deciding what to run |
 | **Contract** | Implements `Sandbox` |
 | **Depends on** | `contracts` only |
-| **Comes alive** | Fake in Stage 2, isolated out-of-process on Linux in Stage 4, macOS + Windows backends in Stage 9 |
+| **Comes alive** | Fake in Stage 2, isolated out-of-process on Linux in Stage 4, macOS + Windows backends in Stage 10 |
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole. No code yet (Stage 0).

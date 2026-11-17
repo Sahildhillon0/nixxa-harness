@@ -10,7 +10,7 @@ order in which it gets built.
 
 ## 1. The core idea: blackbox modules
 
-Nixxa is seven folders. Six do work; one (`contracts/`) defines how they talk.
+Nixxa is eight folders. Seven do work; one (`contracts/`) defines how they talk.
 
 ```
                         ┌──────────────────────────┐
@@ -34,13 +34,19 @@ Nixxa is seven folders. Six do work; one (`contracts/`) defines how they talk.
                      │  (isolated)  │  └────────────┘
                      └──────────────┘
 
+          ┌────────────────────────────────────────────┐
+          │ accounts  (Credentials trait)               │  OS keychain; handed by the
+          │ consumed by brain + knowledge, managed      │  harness to brain and knowledge,
+          │ through the harness UI. Never the sandbox.  │  never to the sandbox
+          └────────────────────────────────────────────┘
+
              every arrow is a type or trait defined in  contracts/
 ```
 
 ### The dependency rule
 
 1. `contracts` depends on nothing in the workspace.
-2. `brain`, `controller`, `sandbox`, `db`, `knowledge` depend **only** on `contracts`.
+2. `brain`, `controller`, `sandbox`, `db`, `knowledge`, `accounts` depend **only** on `contracts`.
 3. `harness` depends on all of them, and is the **only** place concrete implementations are
    chosen and plugged together (the composition root).
 4. No module imports a sibling. Ever. If two modules need to share something, it goes into
@@ -104,6 +110,17 @@ internal is `pub(crate)`.
 - **Does not own:** deciding when to query or write (controller), Nixxa's own transcripts (db).
 - **Runs on the host, never in the sandbox.** Details in §5.
 
+### `accounts/` — holds the keys
+- **Job:** store every account and credential the user adds, for any model provider or
+  integration, and hand out a valid credential when asked.
+- **Owns:** the account registry (provider, label, auth method, default flag), secret storage in
+  the OS keychain, sign-in flows (browser PKCE / device code) where a provider permits them,
+  token refresh, key validation, env-var accounts, redaction helpers.
+- **Does not own:** calling the provider's model API (brain), deciding which account a
+  session uses (controller/harness), any UI (harness).
+- **Never** gives a credential to the sandbox, and never returns one in a form that could land
+  in a log or the model's context. Details in §6.
+
 ### `harness/` — shows and wires
 - **Job:** be the program the user runs.
 - **Owns:** the `main` binary, config loading, the ratatui TUI, input handling, approval
@@ -127,6 +144,8 @@ internal is `pub(crate)`.
 | `SandboxAction` | `Exec`, `ReadFile`, `WriteFile`, `ListDir`, … |
 | `KnowledgeAction` | `Query { source, tool, args }` (read) or `Record { source, entry }` (write) |
 | `Primer` | Context gathered at session start from knowledge sources (recent memory, project note) |
+| `AccountRef` | Which account to use: provider id + account label (e.g. `anthropic:work`). Not a secret |
+| `Credential` | A secret wrapper (`ApiKey`, `BearerToken`, `CloudProfile`, `None`) whose `Debug`/`Display` print `***`; zeroised on drop |
 | `Observation` | A result: output, error, timing, truncation flag, source |
 | `Verdict` | The policy gate's answer: `Allow`, `Ask(reason)`, `Deny(reason)` |
 | `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, turn done |
@@ -138,15 +157,20 @@ internal is `pub(crate)`.
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
 | `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset() |
 | `Store` | `db` | create/load session; append message; append action record; list/search sessions |
+| `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs; primer(workspace) → `Primer`; query(action) → observation; record(entry) → ack |
 | `ApprovalPort` | `harness` | ask the human about an action → `Verdict` |
 | `EventSink` | `harness` | receive `Event`s from the controller |
 
-The controller is the one consumer of all six. The harness constructs it with all six.
+The controller consumes `Brain`, `Sandbox`, `Store`, `Knowledge`, `ApprovalPort` and
+`EventSink`. `Credentials` is consumed by `brain` and `knowledge` (each gets it from the
+harness at construction and asks for a credential per request, so refresh and account
+switching just work) and managed by the harness's accounts screen. The controller only ever
+sees `AccountRef`s, never secrets.
 
 ### Errors
 Each trait has its own error enum in `contracts` (e.g. `BrainError::RateLimited`,
-`SandboxError::Timeout`, `KnowledgeError::SourceUnavailable`). Modules map internal errors
+`SandboxError::Timeout`, `KnowledgeError::SourceUnavailable`, `CredentialsError::Expired`). Modules map internal errors
 into these; internal error types never leak across a boundary.
 
 ### Conformance tests
@@ -260,11 +284,55 @@ Logseq, a team wiki) is a new folder under `knowledge/sources/` plus a config en
 
 ---
 
-## 6. Process model and trust boundaries
+## 6. Accounts and credentials
+
+Any account, any provider, any integration — and as many per provider as the user wants.
+
+### Auth methods
+
+| Method | Used for | Stored |
+|---|---|---|
+| `ApiKey` | Anthropic Console, OpenAI, Gemini, OpenRouter, Mistral, Groq, Context7, OpenAI-compatible endpoints | key in OS keychain |
+| `Cloud` | Bedrock, Vertex AI, Azure / Microsoft Foundry | a reference to the cloud's own profile/credentials (Nixxa does not copy them) |
+| `SignIn` | providers that officially allow third-party OAuth sign-in | access + refresh token in OS keychain; refreshed automatically |
+| `Local` | Ollama, LM Studio, llama.cpp | base URL only |
+| `Env` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … | not stored; read at startup, shown as a read-only account |
+
+Each brain provider adapter and each knowledge source declares which methods it accepts. The
+accounts module stays generic; a provider-specific sign-in flow lives in
+`accounts/src/methods/` and is enabled per provider.
+
+**Subscription logins.** A provider's consumer-subscription login is only implemented when the
+provider officially permits third-party apps to use it. Anthropic currently does not allow
+third-party products to offer claude.ai login without approval, so Anthropic models are
+reached through API keys or cloud accounts. Every new sign-in flow gets its terms checked and
+recorded in the DESIGN.md decision log before it is built.
+
+### Storage
+- **Secrets:** OS keychain via one cross-platform layer — Secret Service (Linux), Keychain
+  (macOS), Credential Manager (Windows). Entry name `nixxa/<provider>/<account>`.
+- **Headless Linux without a Secret Service:** fall back to an encrypted file in the data dir
+  (passphrase asked once per session), or env-var accounts. Never a plain-text file.
+- **Metadata** (provider, label, method, default, created/last-used): in config, no secrets.
+
+### Rules
+- Multiple accounts per provider; one marked default. A session records the `AccountRef` it
+  used; the user can switch account mid-session (takes effect on the next brain call).
+- Keys are validated on add with the cheapest call the provider offers.
+- Usage and cost are tracked **per account** (shown in the status bar and the accounts screen,
+  and used by Stage 9 budgets).
+- Credentials never reach: the sandbox, the model's context, the db, claude-mem, the vault,
+  logs, or crash reports. `Credential` redacts itself and is zeroised on drop.
+- Removing an account deletes its keychain entry and, for sign-in methods, revokes the token
+  where the provider supports it.
+
+---
+
+## 7. Process model and trust boundaries
 
 | Zone | Contains | Trust |
 |---|---|---|
-| Host process | harness, controller, brain, db, knowledge | trusted code, **untrusted brain output**, **untrusted retrieved content** |
+| Host process | harness, controller, brain, db, knowledge, accounts | trusted code, **untrusted brain output**, **untrusted retrieved content** |
 | Sandbox | sandbox runtime + everything the agent runs | **untrusted** |
 | External services | LLM provider, Context7 | receive only what the policy lets out |
 
@@ -277,7 +345,7 @@ Logseq, a team wiki) is a new folder under `knowledge/sources/` plus a config en
   them only through the controller.
 - **Your knowledge does go to the LLM provider** whenever it enters the context. The TUI shows
   when vault or memory content is being sent. A per-source "never send" switch is part of
-  Stage 8 policy.
+  Stage 9 policy.
 - **Secrets never enter the sandbox.** API keys live in the host process. The sandbox gets a
   clean environment.
 - **The sandbox enforces its own limits** (CPU, memory, wall time, output size, file system
@@ -289,14 +357,14 @@ Logseq, a team wiki) is a new folder under `knowledge/sources/` plus a config en
 - **Stage 4:** the sandbox moves out of process: a thin client launches `nixxa-sandboxd`
   inside bubblewrap + Landlock + seccomp (Linux) and talks to it over a framed protocol on
   stdio. **The trait does not change.**
-- **Stage 9:** backends for macOS (Seatbelt profile) and Windows (AppContainer or
+- **Stage 10:** backends for macOS (Seatbelt profile) and Windows (AppContainer or
   WSL2/container — see open questions). Until an OS has a backend, Nixxa runs there with
   sandbox actions **disabled** (chat and knowledge still work) unless a container runtime
   (Docker/Podman) is available as a fallback backend.
 
 ---
 
-## 7. Swap guide
+## 8. Swap guide
 
 | I want to… | Touch only |
 |---|---|
@@ -308,6 +376,8 @@ Logseq, a team wiki) is a new folder under `knowledge/sources/` plus a config en
 | Add a knowledge source (Notion, Logseq, a wiki…) | `knowledge/sources/<name>/` + config |
 | Change how the Obsidian vault is found or written to | `knowledge/sources/obsidian/` |
 | Add a new built-in sandbox action | `contracts` → `sandbox` → `controller` (policy) → `brain` (tool spec) |
+| Add a provider's sign-in method, or a new credential store | `accounts/` |
+| Add a model provider that needs a new kind of credential | `accounts/` (method) + `brain/providers/` (adapter) |
 | Change the look, layout or keybindings | `harness/` |
 | Replace the TUI with a web UI | new frontend crate implementing `ApprovalPort` + `EventSink`; nothing else |
 
@@ -315,7 +385,7 @@ If a change needs more than one row, it is a contract change — see [AGENT.md](
 
 ---
 
-## 8. Cross-cutting concerns
+## 9. Cross-cutting concerns
 
 - **Platforms:** Linux, macOS and Windows from Stage 1 (CI matrix on all three). All paths go
   through one platform-paths helper per module (home, config and data dirs); no hard-coded
@@ -335,17 +405,18 @@ If a change needs more than one row, it is a contract change — see [AGENT.md](
 
 ---
 
-## 9. Planned workspace layout
+## 10. Planned workspace layout
 
 ```
 nixxa-harness/
-├── Cargo.toml              # [workspace] members = all seven
+├── Cargo.toml              # [workspace] members = all eight
 ├── contracts/   → crate nixxa-contracts   (lib)
 ├── brain/       → crate nixxa-brain       (lib)   brain/src/providers/<name>/
 ├── controller/  → crate nixxa-controller  (lib)   controller/src/policy/
 ├── sandbox/     → crate nixxa-sandbox     (lib + bin nixxa-sandboxd)  sandbox/src/backends/<os>/
 ├── db/          → crate nixxa-db          (lib)   db/migrations/
 ├── knowledge/   → crate nixxa-knowledge   (lib)   knowledge/src/{mcp,sources/<name>}/
+├── accounts/    → crate nixxa-accounts    (lib)   accounts/src/{store,methods/<name>}/
 └── harness/     → crate nixxa-harness     (bin `nixxa`)   harness/src/tui/
 ```
 
@@ -360,9 +431,9 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **Exit:** docs agreed; module boundaries, integrations and stage plan accepted.
 
 ### Stage 1 — Contracts
-- Cargo workspace with seven crates (empty bodies except `contracts`).
+- Cargo workspace with eight crates (empty bodies except `contracts`).
 - All types, traits, events and error enums from §3, including `Knowledge` and the
-  `Action` split. Conformance test suites.
+  `Action` split, `Credentials`, `Credential` and `AccountRef`. Conformance test suites.
 - CI on Linux, macOS and Windows: fmt, clippy (`-D warnings`), test, dependency-rule check.
 - **Exit:** workspace builds on all three OSs; CI fails if any crate imports a sibling.
 
@@ -370,14 +441,18 @@ Every stage ends with something that runs and a checklist that must be true befo
 - Harness: ratatui app with conversation pane, activity pane, input line, status bar
   (including knowledge-source indicators).
 - Controller: the loop from §4 with routing; policy = "ask for everything".
-- Fakes: scripted brain, echo sandbox, in-memory store, fake knowledge source.
+- Fakes: scripted brain, echo sandbox, in-memory store, fake knowledge source, in-memory
+  credentials.
 - **Exit:** type a message, watch a fake agent query fake knowledge and propose a sandbox
   action, approve it, see the observation — end to end, every module in place.
 
 ### Stage 3 — Real brain
-- First real provider with streaming and tool calling; API key from config/env.
+- First real provider with streaming and tool calling.
+- `accounts` comes alive: add an API key from the TUI (stored in the OS keychain) or use an env
+  var; one account per provider for now.
 - Token counting and context-window trimming.
-- **Exit:** a real model chats and proposes real actions (still executed by fakes).
+- **Exit:** a real model chats and proposes real actions (still executed by fakes); the key
+  survives a restart without ever being written to a plain-text file.
 
 ### Stage 4 — Real sandbox (Linux)
 - `nixxa-sandboxd` out of process, bubblewrap + Landlock + seccomp, network off, workspace
@@ -402,23 +477,36 @@ Every stage ends with something that runs and a checklist that must be true befo
 ### Stage 7 — Knowledge II: code & docs (CodeGraph + Context7)
 - CodeGraph: detect `.codegraph/`, explore/symbol/call-path tools, user-triggered indexing
   command, clear health errors.
-- Context7: resolve-library and query-docs tools, optional API key.
+- Context7: resolve-library and query-docs tools, optional API key from `accounts`.
 - **Exit:** in an indexed repo the agent answers "who calls X" via CodeGraph instead of grep,
   and looks up current docs for a named library via Context7, with both calls visible in the
   activity pane.
 
-### Stage 8 — Policy & control
+### Stage 8 — Accounts & providers
+- Provider adapters: Anthropic, OpenAI, Google Gemini, OpenRouter, Mistral, Groq, any
+  OpenAI-compatible endpoint, local (Ollama / LM Studio), and cloud routes (Bedrock, Vertex
+  AI, Azure / Microsoft Foundry).
+- Multiple accounts per provider, default account, per-session and mid-session switching.
+- Sign-in (OAuth) flows for providers whose terms allow third-party apps; each recorded in the
+  decision log.
+- Encrypted-file fallback for headless Linux; token refresh and revocation.
+- Accounts screen in the TUI; per-account usage and cost.
+- **Exit:** add two accounts for one provider and one for another, switch between them in a
+  single session, restart, and everything is still there — on Linux, macOS and Windows — with
+  a test proving no secret appears in logs, the db, or the model's context.
+
+### Stage 9 — Policy & control
 - Approval modes (locked / ask / autonomous), per-action and per-source rules (including
-  "never send this source to the provider"), budgets (steps, tokens, time, cost), interrupt,
-  audit log view.
+  "never send this source to the provider"), budgets (steps, tokens, time, cost — per session
+  and per account), interrupt, audit log view.
 - **Exit:** the agent can run unattended within a budget and stops cleanly at the limit.
 
-### Stage 9 — Every OS
+### Stage 10 — Every OS
 - Sandbox backends for macOS and Windows; container fallback backend.
 - **Exit:** the Stage 4 escape tests pass on all three OSs (or sandbox actions are clearly
   disabled where no backend is available).
 
-### Stage 10 — Hardening & release
-- More providers, user-added MCP tools, config UX, packaging (Linux, macOS, Windows), docs
+### Stage 11 — Hardening & release
+- User-added MCP tools, config UX, packaging (Linux, macOS, Windows), docs
   site, first release.
 - **Exit:** `v0.1.0` tagged and installable on all three OSs.

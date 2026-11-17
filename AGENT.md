@@ -6,7 +6,7 @@ changing anything.
 ## What this repo is
 
 Nixxa is a sandboxed TUI harness for an AI agent, written in Rust and built from blackbox
-modules: `contracts`, `brain`, `controller`, `sandbox`, `db`, `knowledge`, `harness`. It
+modules: `contracts`, `brain`, `controller`, `sandbox`, `db`, `knowledge`, `accounts`, `harness`. It
 ships with built-in integrations for claude-mem, Obsidian, CodeGraph and Context7, and targets
 Linux, macOS and Windows. See
 [README.md](README.md) for the overview, [ARCHITECTURE.md](ARCHITECTURE.md) for structure,
@@ -29,8 +29,9 @@ started explicitly. The stage table in README.md is the source of truth for what
    — not even "just the interface". Note the idea under Open questions in DESIGN.md instead.
 4. **Keep the public surface tiny.** A module exports its contract implementation and a
    constructor. Everything else is `pub(crate)` or private.
-5. **Secrets never cross into the sandbox.** No API keys, tokens or host env vars in anything
-   passed to `sandbox`.
+5. **Secrets go through `accounts` only.** Never read an API key from anywhere else, never
+   pass one to `sandbox`, never log it, store it in the db/vault/claude-mem, or put it in the
+   model's context. Use the `Credential` type, which redacts itself.
 6. **Brain output is untrusted.** Never execute anything the brain proposes without it going
    through the controller's policy gate.
 7. **Modules don't read config.** Only `harness` reads files and env; it passes each module a
@@ -41,8 +42,12 @@ started explicitly. The stage table in README.md is the source of truth for what
 9. **Every path is cross-platform.** No hard-coded `/`, `~`, or Linux-only locations. Use the
    module's platform-paths helper, and add the macOS and Windows case whenever you add a
    Linux one.
-10. **Never use a real vault or memory database in tests.** Use fixtures.
-11. **Docs move with code.** Contract change → update ARCHITECTURE.md §3. UX change → update
+10. **Never use a real vault, memory database or real credentials in tests.** Use fixtures and
+    the in-memory credentials fake.
+11. **Respect provider terms.** Don't add a sign-in method (especially subscription logins)
+    unless the provider officially allows third-party apps to use it; record the decision in
+    DESIGN.md §5.
+12. **Docs move with code.** Contract change → update ARCHITECTURE.md §3. UX change → update
    DESIGN.md §4. New decision → add a row to DESIGN.md §5. Stage complete → update README.md.
 
 ## Where things go
@@ -55,6 +60,7 @@ started explicitly. The stage table in README.md is the source of truth for what
 | Isolation, executing actions, resource limits | `sandbox/` |
 | Schema, migrations, persistence of Nixxa's own sessions | `db/` |
 | claude-mem, Obsidian, CodeGraph, Context7, any new external source, the MCP client | `knowledge/` (one folder per source under `sources/`) |
+| Accounts, API keys, sign-in flows, keychain storage, token refresh | `accounts/` |
 | TUI widgets, layout, keybindings, config loading, wiring | `harness/` |
 
 Not sure? It probably belongs in the module whose README says it *owns* that concern. If none
@@ -76,7 +82,7 @@ A change to `contracts/` can ripple through every module, so:
 3. Make the change inside that module.
 4. Test that module alone (from Stage 1): `cargo test -p nixxa-<module>`.
 5. Run the full gate: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace`.
-6. Update docs per rule 11.
+6. Update docs per rule 12.
 
 ## Commits
 

@@ -5,7 +5,8 @@
 Nixxa runs an AI agent **inside a sandbox** and lets you drive and watch it from a **TUI**.
 Every part of the system is a sealed module behind a contract: the brain that thinks, the
 controller that decides, the sandbox that acts, the db that remembers, the knowledge layer
-that connects to your memory, notes, code index and docs, and the harness you look at.
+that connects to your memory, notes, code index and docs, the accounts module that holds your
+logins and API keys, and the harness you look at.
 Replace one, and the rest never notice.
 
 > **Status: Stage 0 — Foundations.** Design documents and folder skeleton only. No code yet.
@@ -22,11 +23,12 @@ Replace one, and the rest never notice.
 | `sandbox/` | Sandbox | Executes actions in isolation and returns observations. The only place commands run. | `contracts` |
 | `db/` | DB | Persists Nixxa's own sessions, transcripts and action logs. | `contracts` |
 | `knowledge/` | Knowledge | Connects to external memory and context: claude-mem, Obsidian vault, CodeGraph, Context7. | `contracts` |
+| `accounts/` | Accounts | Holds every account and API key (any provider, any integration, many per provider) in the OS keychain and hands out credentials on request. | `contracts` |
 | `harness/` | Harness | The TUI and the composition root: wires concrete modules together and renders events. | everything (wiring only) |
 
 The rule that makes this work: **modules talk only through `contracts/`**. No module imports
 a sibling. Want a new LLM provider? Touch `brain/`. Postgres instead of SQLite? Touch `db/`.
-Notion instead of Obsidian? Touch `knowledge/`. Details in [ARCHITECTURE.md](ARCHITECTURE.md).
+Notion instead of Obsidian? Touch `knowledge/`. New way to sign in? Touch `accounts/`. Details in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 ```
 nixxa-harness/
@@ -36,6 +38,7 @@ nixxa-harness/
 ├── sandbox/       # acts (isolated)
 ├── db/            # remembers (Nixxa's own sessions)
 ├── knowledge/     # connects (claude-mem, Obsidian, CodeGraph, Context7)
+├── accounts/      # holds logins + API keys (OS keychain)
 ├── harness/       # shows + wires (TUI binary)
 ├── README.md
 ├── ARCHITECTURE.md
@@ -55,6 +58,31 @@ the status bar and carries on without it.
 | **CodeGraph** | Semantic code navigation of the workspace: symbols, source, call paths | CodeGraph MCP server / CLI, run against the workspace, only when a `.codegraph/` index exists | 7 |
 | **Context7** | Current, version-specific library documentation | Context7 MCP server | 7 |
 
+## Accounts
+
+Bring any account you have. Every model provider and every integration that needs a credential
+goes through one place, and you can keep several accounts per provider (e.g. *work* and
+*personal*) and switch between them per session.
+
+| Kind | Examples | How you add it |
+|---|---|---|
+| API key | Anthropic, OpenAI, Google Gemini, OpenRouter, Mistral, Groq, Context7, any OpenAI-compatible endpoint | paste the key (masked), Nixxa validates it with a cheap test call |
+| Cloud account | Anthropic or other models via AWS Bedrock, Google Vertex AI, Azure / Microsoft Foundry | use the cloud's own credentials/profile |
+| Sign-in (OAuth) | Providers that officially allow third-party apps to sign in | browser or device-code login, tokens refreshed automatically |
+| Local | Ollama, LM Studio, llama.cpp server | base URL, no secret |
+| Environment | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … | picked up automatically as a read-only account |
+
+Secrets live in the OS keychain (Linux Secret Service, macOS Keychain, Windows Credential
+Manager), never in plain-text config, never in logs, never in the sandbox, never in the model's
+context.
+
+> **Note on subscription logins:** signing in with a consumer subscription (e.g. a Claude
+> Pro/Max plan) is only offered where the provider officially permits third-party apps to use
+> it. Anthropic currently does not allow third-party products to offer claude.ai login without
+> its approval, so for Anthropic models Nixxa uses API keys (Anthropic Console) or cloud
+> accounts. Each provider's sign-in options are checked against its terms when its adapter is
+> built.
+
 ## Roadmap
 
 Nixxa is built in stages. Each stage ends with something that runs, and has explicit exit
@@ -65,14 +93,15 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 0 | Foundations | Repo, docs, folder skeleton | **in progress** |
 | 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | planned |
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | planned |
-| 3 | Real brain | First LLM provider, streaming, context-window management | planned |
+| 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | planned |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | planned |
 | 5 | Real memory | SQLite store, session resume, transcript search | planned |
 | 6 | Knowledge I — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
 | 7 | Knowledge II — code & docs | **CodeGraph** + **Context7** | planned |
-| 8 | Policy & control | Approval modes, budgets, interrupts, audit log | planned |
-| 9 | Every OS | Sandbox backends for macOS and Windows | planned |
-| 10 | Hardening & release | More providers, external tools, packaging, `v0.1.0` | planned |
+| 8 | Accounts & providers | All major providers, multiple accounts per provider, cloud accounts, sign-in where permitted, account switcher, per-account usage | planned |
+| 9 | Policy & control | Approval modes, budgets, interrupts, audit log | planned |
+| 10 | Every OS | Sandbox backends for macOS and Windows | planned |
+| 11 | Hardening & release | External tools, packaging, `v0.1.0` | planned |
 
 ## Documents
 
@@ -83,7 +112,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 ## Planned stack
 
 Rust (Cargo workspace, one crate per module) · [ratatui](https://ratatui.rs) + crossterm ·
-tokio · SQLite · MCP (stdio + HTTP) · Linux sandbox: bubblewrap / Landlock / seccomp.
+tokio · SQLite · MCP (stdio + HTTP) · OS keychain (`keyring`) · Linux sandbox: bubblewrap / Landlock / seccomp.
 Targets Linux, macOS and Windows.
 
 ## License
