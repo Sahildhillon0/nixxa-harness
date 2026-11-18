@@ -16,7 +16,10 @@ use crate::ports::UiEvent;
 use crate::settings::Settings;
 use crate::setup::Setup;
 use crate::wiring::{self, Models};
-use crate::{logging, paths, ui};
+use crate::{browser, logging, paths, ui};
+use nixxa_accounts::methods::SignInError;
+use nixxa_accounts::methods::openrouter::{OpenRouterConfig, OpenRouterSignIn};
+use nixxa_contracts::{Credential, Secret};
 
 /// How long quitting waits for the controller to end the session.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
@@ -48,6 +51,15 @@ fn start_session(
     Session { commands, task, account }
 }
 
+/// A sign-in problem, in words for the setup screen.
+fn sign_in_words(err: &SignInError) -> String {
+    let mut words = err.to_string();
+    if let Some(first) = words.get_mut(0..1) {
+        first.make_ascii_uppercase();
+    }
+    words
+}
+
 /// Ends a session in the background (the controller emits `SessionEnded`).
 fn end_session(session: Session) {
     tokio::spawn(async move {
@@ -70,6 +82,9 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     let mut session: Option<Session> = None;
     let mut models: Option<Arc<Models>> = None;
+    // The running OpenRouter sign-in, and the key it produced until a model is chosen.
+    let mut sign_in: Option<JoinHandle<()>> = None;
+    let mut signed_in_key: Option<Secret> = None;
     if settings.fake {
         tracing::info!(brain = "scripted", "using the fake brain");
         let (brain, account) = wiring::scripted();
@@ -132,6 +147,41 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     events.push(event);
                 }
                 for event in events {
+                    match &event {
+                        UiEvent::SignInStarted(Ok(url)) => {
+                            let opened = browser::open(url);
+                            if let Some(setup) = app.setup.as_mut() {
+                                setup.sign_in_started(url.clone(), opened);
+                            }
+                            continue;
+                        }
+                        UiEvent::SignInStarted(Err(why)) | UiEvent::SignedIn(Err(why)) => {
+                            tracing::warn!("OpenRouter sign-in failed");
+                            if let Some(setup) = app.setup.as_mut() {
+                                setup.failed(why);
+                            }
+                            continue;
+                        }
+                        UiEvent::SignedIn(Ok(key)) => {
+                            tracing::info!("OpenRouter sign-in finished");
+                            signed_in_key = Some(key.clone());
+                            if let Some(setup) = app.setup.as_mut() {
+                                setup.signed_in();
+                            }
+                            if let Some(found) = models.clone() {
+                                let (ui_tx, key) = (ui_tx.clone(), key.clone());
+                                tokio::spawn(async move {
+                                    let result = found.list_openrouter_models(&key).await;
+                                    let _ = ui_tx.send(UiEvent::ModelsListed(result));
+                                });
+                            }
+                            continue;
+                        }
+                        UiEvent::AccountSaved(Ok(info)) if info.account.provider.as_str() == wiring::OPENROUTER => {
+                            signed_in_key = None;
+                        }
+                        _ => {}
+                    }
                     let saved = match (&event, &models) {
                         (UiEvent::AccountSaved(Ok(info)), Some(found)) => Some((info.account.clone(), found.clone())),
                         _ => None,
@@ -194,6 +244,53 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         });
                     }
                 }
+                Effect::StartSignIn => {
+                    if let Some(old) = sign_in.take() {
+                        old.abort();
+                    }
+                    signed_in_key = None;
+                    tracing::info!("OpenRouter sign-in started");
+                    let ui_tx = ui_tx.clone();
+                    sign_in = Some(tokio::spawn(async move {
+                        let started = match OpenRouterSignIn::new(OpenRouterConfig::default()) {
+                            Ok(flow) => flow.start().await,
+                            Err(err) => Err(err),
+                        };
+                        let pending = match started {
+                            Ok((url, pending)) => {
+                                let _ = ui_tx.send(UiEvent::SignInStarted(Ok(url)));
+                                pending
+                            }
+                            Err(err) => {
+                                let _ = ui_tx.send(UiEvent::SignInStarted(Err(sign_in_words(&err))));
+                                return;
+                            }
+                        };
+                        let result = match pending.finish().await {
+                            Ok(Credential::BearerToken { token, .. }) => Ok(token),
+                            Ok(_) => Err("OpenRouter answered with an unexpected credential.".to_string()),
+                            Err(err) => Err(sign_in_words(&err)),
+                        };
+                        let _ = ui_tx.send(UiEvent::SignedIn(result));
+                    }));
+                }
+                Effect::CancelSignIn => {
+                    if let Some(task) = sign_in.take() {
+                        task.abort();
+                        tracing::info!("OpenRouter sign-in cancelled");
+                    }
+                    signed_in_key = None;
+                }
+                Effect::SaveOpenRouter { model } => match (models.clone(), signed_in_key.clone()) {
+                    (Some(found), Some(key)) => {
+                        let ui_tx = ui_tx.clone();
+                        tokio::spawn(async move {
+                            let result = found.save_openrouter(key, &model).await;
+                            let _ = ui_tx.send(UiEvent::AccountSaved(result));
+                        });
+                    }
+                    _ => app.account_saved(&Err("The sign-in expired; sign in again.".into())),
+                },
                 Effect::Quit => quit = true,
             }
         }
@@ -232,5 +329,7 @@ fn receive(app: &mut App, event: UiEvent) {
         UiEvent::Approval(prompt) => app.ask(prompt),
         UiEvent::AccountSaved(result) => app.account_saved(&result),
         UiEvent::ModelsListed(result) => app.models_listed(result),
+        // Handled in the loop, which holds the sign-in state.
+        UiEvent::SignInStarted(_) | UiEvent::SignedIn(_) => {}
     }
 }

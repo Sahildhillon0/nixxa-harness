@@ -21,7 +21,18 @@ pub(crate) const LM_STUDIO_URL: &str = "http://localhost:1234/v1";
 pub(crate) const OLLAMA_URL: &str = "http://localhost:11434/v1";
 
 /// The choices on the first step, in order.
-pub(crate) const CHOICES: [&str; 2] = ["Anthropic API key", "Local model"];
+pub(crate) const CHOICES: [&str; 3] = ["Anthropic API key", "Local model", "Sign in with OpenRouter"];
+
+/// What the user must accept before signing in with OpenRouter.
+pub(crate) const PRIVACY_NOTICE: [&str; 3] = [
+    "Everything in the conversation goes to OpenRouter and the model's host: files the agent reads from your workspace, your notes and memory.",
+    "Free models may log your prompts or train on them.",
+    "Don't use it with private code or anything you wouldn't share.",
+];
+
+/// The reminder on OpenRouter's model picker.
+pub(crate) const PRIVACY_SHORT: &str =
+    "Your conversation goes to OpenRouter and the model's host; free models may log or train on it.";
 
 /// Where a form is.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,20 +71,68 @@ pub(crate) struct UrlForm {
     pub(crate) state: SetupState,
 }
 
-/// The local model picker: the server's chat models.
+/// Whose models a picker shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Source {
+    Local,
+    OpenRouter,
+}
+
+/// A model picker: a server's usable models, filtered by what's typed.
 pub(crate) struct ModelPicker {
+    pub(crate) source: Source,
+    /// The local server's URL (local pickers).
     pub(crate) url: String,
     pub(crate) models: Vec<ModelInfo>,
+    /// Typed text narrowing the list (case-insensitive substring).
+    pub(crate) filter: String,
+    /// Index into [`ModelPicker::visible`].
     pub(crate) selected: usize,
     pub(crate) state: SetupState,
 }
 
+impl ModelPicker {
+    fn new(source: Source, url: String, models: Vec<ModelInfo>) -> Self {
+        Self { source, url, models, filter: String::new(), selected: 0, state: SetupState::Editing }
+    }
+
+    /// The models matching the filter.
+    pub(crate) fn visible(&self) -> Vec<&ModelInfo> {
+        let filter = self.filter.to_lowercase();
+        self.models.iter().filter(|m| m.id.to_lowercase().contains(&filter)).collect()
+    }
+}
+
+/// Waiting for the browser to come back from OpenRouter.
+pub(crate) struct SignInWait {
+    /// The page to open; `None` until the listener is up.
+    pub(crate) url: Option<String>,
+    /// Whether the browser was opened for the user.
+    pub(crate) browser_opened: bool,
+    /// `Checking` while waiting for the browser or loading models.
+    pub(crate) state: SetupState,
+    /// Signed in; the models are loading.
+    pub(crate) signed_in: bool,
+}
+
+impl SignInWait {
+    fn new() -> Self {
+        Self { url: None, browser_opened: false, state: SetupState::Checking, signed_in: false }
+    }
+}
+
 /// One step of the setup screen.
 pub(crate) enum Step {
-    Choose { selected: usize },
+    Choose {
+        selected: usize,
+    },
     Key(KeyForm),
     LocalUrl(UrlForm),
-    LocalModel(ModelPicker),
+    /// A picker of local or OpenRouter models.
+    Pick(ModelPicker),
+    /// OpenRouter's privacy notice, confirmed before sign-in.
+    OpenRouterNotice,
+    SigningIn(SignInWait),
 }
 
 /// The setup screen.
@@ -117,7 +176,9 @@ impl Setup {
             Step::Choose { .. } => None,
             Step::Key(form) => Some(&form.state),
             Step::LocalUrl(form) => Some(&form.state),
-            Step::LocalModel(picker) => Some(&picker.state),
+            Step::Pick(picker) => Some(&picker.state),
+            Step::OpenRouterNotice => None,
+            Step::SigningIn(wait) => Some(&wait.state),
         }
     }
 
@@ -132,12 +193,46 @@ impl Setup {
             Step::Choose { .. } => {}
             Step::Key(form) => form.state = failed,
             Step::LocalUrl(form) => form.state = failed,
-            Step::LocalModel(picker) => picker.state = failed,
+            Step::Pick(picker) => picker.state = failed,
+            Step::OpenRouterNotice => {}
+            Step::SigningIn(wait) => wait.state = failed,
         }
     }
 
-    /// The server's models arrived (or why not): move on to the picker, chat models only.
+    /// The sign-in listener is up: the page to open, and whether the browser opened it.
+    pub(crate) fn sign_in_started(&mut self, url: String, browser_opened: bool) {
+        if let Step::SigningIn(wait) = &mut self.step {
+            wait.url = Some(url);
+            wait.browser_opened = browser_opened;
+        }
+    }
+
+    /// The browser came back and a key was issued; the models are loading next.
+    pub(crate) fn signed_in(&mut self) {
+        if let Step::SigningIn(wait) = &mut self.step {
+            wait.signed_in = true;
+        }
+    }
+
+    /// A server's models arrived (or why not): move on to the picker, usable models only.
     pub(crate) fn models_listed(&mut self, result: Result<Vec<ModelInfo>, String>) {
+        if let Step::SigningIn(wait) = &mut self.step {
+            let models = match result {
+                Ok(models) => models,
+                Err(message) => {
+                    wait.state = SetupState::Failed(message);
+                    return;
+                }
+            };
+            // OpenRouter says which models can call tools; only those can act.
+            let usable: Vec<ModelInfo> = models.into_iter().filter(|m| m.supports_tools == Some(true)).collect();
+            if usable.is_empty() {
+                wait.state = SetupState::Failed("OpenRouter listed no model that can use tools.".into());
+                return;
+            }
+            self.step = Step::Pick(ModelPicker::new(Source::OpenRouter, String::new(), usable));
+            return;
+        }
         let Step::LocalUrl(form) = &mut self.step else { return };
         let models = match result {
             Ok(models) => models,
@@ -159,7 +254,7 @@ impl Setup {
             return;
         }
         let url = form.url.clone();
-        self.step = Step::LocalModel(ModelPicker { url, models: usable, selected: 0, state: SetupState::Editing });
+        self.step = Step::Pick(ModelPicker::new(Source::Local, url, usable));
     }
 
     /// Pasted text goes into the current text field.
@@ -177,14 +272,19 @@ impl Setup {
                 form.url.extend(text.chars().filter(|c| !c.is_control() && !c.is_whitespace()));
                 form.state = SetupState::Editing;
             }
-            Step::Choose { .. } | Step::LocalModel(_) => {}
+            Step::Pick(picker) => {
+                picker.filter.extend(text.chars().filter(|c| !c.is_control()));
+                picker.selected = 0;
+            }
+            Step::Choose { .. } | Step::OpenRouterNotice | Step::SigningIn(_) => {}
         }
     }
 
     /// Handles one key press.
     pub(crate) fn key(&mut self, key: KeyEvent) -> Outcome {
         let checking = self.checking();
-        if key.code == KeyCode::Esc && !checking {
+        // Waiting for the browser can always be cancelled.
+        if key.code == KeyCode::Esc && (!checking || matches!(self.step, Step::SigningIn(_))) {
             return self.back();
         }
         if checking {
@@ -199,11 +299,12 @@ impl Setup {
                 KeyCode::Char('2') => {
                     self.step = Step::LocalUrl(UrlForm { url: LM_STUDIO_URL.into(), state: SetupState::Editing })
                 }
+                KeyCode::Char('3') => self.step = Step::OpenRouterNotice,
                 KeyCode::Enter => {
-                    self.step = if *selected == 0 {
-                        Step::Key(KeyForm::new())
-                    } else {
-                        Step::LocalUrl(UrlForm { url: LM_STUDIO_URL.into(), state: SetupState::Editing })
+                    self.step = match *selected {
+                        0 => Step::Key(KeyForm::new()),
+                        1 => Step::LocalUrl(UrlForm { url: LM_STUDIO_URL.into(), state: SetupState::Editing }),
+                        _ => Step::OpenRouterNotice,
                     };
                 }
                 _ => {}
@@ -254,23 +355,52 @@ impl Setup {
                 }
                 _ => {}
             },
-            Step::LocalModel(picker) => match key.code {
-                KeyCode::Up | KeyCode::Char('k') => {
+            Step::Pick(picker) => match key.code {
+                KeyCode::Up => {
                     picker.selected = picker.selected.saturating_sub(1);
                     picker.state = SetupState::Editing;
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    picker.selected = (picker.selected + 1).min(picker.models.len().saturating_sub(1));
+                KeyCode::Down => {
+                    picker.selected = (picker.selected + 1).min(picker.visible().len().saturating_sub(1));
+                    picker.state = SetupState::Editing;
+                }
+                KeyCode::Char(c) if types_text(&key) => {
+                    picker.filter.push(c);
+                    picker.selected = 0;
+                    picker.state = SetupState::Editing;
+                }
+                KeyCode::Backspace => {
+                    picker.filter.pop();
+                    picker.selected = 0;
                     picker.state = SetupState::Editing;
                 }
                 KeyCode::Enter => {
-                    if let Some(model) = picker.models.get(picker.selected) {
-                        picker.state = SetupState::Checking;
-                        return Outcome::effect(Effect::SaveLocal { url: picker.url.clone(), model: model.id.clone() });
-                    }
+                    let Some(model) = picker.visible().get(picker.selected).map(|m| m.id.clone()) else {
+                        picker.state = SetupState::Failed("No model matches what you typed.".into());
+                        return Outcome::none();
+                    };
+                    picker.state = SetupState::Checking;
+                    let effect = match picker.source {
+                        Source::Local => Effect::SaveLocal { url: picker.url.clone(), model },
+                        Source::OpenRouter => Effect::SaveOpenRouter { model },
+                    };
+                    return Outcome::effect(effect);
                 }
                 _ => {}
             },
+            Step::OpenRouterNotice => {
+                if matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'Y')) {
+                    self.step = Step::SigningIn(SignInWait::new());
+                    return Outcome::effect(Effect::StartSignIn);
+                }
+            }
+            Step::SigningIn(wait) => {
+                // A failed sign-in can be tried again.
+                if key.code == KeyCode::Enter && matches!(wait.state, SetupState::Failed(_)) {
+                    *wait = SignInWait::new();
+                    return Outcome::effect(Effect::StartSignIn);
+                }
+            }
         }
         Outcome::none()
     }
@@ -281,7 +411,15 @@ impl Setup {
             Step::Choose { .. } => return Outcome { effects: Vec::new(), close: !self.first_run },
             Step::Key(_) => Step::Choose { selected: 0 },
             Step::LocalUrl(_) => Step::Choose { selected: 1 },
-            Step::LocalModel(picker) => Step::LocalUrl(UrlForm { url: picker.url.clone(), state: SetupState::Editing }),
+            Step::Pick(picker) if picker.source == Source::Local => {
+                Step::LocalUrl(UrlForm { url: picker.url.clone(), state: SetupState::Editing })
+            }
+            // Leaving OpenRouter's sign-in or picker forgets the sign-in (and the key held for it).
+            Step::Pick(_) | Step::SigningIn(_) => {
+                self.step = Step::Choose { selected: 2 };
+                return Outcome::effect(Effect::CancelSignIn);
+            }
+            Step::OpenRouterNotice => Step::Choose { selected: 2 },
         };
         Outcome::none()
     }
@@ -350,7 +488,7 @@ mod tests {
             model("no-tools-model", Some(false)),
             model("qwen3-8b", Some(true)),
         ]));
-        let Step::LocalModel(picker) = &setup.step else { panic!("the picker") };
+        let Step::Pick(picker) = &setup.step else { panic!("the picker") };
         let ids: Vec<_> = picker.models.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["openai/gpt-oss-20b", "qwen3-8b"]);
         setup.key(key(KeyCode::Down));
@@ -377,10 +515,81 @@ mod tests {
         setup.models_listed(Ok(vec![model("m", None)]));
         setup.key(key(KeyCode::Enter));
         setup.failed("`m` can't use tools.");
-        assert!(
-            matches!(&setup.step, Step::LocalModel(p) if p.state == SetupState::Failed("`m` can't use tools.".into()))
-        );
+        assert!(matches!(&setup.step, Step::Pick(p) if p.state == SetupState::Failed("`m` can't use tools.".into())));
         setup.key(key(KeyCode::Esc));
         assert!(matches!(&setup.step, Step::LocalUrl(f) if f.url == LM_STUDIO_URL));
+    }
+
+    fn openrouter_model(id: &str, tools: bool, free: bool) -> ModelInfo {
+        ModelInfo { id: id.into(), supports_tools: Some(tools), free: Some(free) }
+    }
+
+    #[test]
+    fn openrouter_asks_for_the_privacy_confirmation_before_signing_in() {
+        let mut setup = Setup::new(true);
+        setup.key(key(KeyCode::Char('3')));
+        assert!(matches!(setup.step, Step::OpenRouterNotice));
+        assert!(setup.key(key(KeyCode::Char('x'))).effects.is_empty(), "only an explicit yes starts it");
+        assert_eq!(setup.key(key(KeyCode::Char('y'))).effects, vec![Effect::StartSignIn]);
+        assert!(matches!(&setup.step, Step::SigningIn(wait) if wait.state == SetupState::Checking));
+    }
+
+    #[test]
+    fn waiting_for_the_browser_can_be_cancelled_and_a_failure_retried() {
+        let mut setup = Setup::new(false);
+        setup.key(key(KeyCode::Char('3')));
+        setup.key(key(KeyCode::Enter));
+        setup.sign_in_started("https://openrouter.ai/auth?x".into(), false);
+        assert!(matches!(&setup.step, Step::SigningIn(w) if w.url.is_some() && !w.browser_opened));
+        let outcome = setup.key(key(KeyCode::Esc));
+        assert_eq!(outcome.effects, vec![Effect::CancelSignIn], "esc works while waiting");
+        assert!(matches!(setup.step, Step::Choose { selected: 2 }));
+
+        setup.key(key(KeyCode::Enter));
+        setup.key(key(KeyCode::Char('y')));
+        setup.failed("Sign-in timed out; start it again");
+        assert_eq!(setup.key(key(KeyCode::Enter)).effects, vec![Effect::StartSignIn], "enter tries again");
+    }
+
+    #[test]
+    fn the_openrouter_picker_offers_only_tool_models_and_filters_as_you_type() {
+        let mut setup = Setup::new(true);
+        setup.key(key(KeyCode::Char('3')));
+        setup.key(key(KeyCode::Char('y')));
+        setup.signed_in();
+        setup.models_listed(Ok(vec![
+            openrouter_model("anthropic/claude-sonnet-5.5", true, false),
+            openrouter_model("vendor/chat-only", false, false),
+            openrouter_model("qwen/qwen3-coder:free", true, true),
+        ]));
+        let Step::Pick(picker) = &setup.step else { panic!("the picker") };
+        assert_eq!(picker.source, Source::OpenRouter);
+        assert_eq!(picker.models.len(), 2, "models without tools are left out");
+        for c in "qwen".chars() {
+            setup.key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            setup.key(key(KeyCode::Enter)).effects,
+            vec![Effect::SaveOpenRouter { model: "qwen/qwen3-coder:free".into() }]
+        );
+    }
+
+    #[test]
+    fn leaving_the_openrouter_picker_forgets_the_sign_in() {
+        let mut setup = Setup::new(false);
+        setup.key(key(KeyCode::Char('3')));
+        setup.key(key(KeyCode::Char('y')));
+        setup.models_listed(Ok(vec![openrouter_model("m", true, false)]));
+        assert_eq!(setup.key(key(KeyCode::Esc)).effects, vec![Effect::CancelSignIn]);
+    }
+
+    #[test]
+    fn a_filter_that_matches_nothing_says_so() {
+        let mut setup = Setup::local(false, LM_STUDIO_URL);
+        setup.key(key(KeyCode::Enter));
+        setup.models_listed(Ok(vec![model("qwen3-8b", None)]));
+        setup.key(key(KeyCode::Char('z')));
+        assert!(setup.key(key(KeyCode::Enter)).effects.is_empty());
+        assert_eq!(setup.state(), Some(&SetupState::Failed("No model matches what you typed.".into())));
     }
 }
