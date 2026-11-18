@@ -246,6 +246,36 @@ async fn only_api_keys_and_local_servers_are_stored_in_stage_3() {
 }
 
 #[tokio::test]
+async fn a_sign_in_key_is_stored_like_a_key_and_comes_back_as_a_bearer_token() {
+    let store = Arc::new(MemoryStore::default());
+    let account = AccountRef::new("openrouter", "default");
+    let token = Credential::BearerToken { token: Secret::new("sk-or-v1-signed-in-key-4d2e"), expires_at: None };
+    let info = over(&store, KeychainConfig::default()).add(account.clone(), token.clone()).await.unwrap();
+    assert_eq!(info.method, AuthMethod::SignIn);
+    assert_eq!(info.hint.as_deref(), Some("4d2e"));
+    assert_eq!(store.raw("nixxa/openrouter/default").as_deref(), Some("sk-or-v1-signed-in-key-4d2e"));
+    assert!(!store.raw(REGISTRY).unwrap().contains("signed-in-key"), "the registry holds no secret");
+
+    let relaunched = over(&store, KeychainConfig::default());
+    assert_eq!(relaunched.get(&account).await.unwrap(), token);
+    relaunched.validate(&account).await.unwrap();
+    assert!(!format!("{:?}", relaunched.get(&account).await.unwrap()).contains("signed-in-key"));
+    relaunched.remove(&account).await.unwrap();
+    assert_eq!(store.names(), vec!["nixxa/_registry"], "removing deletes the keychain entry");
+}
+
+#[tokio::test]
+async fn expiring_tokens_wait_for_refresh_support() {
+    let credentials = KeychainCredentials::in_memory(KeychainConfig::default());
+    let expiring = Credential::BearerToken {
+        token: Secret::new("sk-or-v1-expiring-0000"),
+        expires_at: Some(nixxa_contracts::Timestamp(1)),
+    };
+    let err = credentials.add(AccountRef::new("openrouter", "default"), expiring).await.unwrap_err();
+    assert!(matches!(err, CredentialsError::Unsupported(_)), "{err:?}");
+}
+
+#[tokio::test]
 async fn a_local_server_is_stored_without_a_secret_and_survives_a_restart() {
     let store = Arc::new(MemoryStore::default());
     let local = AccountRef::new("local", "default");

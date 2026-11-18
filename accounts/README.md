@@ -45,6 +45,14 @@ claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md
 - **Settings:** `setting` / `set_setting` keep small non-secret values next to the account list
   (e.g. which account to start with, a local account's model), so the harness needs no settings
   file (D-035). Never put a secret there.
+- **Sign-in (`methods/`):** `OpenRouterSignIn` runs OpenRouter's OAuth PKCE flow
+  (`start() -> (auth_url, Pending)`, then `Pending::finish().await -> Credential`). It uses a
+  provider-neutral PKCE helper (S256, `ring`) and a loopback listener: 127.0.0.1 only (and
+  `[::1]` on the same port), one request on `/callback`, 404 for anything else, a 5-minute
+  timeout, cancelled by dropping. Accounts opens no browser and draws nothing. The resulting key
+  is a `Credential::BearerToken` (no expiry) stored under `openrouter` with method `SignIn`, like
+  an API key. OpenRouter keys can only be revoked with a management key, so removing the account
+  deletes the keychain entry and the user revokes the key in OpenRouter's settings.
 - **Threading:** keychain calls run on tokio's blocking pool, so use it inside a tokio runtime.
 - **In memory:** `KeychainCredentials::in_memory` behaves the same but keeps everything in
   memory, for tests and offline demos.
