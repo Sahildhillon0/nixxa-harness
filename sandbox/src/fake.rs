@@ -118,7 +118,7 @@ mod tests {
         let sandbox = FakeSandbox::default();
         let id = ActionId::new("unit-reset");
         sandbox
-            .execute(id, SandboxAction::WriteFile { path: "keep.txt".into(), content: "kept".into() })
+            .execute(id.clone(), SandboxAction::WriteFile { path: "keep.txt".into(), content: "kept".into() })
             .await
             .expect("write");
         sandbox.reset().await.expect("reset");
