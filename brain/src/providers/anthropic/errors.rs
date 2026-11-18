@@ -3,17 +3,7 @@
 use nixxa_contracts::BrainError;
 use serde_json::Value;
 
-/// The longest provider message passed on.
-const MAX_MESSAGE: usize = 500;
-
-/// Removes the key from text that came back from the provider, and keeps it short.
-pub(crate) fn scrub(text: &str, key: &str) -> String {
-    let mut text = if key.len() >= 8 { text.replace(key, "***") } else { text.to_string() };
-    if text.chars().count() > MAX_MESSAGE {
-        text = text.chars().take(MAX_MESSAGE).collect::<String>() + "…";
-    }
-    text
-}
+use crate::providers::common::scrub;
 
 /// A non-200 response.
 pub(crate) fn from_status(status: u16, retry_after: Option<&str>, body: &[u8], key: &str) -> BrainError {

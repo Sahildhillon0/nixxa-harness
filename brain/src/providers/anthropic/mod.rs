@@ -2,14 +2,8 @@
 
 mod errors;
 mod pricing;
-#[cfg(feature = "replay")]
-pub(crate) mod replay;
 mod request;
-mod sse;
 mod stream;
-mod tools;
-mod transport;
-mod trim;
 
 #[cfg(test)]
 mod tests;
@@ -28,9 +22,13 @@ use nixxa_contracts::{
     CredentialsError, ProviderId, Secret,
 };
 
-use self::sse::SseParser;
 use self::stream::Decoder;
-use self::transport::{Http, Method, Request, Response, Transport, header};
+use crate::providers::common::history;
+use crate::providers::common::scrub;
+use crate::providers::common::sse::SseParser;
+use crate::providers::common::tools;
+use crate::providers::common::transport::{Http, Method, Request, Response, Transport, header};
+use crate::providers::common::trim;
 
 /// The model used when neither the config nor the context names one: the current Sonnet.
 pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
@@ -153,7 +151,7 @@ impl AnthropicBrain {
             .transport
             .send(Request { method: Method::Get, url, headers, body: None })
             .await
-            .map_err(|err| BrainError::Network(errors::scrub(&err, key.expose())))?;
+            .map_err(|err| BrainError::Network(scrub(&err, key.expose())))?;
         if response.status == 200 {
             return Ok(());
         }
@@ -194,7 +192,7 @@ impl AnthropicBrain {
     /// The request body for a context.
     fn body(&self, context: &Context, model: &str, fallback: bool) -> Result<(Value, tools::ToolMap), BrainError> {
         let (tool_definitions, map) = tools::build(context);
-        let system = request::system(&context.instructions, &context.primer);
+        let system = history::system(&context.instructions, &context.primer);
         let max_tokens = context.limits.max_output_tokens.unwrap_or(self.config.max_output_tokens);
         let tools_value = Value::Array(tool_definitions);
         let fixed = trim::estimate(&json!(system)) + trim::estimate(&tools_value);
@@ -256,7 +254,7 @@ impl Brain for AnthropicBrain {
             body: Some(body),
         };
         let response =
-            self.transport.send(request).await.map_err(|err| BrainError::Network(errors::scrub(&err, key.expose())))?;
+            self.transport.send(request).await.map_err(|err| BrainError::Network(scrub(&err, key.expose())))?;
         if response.status != 200 {
             return Err(error_response(response, key.expose()).await);
         }
@@ -323,4 +321,16 @@ fn decode(response: Response, decoder: Decoder) -> BrainStream {
             }
         }
     }))
+}
+
+#[cfg(feature = "replay")]
+impl AnthropicBrain {
+    /// A brain that answers from `replay` instead of the network.
+    pub fn replaying(
+        credentials: Arc<dyn Credentials>,
+        config: AnthropicConfig,
+        replay: &crate::providers::common::replay::Replay,
+    ) -> Self {
+        Self::with_transport(credentials, config, Arc::new(replay.clone()))
+    }
 }
