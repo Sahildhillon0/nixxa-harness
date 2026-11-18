@@ -50,9 +50,14 @@ pub(crate) struct Http {
 
 impl Http {
     pub(crate) fn new() -> Result<Self, String> {
+        Self::with_read_timeout(READ_TIMEOUT)
+    }
+
+    /// Like [`Http::new`], with a different longest silence while reading.
+    pub(crate) fn with_read_timeout(read_timeout: Duration) -> Result<Self, String> {
         let client = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
-            .read_timeout(READ_TIMEOUT)
+            .read_timeout(read_timeout)
             .user_agent(concat!("nixxa/", env!("CARGO_PKG_VERSION")))
             .build()
             .map_err(|err| format!("could not set up HTTPS: {}", describe(&err)))?;

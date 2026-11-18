@@ -2,3 +2,4 @@
 
 pub(crate) mod anthropic;
 pub(crate) mod common;
+pub(crate) mod openai_compat;
