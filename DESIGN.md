@@ -114,7 +114,7 @@ The mode is always shown in the hint bar and changeable with one key.
 | `y` / `n` | approve / deny in a prompt |
 | `ctrl-s` | session list |
 | `ctrl-k` | knowledge panel: source status, paths found, enable/disable per source |
-| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account (Stage 3: the API-key setup screen) |
+| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account (Stage 3: the setup screen: Anthropic key or local model) |
 | `?` | help overlay |
 
 ### Visual language
@@ -201,6 +201,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-032 | A turn that ends in an error drops its half-streamed answer from the screen | A refused or failed answer isn't an answer; the docs say to discard a refused partial. An interrupted turn still keeps what streamed, as before. | 3 |
 | D-033 | Local models go through one OpenAI-compatible brain (`OpenAiCompatBrain`) with `Credential::Local` accounts; the two providers share transport, SSE, tools, trimming and history code | LM Studio, Ollama and llama.cpp all serve the same Chat Completions API, so one provider covers them and later hosted OpenAI-compatible ones. The re-plan needs a Stage 3 exit that doesn't depend on an Anthropic key. | 3 |
 | D-034 | A local-server account stores no secret: its base URL is the registry hint; a key is never sent over plain http to another machine | A base URL isn't secret, and local servers need no auth. Sending a bearer key in clear text across a network would leak it. | 3 |
+| D-035 | Small non-secret settings (`active_account`, a local account's `model.<account>`) live in the keychain account registry (`KeychainCredentials::setting` / `set_setting`) | It keeps the harness file-free like the accounts (D-022) without a contract change: `AccountInfo` has no model field, and which account to start with is per installation. Never secrets. | 3 |
+| D-036 | Nixxa starts with the account set up last; setting up an account switches to it at once in a new session (except rotating the key of the account in use) | Setting up a local model and then still talking to Claude would surprise; the conversation isn't persisted yet (Stage 5), so a new session loses nothing that could be kept. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 

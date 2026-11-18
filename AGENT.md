@@ -19,10 +19,9 @@ Linux, macOS and Windows. See
   - Claude (`AnthropicBrain`) with keys in the OS keychain (`KeychainCredentials`);
   - the OpenAI-compatible provider for local models (`OpenAiCompatBrain`, `Credential::Local`
     accounts);
-  - the harness's Anthropic setup path; `--fake` runs the scripted brain.
+  - setup in the harness, either (1) an Anthropic API key or (2) a local model; the wiring picks
+    the brain from the start account's provider; `--fake` runs the scripted brain.
 - **Still to come:**
-  - setup option 2, a local model, with the wiring picking the brain from the default account's
-    provider;
   - OpenRouter sign-in.
 - **Pending:** the Anthropic live checks, which need a key.
 

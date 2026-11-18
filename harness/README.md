@@ -14,23 +14,37 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
 ## Stage 3 status (in progress)
 
-`cargo run -p nixxa-harness` opens the TUI on the current directory. This is the Anthropic path of
-the Stage 3 setup. A local OpenAI-compatible model is the next setup option.
+`cargo run -p nixxa-harness` opens the TUI on the current directory.
 
-- **Brain:** Claude (`AnthropicBrain`), with keys from `KeychainCredentials` (OS keychain plus a
-  read-only `anthropic:env` account from `ANTHROPIC_API_KEY`). `--fake` uses the scripted Stage 2
-  brain instead. The sandbox, store and knowledge are still the Stage 2 fakes.
-- **First run:** with no Anthropic account, a setup screen asks for a key. It is masked (bullets
-  plus the last four characters), checked with `AnthropicBrain::verify_key`, then stored as
-  `anthropic:default`; the session starts once it's saved. A bad key shows the error and can be
-  retried; `ctrl-u` clears; `ctrl-a` reopens the screen later. Paste uses bracketed paste.
+- **Brains:**
+  - Claude (`AnthropicBrain`) for `anthropic:*` accounts;
+  - a local model (`OpenAiCompatBrain`) for `local:*` accounts, with the model saved as the
+    account setting `model.<account>`.
+
+  `wiring::Models` picks the brain from the account's provider. `--fake` uses the scripted Stage 2
+  brain. The sandbox, store and knowledge are still the Stage 2 fakes.
+- **Start account:** the one set up last (the `active_account` setting), else the Anthropic
+  default (a stored key or `ANTHROPIC_API_KEY`), else the local default. A local account without a
+  model reopens setup on its server.
+- **Setup screen (`setup.rs`):** shown when nothing is set up; `ctrl-a` reopens it, and `esc` goes
+  back a step.
+  1. **Anthropic API key:** masked (bullets plus the last four characters), checked with
+     `verify_key`, stored as `anthropic:default`. `ctrl-u` clears; paste uses bracketed paste.
+  2. **Local model:** the server URL (LM Studio's filled in) → its models (embedding models, and
+     models the server says can't use tools, are hidden; `tools ✓` when it says they can) →
+     `verify` → saved as `local:default` with the model.
+
+  Saving an account starts a session with it, replacing the running one (key rotation for the
+  account in use excepted).
 - **Startup:** if the keychain can't be read, the conversation says so (`check_storage`).
 - **Settings:** `settings.rs` reads the arguments and `ANTHROPIC_API_KEY` (trimmed), `NIXXA_MODEL`
-  and `NIXXA_EFFORT`. Modules never read the environment (D-007).
+  and `NIXXA_EFFORT` (both for Claude). Modules never read the environment (D-007).
 - **Errors:** a turn that ends in an error drops its half-streamed text (D-032).
 - **Tests:**
-  - an offline end-to-end run with recorded Claude responses through the real wiring
-    (`stage_three_end_to_end_with_recorded_claude`, `tests/anthropic_loop.rs`);
+  - offline end-to-end runs through the real wiring with recorded Claude and local-model responses
+    (`stage_three_end_to_end_with_recorded_claude`, `…_with_a_recorded_local_model`,
+    `tests/anthropic_loop.rs`, `tests/local_loop.rs`);
+  - the setup steps (`setup.rs`) and their rendering;
   - setup-screen masking;
   - a full setup run whose screens, logs and data directory are scanned for the key
     (`setup_never_writes_the_key_to_the_screen_logs_or_disk`).

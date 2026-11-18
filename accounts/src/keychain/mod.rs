@@ -8,6 +8,7 @@
 
 mod store;
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +56,10 @@ pub struct KeychainConfig {
 struct Registry {
     version: u32,
     accounts: Vec<AccountInfo>,
+    /// Non-secret settings the harness keeps with the accounts (e.g. which account to start
+    /// with, a local account's model). Absent in registries written before it existed.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    settings: BTreeMap<String, String>,
 }
 
 /// API-key accounts in the OS keychain, plus read-only environment accounts.
@@ -107,6 +112,36 @@ impl KeychainCredentials {
         Self { inner: Arc::new(Inner { store, env, lock: Mutex::new(()) }) }
     }
 
+    /// A non-secret setting kept with the accounts, e.g. `active_account`.
+    pub async fn setting(&self, key: &str) -> Result<Option<String>, CredentialsError> {
+        check_setting_key(key)?;
+        let key = key.to_string();
+        self.blocking(move |inner| Ok(inner.load()?.settings.get(&key).cloned())).await
+    }
+
+    /// Sets (or, with `None`, clears) a non-secret setting kept with the accounts. Never put a
+    /// secret here: settings are stored next to the account list, in plain JSON.
+    pub async fn set_setting(&self, key: &str, value: Option<&str>) -> Result<(), CredentialsError> {
+        check_setting_key(key)?;
+        if let Some(value) = value {
+            if value.len() > 1024 || value.chars().any(char::is_control) {
+                return Err(CredentialsError::Invalid(format!(
+                    "the value of setting `{key}` is too long or not one line"
+                )));
+            }
+        }
+        let (key, value) = (key.to_string(), value.map(str::to_string));
+        self.blocking(move |inner| {
+            let mut registry = inner.load()?;
+            match value {
+                Some(value) => registry.settings.insert(key, value),
+                None => registry.settings.remove(&key),
+            };
+            inner.save(&registry)
+        })
+        .await
+    }
+
     /// Checks that the keychain and the account registry can be read. `list` falls back to
     /// environment accounts when they can't, so the harness calls this to tell the user why the
     /// stored accounts are missing.
@@ -152,7 +187,11 @@ impl Inner {
     }
 
     fn save(&self, registry: &Registry) -> Result<(), CredentialsError> {
-        let registry = Registry { version: REGISTRY_VERSION, accounts: registry.accounts.clone() };
+        let registry = Registry {
+            version: REGISTRY_VERSION,
+            accounts: registry.accounts.clone(),
+            settings: registry.settings.clone(),
+        };
         let json = serde_json::to_string(&registry)
             .map_err(|_| CredentialsError::Storage("could not encode the account registry".into()))?;
         self.store.set(REGISTRY, &json).map_err(storage)
@@ -376,6 +415,18 @@ fn check_key(secret: &Secret) -> Result<(), CredentialsError> {
         return Err(CredentialsError::Invalid("the API key contains spaces or control characters".into()));
     }
     Ok(())
+}
+
+/// Setting names are plain: letters, digits, `.`, `_`, `-`, `:`, up to 128 characters.
+fn check_setting_key(key: &str) -> Result<(), CredentialsError> {
+    let ok = !key.is_empty()
+        && key.len() <= 128
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':'));
+    if ok {
+        Ok(())
+    } else {
+        Err(CredentialsError::Invalid(format!("`{}` is not a valid setting name", key.escape_debug())))
+    }
 }
 
 /// A local server's base URL: `http://` or `https://`, no credentials in it, no spaces or

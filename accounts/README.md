@@ -42,6 +42,9 @@ claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md
 - **Checks:** keys are checked locally (non-empty, no spaces or control characters). Provider
   and label must be plain lower-case (`a-z 0-9 - _ .`), because they become entry names and
   Windows Credential Manager matches names case-insensitively.
+- **Settings:** `setting` / `set_setting` keep small non-secret values next to the account list
+  (e.g. which account to start with, a local account's model), so the harness needs no settings
+  file (D-035). Never put a secret there.
 - **Threading:** keychain calls run on tokio's blocking pool, so use it inside a tokio runtime.
 - **In memory:** `KeychainCredentials::in_memory` behaves the same but keeps everything in
   memory, for tests and offline demos.

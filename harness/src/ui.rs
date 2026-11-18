@@ -7,8 +7,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use crate::app::{Activity, ActivityState, App, Focus, SetupState, Speaker};
+use crate::app::{Activity, ActivityState, App, Focus, Speaker};
 use crate::safe;
+use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, SetupState, Step};
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
 const WIDE: u16 = 100;
@@ -308,10 +309,23 @@ fn draw_input(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
 }
 
 fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
-    let setup = app.setup.as_ref().map(|form| form.first_run);
-    let keys = if let Some(first_run) = setup {
-        let leave = if first_run { "ctrl-c twice quit" } else { "esc cancel" };
-        format!("enter check & save · ctrl-u clear · {leave}")
+    let setup = app.setup.as_ref().map(|setup| {
+        let first = matches!(setup.step, Step::Choose { .. });
+        (setup.first_run && first, first, matches!(setup.step, Step::Choose { .. } | Step::LocalModel(_)))
+    });
+    let keys = if let Some((stuck, first, choosing)) = setup {
+        let leave = if !first {
+            "esc back"
+        } else if stuck {
+            "ctrl-c twice quit"
+        } else {
+            "esc cancel"
+        };
+        if choosing {
+            format!("↑/↓ choose · enter select · {leave}")
+        } else {
+            format!("enter check & save · ctrl-u clear · {leave}")
+        }
     } else if app.approval().is_some() {
         "y allow · n deny · ctrl-c interrupt".to_string()
     } else if let Some(notice) = &app.notice {
@@ -330,32 +344,117 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     ])
 }
 
-/// The API-key setup form, over the panes. The key is only ever drawn masked.
+/// The setup screen, over the panes. A key is only ever drawn masked.
 fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
-    let Some(form) = app.setup.as_ref() else { return };
-    let masked = form.masked();
-    let mut lines = vec![
-        Line::raw("Paste an API key from the Anthropic Console (console.anthropic.com)."),
-        Line::styled("It is checked with Anthropic, then kept in the OS keychain, never in a file.", theme.dim()),
-        Line::default(),
-        Line::from(vec![Span::styled("Key  ", theme.dim()), Span::raw(masked.clone())]),
-        Line::default(),
-    ];
-    match &form.state {
-        SetupState::Editing => lines.push(Line::styled("Only the last four characters are ever shown.", theme.dim())),
-        SetupState::Checking => lines.push(Line::styled("● Checking the key with Anthropic…", theme.pending())),
-        SetupState::Failed(message) => lines.push(Line::styled(format!("✗ {}", safe::line(message)), theme.bad())),
-    }
-    let width = over.width.min(78);
-    let height = 9.min(over.height);
+    let Some(setup) = app.setup.as_ref() else { return };
+    let mut cursor: Option<(usize, usize)> = None;
+    let (title, mut lines): (&str, Vec<Line>) = match &setup.step {
+        Step::Choose { selected } => {
+            let mut lines = vec![Line::raw("How should Nixxa think?"), Line::default()];
+            let details = ["Claude, with your API key", "LM Studio, Ollama or another server on this machine"];
+            for (i, (choice, detail)) in CHOICES.iter().zip(details).enumerate() {
+                let marker = if i == *selected { "›" } else { " " };
+                let style = if i == *selected { theme.accent() } else { Style::new() };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} {}  {choice}", i + 1), style.add_modifier(Modifier::BOLD)),
+                    Span::styled(format!(" — {detail}"), theme.dim()),
+                ]));
+            }
+            (" Set up a model ", lines)
+        }
+        Step::Key(form) => {
+            let masked = form.masked();
+            cursor = Some((3, 5 + masked.chars().count()));
+            let mut lines = vec![
+                Line::raw("Paste an API key from the Anthropic Console (console.anthropic.com)."),
+                Line::styled(
+                    "It is checked with Anthropic, then kept in the OS keychain, never in a file.",
+                    theme.dim(),
+                ),
+                Line::default(),
+                Line::from(vec![Span::styled("Key  ", theme.dim()), Span::raw(masked)]),
+                Line::default(),
+            ];
+            lines.push(state_line(
+                &form.state,
+                "Only the last four characters are ever shown.",
+                "Checking the key with Anthropic…",
+                theme,
+            ));
+            (" Anthropic API key ", lines)
+        }
+        Step::LocalUrl(form) => {
+            let url = safe::line(&form.url);
+            cursor = Some((3, 5 + url.chars().count()));
+            let mut lines = vec![
+                Line::raw("The address of an OpenAI-compatible server on this machine (ending in /v1)."),
+                Line::styled(format!("LM Studio: {LM_STUDIO_URL}   Ollama: {OLLAMA_URL}"), theme.dim()),
+                Line::default(),
+                Line::from(vec![Span::styled("URL  ", theme.dim()), Span::raw(url)]),
+                Line::default(),
+            ];
+            lines.push(state_line(
+                &form.state,
+                "Start the server and load a model first.",
+                "Asking the server for its models…",
+                theme,
+            ));
+            (" Local model server ", lines)
+        }
+        Step::LocalModel(picker) => {
+            let mut lines = vec![
+                Line::from(vec![Span::raw("Models on "), Span::styled(safe::line(&picker.url), theme.dim())]),
+                Line::default(),
+            ];
+            let room = usize::from(over.height).saturating_sub(8).max(3);
+            let first = (picker.selected + 1).saturating_sub(room);
+            for (i, model) in picker.models.iter().enumerate().skip(first).take(room) {
+                let chosen = i == picker.selected;
+                let marker = if chosen { "›" } else { " " };
+                let tools = if model.supports_tools == Some(true) { "  tools ✓" } else { "" };
+                let style = if chosen { theme.accent().add_modifier(Modifier::BOLD) } else { Style::new() };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("{marker} {}", safe::line(&model.id)), style),
+                    Span::styled(tools.to_string(), theme.ok()),
+                ]));
+            }
+            lines.push(Line::default());
+            lines.push(state_line(
+                &picker.state,
+                "The model must be able to call tools to run actions.",
+                "Checking the model…",
+                theme,
+            ));
+            (" Pick a local model ", lines)
+        }
+    };
+    lines.insert(0, Line::default());
+    let width = over.width.min(84);
+    // Rows once wrapped to the panel's inner width, plus the border.
+    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(inner_width)).sum();
+    let needed = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
+    let height = needed.min(over.height);
     let area = Rect { x: over.x + (over.width - width) / 2, y: over.y + (over.height - height) / 2, width, height };
-    let block = Block::bordered().title(" Anthropic API key ").border_style(theme.accent());
+    let block = Block::bordered().title(title).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
-    if form.state != SetupState::Checking && inner.height > 3 {
-        let x = inner.x.saturating_add(u16::try_from(5 + masked.chars().count()).unwrap_or(u16::MAX));
-        frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y + 3));
+    if let Some((row, column)) = cursor.filter(|_| setup.state() != Some(&SetupState::Checking)) {
+        let x = inner.x.saturating_add(u16::try_from(column).unwrap_or(u16::MAX)).min(inner.right().saturating_sub(1));
+        let y = inner.y.saturating_add(u16::try_from(row + 1).unwrap_or(u16::MAX));
+        if y < inner.bottom() {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
+/// The status line under a setup form.
+fn state_line(state: &SetupState, idle: &str, checking: &str, theme: Theme) -> Line<'static> {
+    match state {
+        SetupState::Editing => Line::styled(idle.to_string(), theme.dim()),
+        SetupState::Checking => Line::styled(format!("● {checking}"), theme.pending()),
+        SetupState::Failed(message) => Line::styled(format!("✗ {}", safe::line(message)), theme.bad()),
     }
 }
 
@@ -675,15 +774,55 @@ pub(crate) mod tests {
         let key = "sk-ant-api03-SECRETSECRET-wxyz";
         let mut app = started();
         app.open_setup(true);
-        app.paste(key);
         let screen = screen(&mut app, 120, 24);
+        assert!(screen.contains("How should Nixxa think?") && screen.contains("Local model"), "{screen}");
+        assert!(screen.contains("ctrl-c twice quit"), "first run, first step: quitting is the way out");
+        app.handle_key(crate::app::tests::key(crossterm::event::KeyCode::Char('1')));
+        app.paste(key);
+        let screen = screen_of(&mut app);
         assert!(screen.contains("Anthropic API key") && screen.contains("wxyz"), "{screen}");
         assert!(!screen.contains("SECRET") && !screen.contains("sk-ant"), "{screen}");
-        assert!(screen.contains("enter check & save") && screen.contains("ctrl-c twice quit"));
+        assert!(screen.contains("enter check & save") && screen.contains("esc back"));
 
-        app.key_saved(&Err("Anthropic rejected this key: invalid x-api-key".into()));
+        app.account_saved(&Err("Anthropic rejected this key: invalid x-api-key".into()));
         let screen = screen_of(&mut app);
         assert!(screen.contains("✗ Anthropic rejected this key"), "{screen}");
+    }
+
+    #[test]
+    fn the_local_setup_shows_the_url_then_the_models() {
+        use crossterm::event::KeyCode;
+        let key = crate::app::tests::key;
+        let mut app = started();
+        app.open_setup(false);
+        app.handle_key(key(KeyCode::Char('2')));
+        let screen = screen_of(&mut app);
+        assert!(screen.contains("Local model server") && screen.contains("http://localhost:1234/v1"), "{screen}");
+        assert!(screen.contains("Ollama: http://localhost:11434/v1") && screen.contains("esc back"));
+        app.handle_key(key(KeyCode::Enter));
+        assert!(screen_of(&mut app).contains("Asking the server for its models"));
+        app.models_listed(Ok(vec![
+            nixxa_brain::ModelInfo { id: "openai/gpt-oss-20b".into(), supports_tools: None, free: None },
+            nixxa_brain::ModelInfo { id: "qwen3-8b".into(), supports_tools: Some(true), free: None },
+            nixxa_brain::ModelInfo {
+                id: "text-embedding-nomic-embed-text-v1.5".into(),
+                supports_tools: None,
+                free: None,
+            },
+        ]));
+        let screen = screen_of(&mut app);
+        assert!(screen.contains("Pick a local model") && screen.contains("› openai/gpt-oss-20b"), "{screen}");
+        assert!(screen.contains("qwen3-8b  tools ✓") && !screen.contains("nomic-embed"), "{screen}");
+        assert!(screen.contains("↑/↓ choose · enter select · esc back"));
+    }
+
+    /// Regression: on a narrow terminal the choices wrap, and the panel must grow to show both.
+    #[test]
+    fn both_choices_stay_visible_on_a_narrow_terminal() {
+        let mut app = started();
+        app.open_setup(true);
+        let screen = screen(&mut app, 60, 24);
+        assert!(screen.contains("Anthropic API key") && screen.contains("Local model"), "{screen}");
     }
 
     #[test]
