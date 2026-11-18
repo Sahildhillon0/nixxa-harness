@@ -91,6 +91,21 @@ impl ScriptedBrain {
             ]
         }
     }
+
+    /// The scripted sandbox exec the fake brain proposes after a knowledge lookup.
+    fn exec_request(context: &Context) -> ActionRequest {
+        ActionRequest {
+            id: ActionId::new(format!("act-{}-{}", context.session, context.messages.len())),
+            action: Action::Sandbox {
+                action: SandboxAction::Exec {
+                    command: "echo hello from the sandbox".into(),
+                    cwd: None,
+                    timeout_ms: Some(5_000),
+                },
+            },
+            reason: Some("run the command".into()),
+        }
+    }
 }
 
 #[async_trait]
@@ -116,14 +131,300 @@ impl Brain for ScriptedBrain {
 
 #[cfg(test)]
 mod tests {
+    use futures::StreamExt;
     use nixxa_contracts::AccountRef;
     use nixxa_contracts::conformance::brain::run;
+    use nixxa_contracts::{
+        Action, ActionId, ActionRequest, Brain, BrainEvent, Content, Context, Intent, KnowledgeAction, Message,
+        Observation, Outcome, Role, SandboxAction, SessionId, SourceId, Timestamp,
+    };
 
     use super::ScriptedBrain;
+
+    const T: Timestamp = Timestamp(1_000);
+
+    fn context(messages: Vec<Message>) -> Context {
+        Context {
+            session: SessionId::new("s1"),
+            account: AccountRef::new("scripted", "default"),
+            model: None,
+            instructions: "Reply with one short sentence.".into(),
+            primer: Default::default(),
+            messages,
+            sandbox_actions: Vec::new(),
+            knowledge_tools: Vec::new(),
+            limits: Default::default(),
+        }
+    }
+
+    fn user(text: &str) -> Message {
+        Message::text(Role::User, text, T)
+    }
+
+    fn agent_action(request: ActionRequest) -> Message {
+        Message { role: Role::Agent, content: Content::Action { request }, at: T }
+    }
+
+    fn observation(action_id: ActionId, outcome: Outcome) -> Message {
+        Message {
+            role: Role::Observation,
+            content: Content::Observation { observation: Observation::new(action_id, outcome) },
+            at: T,
+        }
+    }
+
+    async fn plan(context: Context) -> Vec<Intent> {
+        let mut stream = ScriptedBrain.think(context).await.expect("think");
+        let mut intents = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let BrainEvent::Intent { intent } = event.expect("brain event") {
+                intents.push(intent);
+            }
+        }
+        intents
+    }
 
     #[tokio::test]
     async fn scripted_brain_conforms() {
         let brain = ScriptedBrain;
         run(&brain, AccountRef::new("scripted", "default")).await;
+    }
+
+    #[tokio::test]
+    async fn empty_context_lets_it_speak() {
+        let intents = plan(context(Vec::new())).await;
+        assert_eq!(intents, vec![Intent::Say { text: "I am listening.".into() }]);
+    }
+
+    #[tokio::test]
+    async fn user_message_plans_the_knowledge_lookup() {
+        let intents = plan(context(vec![user("list the project")])).await;
+        assert_eq!(
+            intents,
+            vec![Intent::Act {
+                request: ActionRequest {
+                    id: ActionId::new("act-s1-1"),
+                    action: Action::Knowledge {
+                        action: KnowledgeAction::Call {
+                            source: SourceId::new("notes"),
+                            tool: "search".into(),
+                            args: serde_json::json!({ "query": "list the project" }),
+                        },
+                    },
+                    reason: Some("search notes".into()),
+                },
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn knowledge_result_plans_the_sandbox_exec() {
+        let intents = plan(context(vec![
+            user("list the project"),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-1"),
+                action: Action::Knowledge {
+                    action: KnowledgeAction::Call {
+                        source: SourceId::new("notes"),
+                        tool: "search".into(),
+                        args: serde_json::json!({ "query": "list the project" }),
+                    },
+                },
+                reason: Some("search notes".into()),
+            }),
+            observation(ActionId::new("act-s1-1"), Outcome::Text { content: "the notes are quiet".into() }),
+        ]))
+        .await;
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Say { text: "I looked into that.".into() },
+                Intent::Act {
+                    request: ActionRequest {
+                        id: ActionId::new("act-s1-3"),
+                        action: Action::Sandbox {
+                            action: SandboxAction::Exec {
+                                command: "echo hello from the sandbox".into(),
+                                cwd: None,
+                                timeout_ms: Some(5_000)
+                            },
+                        },
+                        reason: Some("run the command".into()),
+                    },
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn exec_result_closes_the_turn() {
+        let intents = plan(context(vec![
+            user("list the project"),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-1"),
+                action: Action::Knowledge {
+                    action: KnowledgeAction::Call {
+                        source: SourceId::new("notes"),
+                        tool: "search".into(),
+                        args: serde_json::json!({ "query": "list the project" }),
+                    },
+                },
+                reason: Some("search notes".into()),
+            }),
+            observation(ActionId::new("act-s1-1"), Outcome::Text { content: "the notes are quiet".into() }),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-3"),
+                action: Action::Sandbox {
+                    action: SandboxAction::Exec {
+                        command: "echo hello from the sandbox".into(),
+                        cwd: None,
+                        timeout_ms: Some(5_000),
+                    },
+                },
+                reason: Some("run the command".into()),
+            }),
+            observation(
+                ActionId::new("act-s1-3"),
+                Outcome::Exec {
+                    exit_code: Some(0),
+                    stdout: "echo hello from the sandbox".into(),
+                    stderr: String::new(),
+                },
+            ),
+        ]))
+        .await;
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Say { text: "The command finished.".into() },
+                Intent::Done { summary: "sandbox exec done".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_exec_closes_the_turn() {
+        let intents = plan(context(vec![
+            user("list the project"),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-1"),
+                action: Action::Knowledge {
+                    action: KnowledgeAction::Call {
+                        source: SourceId::new("notes"),
+                        tool: "search".into(),
+                        args: serde_json::json!({ "query": "list the project" }),
+                    },
+                },
+                reason: Some("search notes".into()),
+            }),
+            observation(ActionId::new("act-s1-1"), Outcome::Text { content: "the notes are quiet".into() }),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-3"),
+                action: Action::Sandbox {
+                    action: SandboxAction::Exec {
+                        command: "echo hello from the sandbox".into(),
+                        cwd: None,
+                        timeout_ms: Some(5_000),
+                    },
+                },
+                reason: Some("run the command".into()),
+            }),
+            observation(ActionId::new("act-s1-3"), Outcome::Failed { message: "the command failed".into() }),
+        ]))
+        .await;
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Say { text: "The command failed: echo hello from the sandbox".into() },
+                Intent::Done { summary: "sandbox exec failed".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_knowledge_action_is_skipped() {
+        let intents = plan(context(vec![
+            user("list the project"),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-1"),
+                action: Action::Knowledge {
+                    action: KnowledgeAction::Call {
+                        source: SourceId::new("notes"),
+                        tool: "search".into(),
+                        args: serde_json::json!({ "query": "list the project" }),
+                    },
+                },
+                reason: Some("search notes".into()),
+            }),
+            observation(ActionId::new("act-s1-1"), Outcome::Denied { reason: "no notes".into() }),
+        ]))
+        .await;
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Say { text: "okay, skipping that: no notes".into() },
+                Intent::Done { summary: "denied".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn denied_sandbox_action_is_skipped() {
+        let intents = plan(context(vec![
+            user("list the project"),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-1"),
+                action: Action::Knowledge {
+                    action: KnowledgeAction::Call {
+                        source: SourceId::new("notes"),
+                        tool: "search".into(),
+                        args: serde_json::json!({ "query": "list the project" }),
+                    },
+                },
+                reason: Some("search notes".into()),
+            }),
+            observation(ActionId::new("act-s1-1"), Outcome::Text { content: "the notes are quiet".into() }),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-3"),
+                action: Action::Sandbox {
+                    action: SandboxAction::Exec {
+                        command: "echo hello from the sandbox".into(),
+                        cwd: None,
+                        timeout_ms: Some(5_000),
+                    },
+                },
+                reason: Some("run the command".into()),
+            }),
+            observation(ActionId::new("act-s1-3"), Outcome::Denied { reason: "not worth it".into() }),
+        ]))
+        .await;
+        assert_eq!(
+            intents,
+            vec![
+                Intent::Say { text: "okay, skipping that: not worth it".into() },
+                Intent::Done { summary: "denied".into() },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_action_is_ignored() {
+        let intents = plan(context(vec![
+            user("list the project"),
+            agent_action(ActionRequest {
+                id: ActionId::new("act-s1-99"),
+                action: Action::Knowledge {
+                    action: KnowledgeAction::Call {
+                        source: SourceId::new("notes"),
+                        tool: "search".into(),
+                        args: serde_json::json!({ "query": "list the project" }),
+                    },
+                },
+                reason: Some("search notes".into()),
+            }),
+            observation(ActionId::new("act-s1-404"), Outcome::Text { content: "the notes are quiet".into() }),
+        ]))
+        .await;
+        assert_eq!(intents, vec![Intent::Done { summary: "no matching action".into() }]);
     }
 }
