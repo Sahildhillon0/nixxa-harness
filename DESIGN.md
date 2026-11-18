@@ -188,6 +188,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-019 | ratatui 0.29 + crossterm 0.28 (not ratatui 0.30) | ratatui 0.30 needs Rust 1.88, above the workspace MSRV of 1.85; 0.29 has everything Stage 2 needs. Revisit when the MSRV moves. | 2 |
 | D-020 | The harness sanitises every untrusted string it draws, and scrubs the whole frame as a backstop | Escape sequences in model or command output could retitle the window, write the host clipboard (OSC 52) or spoof the approval prompt with `\r` or bidi overrides, which would defeat the human-in-the-loop principle. One choke point (`harness/src/safe.rs`) plus a buffer scrub keeps a forgotten call site from reopening the hole. | 2 |
 | D-021 | Logs go to daily files in `<data dir>/nixxa/logs` (kept 7 days), metadata only | The TUI owns stdout/stderr. Logging ids, kinds, verdicts and errors, never message text or action output, keeps file contents and secrets out of logs. `NIXXA_LOG` sets the level. | 2 |
+| D-022 | Account metadata lives in a keychain entry (`nixxa/_registry`, JSON), not a config file | Keeps accounts fileless, so no plain-text file is ever written and D-007 holds (only the harness reads config). The registry holds no secret, just provider, label, method, default and the last four characters. | 3 |
+| D-023 | `keyring` 3.6 with native backends per OS; on Linux the pure-Rust Secret Service client (zbus + RustCrypto, `async-io`) | keyring 4 needs Rust 1.88 (MSRV is 1.85). The pure-Rust Linux client avoids libdbus and OpenSSL at build time and needs no tokio reactor. No Secret Service (headless Linux) is a clear storage error; env accounts still work. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
