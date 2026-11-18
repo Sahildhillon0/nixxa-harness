@@ -12,6 +12,20 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 nixxa-contracts = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+# The OS keychain, one native backend per OS. Linux uses the pure-Rust Secret Service client
+# (zbus + RustCrypto) on its own executor: no libdbus, no OpenSSL, no tokio reactor needed.
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { workspace = true, features = ["async-secret-service", "async-io", "crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { workspace = true, features = ["windows-native"] }
 
 [dev-dependencies]
 nixxa-contracts = { workspace = true, features = ["conformance"] }

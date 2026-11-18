@@ -333,7 +333,12 @@ recorded in the DESIGN.md decision log before it is built.
   (macOS), Credential Manager (Windows). Entry name `nixxa/<provider>/<account>`.
 - **Headless Linux without a Secret Service:** fall back to an encrypted file in the data dir
   (passphrase asked once per session), or env-var accounts. Never a plain-text file.
-- **Metadata** (provider, label, method, default, created/last-used): in config, no secrets.
+- **Metadata** (provider, label, method, default, hint): a JSON registry in the keychain entry
+  `nixxa/_registry`, no secrets, so accounts need no file and only the harness reads config
+  (D-022).
+- **Env accounts:** the harness reads `ANTHROPIC_API_KEY` (and later others) and hands them to
+  `accounts`, which lists them as read-only `<provider>:env` accounts and never stores them.
+  An env account is its provider's default whenever no stored account is.
 
 ### Rules
 - Multiple accounts per provider; one marked default. A session records the `AccountRef` it

@@ -188,6 +188,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-019 | ratatui 0.29 + crossterm 0.28 (not ratatui 0.30) | ratatui 0.30 needs Rust 1.88, above the workspace MSRV of 1.85; 0.29 has everything Stage 2 needs. Revisit when the MSRV moves. | 2 |
 | D-020 | The harness sanitises every untrusted string it draws, and scrubs the whole frame as a backstop | Escape sequences in model or command output could retitle the window, write the host clipboard (OSC 52) or spoof the approval prompt with `\r` or bidi overrides, which would defeat the human-in-the-loop principle. One choke point (`harness/src/safe.rs`) plus a buffer scrub keeps a forgotten call site from reopening the hole. | 2 |
 | D-021 | Logs go to daily files in `<data dir>/nixxa/logs` (kept 7 days), metadata only | The TUI owns stdout/stderr. Logging ids, kinds, verdicts and errors, never message text or action output, keeps file contents and secrets out of logs. `NIXXA_LOG` sets the level. | 2 |
+| D-022 | Account metadata lives in a keychain entry (`nixxa/_registry`, JSON), not a config file | Keeps accounts fileless, so no plain-text file is ever written and D-007 holds (only the harness reads config). The registry holds no secret, just provider, label, method, default and the last four characters. | 3 |
+| D-023 | `keyring` 3.6 with native backends per OS; on Linux the pure-Rust Secret Service client (zbus + RustCrypto, `async-io`) | keyring 4 needs Rust 1.88 (MSRV is 1.85). The pure-Rust Linux client avoids libdbus and OpenSSL at build time and needs no tokio reactor. No Secret Service (headless Linux) is a clear storage error; env accounts still work. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
@@ -196,6 +198,13 @@ New decisions get the next ID. A reversed decision is struck through, not delete
 - Which LLM provider ships first in Stage 3? (Leaning Anthropic via API key.)
 - Which providers, if any, permit third-party subscription sign-in at the time Stage 8 starts?
 - Should an account be pinnable per workspace (e.g. this repo always uses `anthropic:work`)?
+- Stage 8, account registry (from the PR #5 review): Windows caps a Credential Manager blob at
+  about 2.5 KB, so a single `nixxa/_registry` entry fits only a dozen or two accounts. Shard it
+  (one entry per provider) or use a more compact format? And the registry lock is per process:
+  two Nixxa instances adding accounts at once can lose an update. Re-read and retry, or an
+  advisory lock?
+- Stage 3 PR C: when the registry is unreadable but an env key exists, `list` quietly falls back
+  to the env account and the stored accounts disappear. How should the harness tell the user?
 - User-added external tools (Stage 11): MCP only, or also a native plugin trait?
 - Sandbox network policy: off / allow-list / proxy-with-log?
 - Windows sandbox backend: AppContainer, WSL2, or container-only?
