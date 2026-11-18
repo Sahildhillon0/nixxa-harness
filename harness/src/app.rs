@@ -79,6 +79,12 @@ pub(crate) struct Activity {
     pub(crate) observation: Option<Observation>,
 }
 
+/// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
+/// on Windows, AltGr arrives as ctrl+alt and is how many layouts type `@`, `€` or `{`.
+fn types_text(key: &KeyEvent) -> bool {
+    !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
+}
+
 /// What the UI loop must do after a key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Effect {
@@ -367,7 +373,7 @@ impl App {
                 form.key = Zeroizing::new(String::new());
                 form.state = SetupState::Editing;
             }
-            KeyCode::Char(c) if !ctrl => form.push(&c.to_string()),
+            KeyCode::Char(c) if types_text(&key) => form.push(&c.to_string()),
             KeyCode::Backspace if form.state != SetupState::Checking => {
                 form.key.pop();
                 form.state = SetupState::Editing;
@@ -425,7 +431,7 @@ impl App {
                     return vec![Effect::Send(Command::UserMessage(text))];
                 }
             }
-            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Char(c) if types_text(&key) => self.input.push(c),
             KeyCode::Backspace => {
                 self.input.pop();
             }
@@ -633,6 +639,24 @@ pub(crate) mod tests {
         });
         assert!(app.queued.is_empty());
         assert_eq!(app.conversation, vec![Entry { speaker: Speaker::User, text: "next".into() }]);
+    }
+
+    /// Regression (PR #7 review, B1): an unhandled ctrl shortcut must not type its letter.
+    #[test]
+    fn ctrl_shortcuts_do_not_type_but_altgr_does() {
+        let mut app = App::new(true);
+        app.handle_key(ctrl('a'));
+        app.handle_key(ctrl('x'));
+        assert_eq!(app.input, "", "ctrl-a and ctrl-x type nothing");
+        let altgr = KeyEvent::new(KeyCode::Char('@'), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        app.handle_key(altgr);
+        assert_eq!(app.input, "@", "AltGr (ctrl+alt on Windows) still types");
+
+        app.open_setup(false);
+        app.handle_key(ctrl('x'));
+        assert_eq!(app.setup.as_ref().unwrap().masked(), "", "nor in the key field");
+        app.handle_key(KeyEvent::new(KeyCode::Char('{'), KeyModifiers::CONTROL | KeyModifiers::ALT));
+        assert_eq!(app.setup.as_ref().unwrap().masked(), "•");
     }
 
     #[test]
