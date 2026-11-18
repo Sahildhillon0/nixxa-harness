@@ -42,7 +42,11 @@ OpenAI-compatible providers.
   - `length` keeps the text and drops the cut-off call, then `Done("stopped: output limit")`;
   - `content_filter` and an `error` chunk are provider errors;
   - a stream may end without `[DONE]` once a choice has finished.
-- **Cost:** `Some(0)` for a local server; otherwise `None` (never guessed).
+- **Cost:** `Some(0)` for a local server; the reported `usage.cost` (US dollars) when the config
+  says the server reports one (OpenRouter); otherwise `None`, never guessed.
+- **OpenRouter:** `OpenAiCompatConfig::openrouter(model)` uses `https://openrouter.ai/api/v1`,
+  a signed-in `BearerToken` as `Authorization: Bearer`, and the recommended `HTTP-Referer` /
+  `X-OpenRouter-Title` headers. `verify` first checks the key at `GET /key`.
 - **No tools:** a server's "does not support tools" error (any common wording) becomes
   ``Provider("`<model>` can't use tools. Pick a tool-capable model …")``.
 - **`list_models`:** the ids, plus tool support (`supported_parameters` / `capabilities`) and free

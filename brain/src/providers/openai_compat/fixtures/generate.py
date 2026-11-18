@@ -56,6 +56,10 @@ fixtures = {
     "truncated.sse": ROLE + text("Cut off"),
     "unknown_tool.sse": ROLE + call(0, "call_4", "rm_everything", "{}") + chunk(finish="tool_calls") + DONE,
     "invalid_arguments.sse": ROLE + call(0, "call_5", "exec", '{"command": 5}') + chunk(finish="tool_calls") + DONE,
+    # OpenRouter reports the step's cost (credits = US dollars) in the usage chunk.
+    "openrouter_text.sse": ROLE + text("Hi from OpenRouter.") + chunk(finish="stop")
+        + chunk(choices=False, usage={"prompt_tokens": 50, "completion_tokens": 5, "total_tokens": 55, "cost": 0.000421})
+        + DONE,
     "no_ids.sse": ROLE + call(0, None, "exec", '{"command":"ls"}') + call(1, None, "exec", '{"command":"pwd"}')
         + chunk(finish="tool_calls") + DONE,
 }

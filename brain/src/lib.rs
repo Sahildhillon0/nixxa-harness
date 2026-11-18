@@ -10,4 +10,4 @@ mod providers;
 pub use providers::anthropic::{AnthropicBrain, AnthropicConfig, DEFAULT_BASE_URL, DEFAULT_MODEL, Effort};
 #[cfg(feature = "replay")]
 pub use providers::common::replay::Replay;
-pub use providers::openai_compat::{ModelInfo, OpenAiCompatBrain, OpenAiCompatConfig};
+pub use providers::openai_compat::{ModelInfo, OPENROUTER_URL, OpenAiCompatBrain, OpenAiCompatConfig};

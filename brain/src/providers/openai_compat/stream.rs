@@ -27,6 +27,9 @@ pub(crate) struct Decoder {
     key: String,
     local: bool,
     model: String,
+    reports_cost: bool,
+    /// The step's cost in micro-dollars, when the server reported it.
+    cost: Option<u64>,
     text: String,
     calls: BTreeMap<u64, Call>,
     finish_reason: Option<String>,
@@ -38,12 +41,14 @@ pub(crate) struct Decoder {
 pub(crate) type Items = Vec<Result<BrainEvent, BrainError>>;
 
 impl Decoder {
-    pub(crate) fn new(tools: ToolMap, key: String, local: bool, model: String) -> Self {
+    pub(crate) fn new(tools: ToolMap, key: String, local: bool, model: String, reports_cost: bool) -> Self {
         Self {
             tools,
             key,
             local,
             model,
+            reports_cost,
+            cost: None,
             text: String::new(),
             calls: BTreeMap::new(),
             finish_reason: None,
@@ -78,6 +83,10 @@ impl Decoder {
             (chunk["usage"]["prompt_tokens"].as_u64(), chunk["usage"]["completion_tokens"].as_u64())
         {
             self.usage = Some((prompt, completion));
+        }
+        // OpenRouter reports the step's cost in credits, which are US dollars.
+        if let Some(cost) = chunk["usage"]["cost"].as_f64().filter(|c| c.is_finite() && *c >= 0.0) {
+            self.cost = Some((cost * 1_000_000.0).round() as u64);
         }
         let mut items = Vec::new();
         let Some(choice) = chunk["choices"].as_array().and_then(|choices| choices.first()) else { return items };
@@ -123,8 +132,15 @@ impl Decoder {
 
     fn usage(&self) -> Option<Result<BrainEvent, BrainError>> {
         let (input_tokens, output_tokens) = self.usage?;
-        // A local server bills nothing; anything else reports no price, so none is guessed.
-        let cost_micro_usd = self.local.then_some(0);
+        // A local server bills nothing; a server that reports its cost is believed; anything
+        // else has no price, and none is guessed.
+        let cost_micro_usd = if self.local {
+            Some(0)
+        } else if self.reports_cost {
+            self.cost
+        } else {
+            None
+        };
         Some(Ok(BrainEvent::Usage { usage: Usage { input_tokens, output_tokens, cost_micro_usd } }))
     }
 
