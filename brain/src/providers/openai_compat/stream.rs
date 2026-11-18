@@ -26,6 +26,7 @@ pub(crate) struct Decoder {
     tools: ToolMap,
     key: String,
     local: bool,
+    model: String,
     text: String,
     calls: BTreeMap<u64, Call>,
     finish_reason: Option<String>,
@@ -37,11 +38,12 @@ pub(crate) struct Decoder {
 pub(crate) type Items = Vec<Result<BrainEvent, BrainError>>;
 
 impl Decoder {
-    pub(crate) fn new(tools: ToolMap, key: String, local: bool) -> Self {
+    pub(crate) fn new(tools: ToolMap, key: String, local: bool, model: String) -> Self {
         Self {
             tools,
             key,
             local,
+            model,
             text: String::new(),
             calls: BTreeMap::new(),
             finish_reason: None,
@@ -69,7 +71,8 @@ impl Decoder {
         };
         if !chunk["error"].is_null() {
             self.finished = true;
-            return vec![Err(errors::from_stream_error(&chunk["error"], &self.key))];
+            let err = errors::from_stream_error(&chunk["error"], &self.key);
+            return vec![Err(errors::explain_no_tools(err, &self.model))];
         }
         if let (Some(prompt), Some(completion)) =
             (chunk["usage"]["prompt_tokens"].as_u64(), chunk["usage"]["completion_tokens"].as_u64())

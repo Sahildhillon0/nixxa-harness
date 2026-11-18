@@ -403,6 +403,20 @@ async fn http_errors_map_to_brain_errors() {
     }
 }
 
+/// Review S2: a model that can't use tools gets a hint, not the server's raw error.
+#[tokio::test]
+async fn a_model_without_tools_is_explained() {
+    let fixtures = Fixtures::with(vec![Ok(Canned {
+        status: 400,
+        body: br#"{"error":"registry.ollama.ai/library/qwen-uncensored does not support tools"}"#.to_vec(),
+    })]);
+    let err = local_brain(&fixtures).think(hello()).await.err().unwrap();
+    assert_eq!(
+        err.to_string(),
+        "provider error: `qwen3-8b` can't use tools. Pick a tool-capable model (e.g. gpt-oss, qwen2.5/3, llama3.1+)."
+    );
+}
+
 #[tokio::test]
 async fn list_models_reads_ids_and_what_the_server_says_about_them() {
     let fixtures = Fixtures::with(vec![fixture("models_local.json"), fixture("models_rich.json")]);

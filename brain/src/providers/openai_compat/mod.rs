@@ -243,10 +243,10 @@ impl Brain for OpenAiCompatBrain {
             .map_err(|err| BrainError::Other(format!("could not encode the request: {err}")))?;
         let response = self.send(&endpoint, Method::Post, "chat/completions", Some(body)).await?;
         if response.status != 200 {
-            return Err(error_response(response, &endpoint).await);
+            return Err(errors::explain_no_tools(error_response(response, &endpoint).await, &model));
         }
         let key = endpoint.key.clone().unwrap_or_default();
-        Ok(decode(response, Decoder::new(map, key, endpoint.local)))
+        Ok(decode(response, Decoder::new(map, key, endpoint.local, model)))
     }
 }
 
