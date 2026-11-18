@@ -140,7 +140,7 @@ internal is `pub(crate)`.
 | `SessionId`, `TurnId`, `ActionId` | Opaque identifiers |
 | `Message` | A conversation entry: role (user / agent / system / observation) + content |
 | `Context` | Everything the brain needs for one think step: account, instructions, primer, messages, available sandbox action kinds, knowledge tool specs, limits |
-| `Content` | What a `Message` carries: text, a proposed `ActionRequest`, or an `Observation` — so the brain can rebuild tool-call history |
+| `Content` | What a `Message` carries: text, a proposed `ActionRequest`, an `Observation`, or `Reasoning` (opaque provider data such as a signed thinking block) — so the brain can rebuild tool-call history exactly |
 | `Intent` | What the brain wants: `Say(text)`, `Act(Action)`, `Done(summary)` |
 | `Action` | `Sandbox(SandboxAction)` or `Knowledge(KnowledgeAction)` — the controller routes on this |
 | `SandboxAction` | `Exec`, `ReadFile`, `WriteFile`, `ListDir`, … |
@@ -180,6 +180,10 @@ sees `AccountRef`s, never secrets.
 - **Secrets:** `Secret` and `Credential` are not serialisable and redact themselves in `Debug`,
   so a credential cannot reach the db, an event or a log by accident.
 - **Wire format:** all other types are serde-serialisable with stable, tagged, snake_case JSON.
+- **Reasoning:** a brain may emit `BrainEvent::Reasoning { provider, data }`. The controller
+  records it, in stream order and unannounced, as `Content::Reasoning`, and the brain gets it back
+  in later contexts. Only the brain of that provider reads it; nothing shows it. It exists
+  because some providers require their signed reasoning blocks to be sent back unchanged.
 - **Ids:** `ActionId` is assigned by the brain (usually the provider's tool-call id);
   `SessionId` by the store; `TurnId` by the controller.
 
