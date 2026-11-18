@@ -1316,6 +1316,7 @@ dependencies = [
  "nixxa-knowledge",
  "nixxa-sandbox",
  "ratatui",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-appender",
