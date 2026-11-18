@@ -150,7 +150,12 @@ dependencies = [
 name = "nixxa-controller"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
+ "futures",
  "nixxa-contracts",
+ "serde_json",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
