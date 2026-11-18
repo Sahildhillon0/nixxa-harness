@@ -9,11 +9,13 @@ that connects to your memory, notes, code index and docs, the accounts module th
 logins and API keys, and the harness you look at.
 Replace one, and the rest never notice.
 
-> **Status: Stage 3 — Real brain (done).** `cargo run -p nixxa-harness` talks to Claude
-> (`claude-sonnet-5-5` by default) with streaming and tool use. Your API key is kept in the OS
-> keychain, never in a file. The sandbox, store and knowledge are still fakes, and the sandbox says
-> so (`NOT ISOLATED`). `--fake` runs the scripted Stage 2 agent offline. Next: Stage 4, a real
-> sandbox.
+> **Status: Stage 3 — Real brain (in progress).** With an Anthropic API key,
+> `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
+> tool use. The key is kept in the OS keychain, never in a file. Still to come in Stage 3: a local
+> model through an OpenAI-compatible endpoint (LM Studio / Ollama) as a second setup option, and
+> OpenRouter sign-in. The live checks against the Anthropic API haven't been run yet. The sandbox,
+> store and knowledge are still fakes, and the sandbox says so (`NOT ISOLATED`). `--fake` runs the
+> scripted Stage 2 agent offline.
 
 ---
 
@@ -97,7 +99,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 0 | Foundations | Repo, docs, folder skeleton | done |
 | 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | done (macOS/Windows CI pending) |
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | done |
-| 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | done |
+| 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | planned |
 | 5 | Real memory | SQLite store, session resume, transcript search | planned |
 | 6 | Knowledge I — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
@@ -124,7 +126,7 @@ Requires Rust 1.85+ (edition 2024).
 Nixxa uses Claude through the Anthropic API with your own API key (from the
 [Anthropic Console](https://console.anthropic.com)). Choose one of these:
 
-- **In the TUI (recommended).** On first run Nixxa shows a setup screen. Paste the key: it is
+- **In the TUI (recommended).** With no account yet, Nixxa shows a setup screen. Paste the key: it is
   masked, and only the last four characters are ever shown. Nixxa checks it with Anthropic
   (a free call) and saves it in your OS keychain (Secret Service on Linux, Keychain on macOS,
   Credential Manager on Windows) as `anthropic:default`. It's remembered across restarts and

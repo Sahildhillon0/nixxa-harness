@@ -12,9 +12,10 @@ The `nixxa` binary: the ratatui TUI and the composition root that picks concrete
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
-## Stage 3 status
+## Stage 3 status (in progress)
 
-`cargo run -p nixxa-harness` opens the TUI on the current directory.
+`cargo run -p nixxa-harness` opens the TUI on the current directory. This is the Anthropic path of
+the Stage 3 setup. A local OpenAI-compatible model is the next setup option.
 
 - **Brain:** Claude (`AnthropicBrain`), with keys from `KeychainCredentials` (OS keychain plus a
   read-only `anthropic:env` account from `ANTHROPIC_API_KEY`). `--fake` uses the scripted Stage 2

@@ -475,7 +475,7 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **Exit:** type a message, watch a fake agent query fake knowledge and propose a sandbox
   action, approve it, see the observation — end to end, every module in place.
 
-### Stage 3 — Real brain *(done)*
+### Stage 3 — Real brain *(in progress)*
 - First real provider with streaming and tool calling.
 - `accounts` comes alive: add an API key from the TUI (stored in the OS keychain) or use an env
   var; one account per provider for now.
