@@ -23,8 +23,12 @@ The loop from ARCHITECTURE.md §4 runs end to end against fakes:
 - **Turns:** one at a time; messages sent during a turn are queued. The conversation carries across turns.
 - **Ending a turn:** `Done`, a brain error, an infrastructure error from the sandbox or knowledge,
   a step with no intent, the per-turn step cap (`max_steps`, announced as a system message), or an interrupt.
-- **Interrupt / shutdown:** drops the in-flight turn (brain stream, approval prompt or action),
-  closes any open action with a `Denied`/`Failed` observation and records "interrupted by the user".
+- **Interrupt / shutdown:** signals the turn, which stops at its next cancellation point (brain
+  stream, approval prompt or action), closes an open action with a `Denied`/`Failed` observation
+  and records "interrupted by the user". Store writes are never cancelled.
+- **Shown vs recorded:** `Done` summaries are recorded for the brain and the db but not announced
+  as an `Event::Message`. A `Say` streams `TextDelta`s and then announces the full text, so the
+  harness should replace the streamed text with the final message, not append both.
 
 Not yet: token/time/cost budgets and approval modes (Stage 9), retries, session write-back (Stage 6).
 

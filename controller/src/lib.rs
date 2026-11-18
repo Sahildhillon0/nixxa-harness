@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use nixxa_contracts::{
     AccountRef, Action, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, Content, Context, Event,
@@ -86,14 +86,6 @@ struct Session {
     primer: Primer,
     /// The conversation the brain sees, across turns.
     conversation: Vec<Message>,
-    /// The action between its proposal and its observation, so an interrupt can close it.
-    in_flight: Option<InFlight>,
-}
-
-struct InFlight {
-    request: ActionRequest,
-    /// `None` while the policy gate or the human is still deciding.
-    verdict: Option<Verdict>,
 }
 
 /// Whether the loop keeps going after an intent or a step.
@@ -101,14 +93,28 @@ struct InFlight {
 enum Flow {
     Continue,
     Finish,
+    /// The turn was interrupted at a cancellation point.
+    Cancelled,
 }
 
-/// How a turn ended, as seen from the command loop.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TurnEnd {
-    Finished,
-    Interrupted,
-    Shutdown,
+/// Awaits `future` unless the turn is cancelled first (`None`).
+///
+/// Only the brain stream, the approval prompt and the action itself are wrapped in this; store
+/// writes and conversation updates always run to completion, so a cancelled turn never leaves
+/// the history or the db half-written.
+async fn cancellable<F: Future>(cancel: &watch::Receiver<bool>, future: F) -> Option<F::Output> {
+    let mut cancel = cancel.clone();
+    let cancelled = async move {
+        if cancel.wait_for(|cancelled| *cancelled).await.is_err() {
+            // No sender: nothing can cancel this turn.
+            std::future::pending::<()>().await;
+        }
+    };
+    tokio::select! {
+        biased;
+        () = cancelled => None,
+        output = future => Some(output),
+    }
 }
 
 /// Runs the agent loop: policy gate, routing, recording, events.
@@ -122,6 +128,8 @@ pub struct Controller {
     config: ControllerConfig,
     session: Option<Session>,
     next_turn: u64,
+    /// Set to `true` by [`Controller::run`] to cancel the in-flight turn.
+    cancel: watch::Receiver<bool>,
 }
 
 impl Controller {
@@ -135,7 +143,18 @@ impl Controller {
         events: Arc<dyn EventSink>,
         config: ControllerConfig,
     ) -> Self {
-        Self { brain, sandbox, store, knowledge, approvals, events, config, session: None, next_turn: 0 }
+        Self {
+            brain,
+            sandbox,
+            store,
+            knowledge,
+            approvals,
+            events,
+            config,
+            session: None,
+            next_turn: 0,
+            cancel: watch::channel(false).1,
+        }
     }
 
     /// Creates a session, gathers the primer and emits the session start events.
@@ -166,18 +185,22 @@ impl Controller {
                 Primer::default()
             }
         };
-        self.session = Some(Session { id: info.id.clone(), primer, conversation: Vec::new(), in_flight: None });
+        self.session = Some(Session { id: info.id.clone(), primer, conversation: Vec::new() });
         Ok(info)
     }
 
     /// The command loop. Returns when the session ends ([`Command::Shutdown`] or the sender is
     /// dropped).
     ///
-    /// Turns run one at a time. While a turn is in flight the loop keeps listening, so an
-    /// interrupt cancels it immediately; messages that arrive meanwhile are queued.
+    /// Turns run one at a time. While a turn is in flight the loop keeps listening: an interrupt
+    /// or shutdown signals the turn to cancel at its next cancellation point (brain stream,
+    /// approval prompt or action), and messages that arrive meanwhile are queued.
     pub async fn run(&mut self, mut commands: mpsc::Receiver<Command>) {
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        self.cancel = cancel_rx;
         let mut queued: VecDeque<String> = VecDeque::new();
-        loop {
+        let mut shutting_down = false;
+        while !shutting_down {
             let command = match queued.pop_front() {
                 Some(text) => Command::UserMessage(text),
                 None => commands.recv().await.unwrap_or(Command::Shutdown),
@@ -193,28 +216,29 @@ impl Controller {
             }
             let turn = TurnId::new(format!("turn-{}", self.next_turn));
             self.next_turn += 1;
-            let end = {
+            cancel_tx.send_replace(false);
+            {
                 let turn_future = self.run_turn(text, &turn);
                 tokio::pin!(turn_future);
+                let mut listening = true;
                 loop {
                     tokio::select! {
-                        () = &mut turn_future => break TurnEnd::Finished,
-                        command = commands.recv() => match command {
+                        () = &mut turn_future => break,
+                        command = commands.recv(), if listening => match command {
                             Some(Command::UserMessage(text)) => queued.push_back(text),
-                            Some(Command::Interrupt) => break TurnEnd::Interrupted,
-                            Some(Command::Shutdown) | None => break TurnEnd::Shutdown,
+                            Some(Command::Interrupt) => {
+                                cancel_tx.send_replace(true);
+                            }
+                            Some(Command::Shutdown) | None => {
+                                cancel_tx.send_replace(true);
+                                shutting_down = true;
+                                listening = false;
+                            }
                         },
                     }
                 }
-            };
-            if end != TurnEnd::Finished {
-                // Dropping the turn future cancelled the brain stream, approval or action.
-                self.record_interruption(&turn).await;
             }
             self.emit(Event::TurnDone { turn });
-            if end == TurnEnd::Shutdown {
-                break;
-            }
         }
         if let Some(session) = self.session.take() {
             self.emit(Event::SessionEnded { session: session.id });
@@ -228,8 +252,14 @@ impl Controller {
         let message = Message::text(Role::User, text, self.now());
         self.record_message(turn, message, true).await;
         for _ in 0..self.config.max_steps {
-            if self.step(turn).await == Flow::Finish {
-                return;
+            match self.step(turn).await {
+                Flow::Continue => {}
+                Flow::Finish => return,
+                Flow::Cancelled => {
+                    let message = Message::text(Role::System, INTERRUPTED, self.now());
+                    self.record_message(turn, message, true).await;
+                    return;
+                }
             }
         }
         let notice = format!("stopped: the step budget of {} for this turn ran out", self.config.max_steps);
@@ -240,26 +270,32 @@ impl Controller {
     /// One think step: build the context, stream the brain, apply its intents.
     async fn step(&mut self, turn: &TurnId) -> Flow {
         let context = self.build_context().await;
-        let mut stream = match self.brain.think(context).await {
-            Ok(stream) => stream,
-            Err(err) => {
+        let mut stream = match cancellable(&self.cancel, self.brain.think(context)).await {
+            None => return Flow::Cancelled,
+            Some(Ok(stream)) => stream,
+            Some(Err(err)) => {
                 self.emit(Event::Error { turn: Some(turn.clone()), message: err.to_string() });
                 return Flow::Finish;
             }
         };
         let mut flow = Flow::Continue;
         let mut saw_intent = false;
-        while let Some(item) = stream.next().await {
+        loop {
+            let Some(next) = cancellable(&self.cancel, stream.next()).await else { return Flow::Cancelled };
+            let Some(item) = next else { break };
             match item {
                 // Usage is always reported, even after the turn has finished, so it is never lost.
                 Ok(BrainEvent::Usage { usage }) => {
                     self.emit(Event::Usage { account: self.config.account.clone(), usage });
                 }
-                Ok(_) if flow == Flow::Finish => {}
+                Ok(_) if flow != Flow::Continue => {}
                 Ok(BrainEvent::TextDelta { text }) => self.emit(Event::TextDelta { turn: turn.clone(), text }),
                 Ok(BrainEvent::Intent { intent }) => {
                     saw_intent = true;
                     flow = self.handle_intent(turn, intent).await;
+                    if flow == Flow::Cancelled {
+                        return flow;
+                    }
                 }
                 Err(err) => {
                     self.emit(Event::Error { turn: Some(turn.clone()), message: err.to_string() });
@@ -286,8 +322,10 @@ impl Controller {
                 Flow::Continue
             }
             Intent::Done { summary } => {
+                // Kept for the brain and the db, but not shown: what the user sees is what the
+                // agent said.
                 let message = Message::text(Role::Agent, summary, self.now());
-                self.record_message(turn, message, true).await;
+                self.record_message(turn, message, false).await;
                 Flow::Finish
             }
             Intent::Act { request } => self.act(turn, request).await,
@@ -295,11 +333,10 @@ impl Controller {
     }
 
     /// Gates, routes and records one proposed action. An infrastructure failure ends the turn;
-    /// denials and action-level failures go back to the brain as observations.
+    /// denials and action-level failures go back to the brain as observations. An interrupt
+    /// while asking or running still closes the action with an observation, so the history
+    /// never holds a proposal without its result.
     async fn act(&mut self, turn: &TurnId, request: ActionRequest) -> Flow {
-        if let Some(session) = self.session.as_mut() {
-            session.in_flight = Some(InFlight { request: request.clone(), verdict: None });
-        }
         let proposal =
             Message { role: Role::Agent, content: Content::Action { request: request.clone() }, at: self.now() };
         self.record_message(turn, proposal, false).await;
@@ -312,24 +349,27 @@ impl Controller {
                     request: request.clone(),
                     reason: reason.clone(),
                 });
-                match self.approvals.ask(&request, &reason).await {
-                    Verdict::Allow => Verdict::Allow,
+                match cancellable(&self.cancel, self.approvals.ask(&request, &reason)).await {
+                    Some(Verdict::Allow) => Verdict::Allow,
                     // The port must answer Allow or Deny; anything else counts as a denial.
-                    Verdict::Deny(reason) | Verdict::Ask(reason) => Verdict::Deny(reason),
+                    Some(Verdict::Deny(reason) | Verdict::Ask(reason)) => Verdict::Deny(reason),
+                    None => {
+                        let observation = Observation::denied(request.id.clone(), INTERRUPTED);
+                        self.finish_action(turn, request, Verdict::Deny(INTERRUPTED.into()), observation).await;
+                        return Flow::Cancelled;
+                    }
                 }
             }
             verdict => verdict,
         };
-        if let Some(in_flight) = self.session.as_mut().and_then(|s| s.in_flight.as_mut()) {
-            in_flight.verdict = Some(verdict.clone());
-        }
 
         let (observation, flow) = match &verdict {
             Verdict::Allow => {
                 self.emit(Event::ActionStarted { turn: turn.clone(), action_id: request.id.clone() });
-                match self.route(&request).await {
-                    Ok(observation) => (observation, Flow::Continue),
-                    Err(message) => {
+                match cancellable(&self.cancel, self.route(&request)).await {
+                    None => (Observation::failed(request.id.clone(), INTERRUPTED), Flow::Cancelled),
+                    Some(Ok(observation)) => (observation, Flow::Continue),
+                    Some(Err(message)) => {
                         self.emit(Event::Error { turn: Some(turn.clone()), message: message.clone() });
                         (Observation::failed(request.id.clone(), message), Flow::Finish)
                     }
@@ -365,34 +405,17 @@ impl Controller {
         verdict: Verdict,
         observation: Observation,
     ) {
-        if let Some(session) = self.session.as_mut() {
-            session.in_flight = None;
-        }
+        self.emit(Event::ActionFinished { turn: turn.clone(), observation: observation.clone() });
         let record = ActionRecord { request, verdict, observation: Some(observation.clone()), at: self.now() };
+        let message =
+            Message { role: Role::Observation, content: Content::Observation { observation }, at: self.now() };
+        self.record_message(turn, message, false).await;
         if let Some(id) = self.session_id() {
             if let Err(err) = self.store.append_action(&id, record).await {
                 let message = format!("could not save the action: {err}");
                 self.emit(Event::Error { turn: Some(turn.clone()), message });
             }
         }
-        self.emit(Event::ActionFinished { turn: turn.clone(), observation: observation.clone() });
-        let message =
-            Message { role: Role::Observation, content: Content::Observation { observation }, at: self.now() };
-        self.record_message(turn, message, false).await;
-    }
-
-    /// Closes whatever the cancelled turn left open and tells the agent it was interrupted.
-    async fn record_interruption(&mut self, turn: &TurnId) {
-        if let Some(InFlight { request, verdict }) = self.session.as_mut().and_then(|s| s.in_flight.take()) {
-            let (verdict, observation) = match verdict {
-                Some(Verdict::Allow) => (Verdict::Allow, Observation::failed(request.id.clone(), INTERRUPTED)),
-                Some(verdict) => (verdict, Observation::denied(request.id.clone(), INTERRUPTED)),
-                None => (Verdict::Deny(INTERRUPTED.into()), Observation::denied(request.id.clone(), INTERRUPTED)),
-            };
-            self.finish_action(turn, request, verdict, observation).await;
-        }
-        let message = Message::text(Role::System, INTERRUPTED, self.now());
-        self.record_message(turn, message, true).await;
     }
 
     /// Adds a message to the conversation and the store; optionally announces it.

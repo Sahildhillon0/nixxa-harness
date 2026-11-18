@@ -105,6 +105,28 @@ impl Sandbox for EchoSandbox {
     }
 }
 
+/// Never finishes an action.
+struct HangingSandbox;
+
+#[async_trait]
+impl Sandbox for HangingSandbox {
+    fn capabilities(&self) -> SandboxCapabilities {
+        EchoSandbox.capabilities()
+    }
+
+    async fn execute(&self, _id: ActionId, _action: SandboxAction) -> Result<Observation, SandboxError> {
+        std::future::pending().await
+    }
+
+    async fn health(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+}
+
 /// Fails every action with an infrastructure error.
 struct FailingSandbox;
 
@@ -131,9 +153,15 @@ impl Sandbox for FailingSandbox {
 #[derive(Default)]
 struct MemoryStore {
     sessions: Mutex<Vec<SessionRecord>>,
+    /// Makes `append_action` slow, like a real database.
+    action_delay: Option<Duration>,
 }
 
 impl MemoryStore {
+    fn slow_actions(delay: Duration) -> Arc<Self> {
+        Arc::new(Self { action_delay: Some(delay), ..Self::default() })
+    }
+
     fn record(&self, id: &str) -> SessionRecord {
         self.sessions.lock().unwrap().iter().find(|s| s.info.id.as_str() == id).cloned().expect("session")
     }
@@ -168,6 +196,9 @@ impl Store for MemoryStore {
     }
 
     async fn append_action(&self, id: &SessionId, record: ActionRecord) -> Result<(), StoreError> {
+        if let Some(delay) = self.action_delay {
+            sleep(delay).await;
+        }
         self.with(id, |s| s.actions.push(record))
     }
 
@@ -325,7 +356,16 @@ impl Rig {
         sandbox: Arc<dyn Sandbox>,
         max_steps: u32,
     ) -> Self {
-        let store = Arc::new(MemoryStore::default());
+        Self::start_with_store(brain, approvals, sandbox, max_steps, Arc::new(MemoryStore::default())).await
+    }
+
+    async fn start_with_store(
+        brain: Arc<ScriptedBrain>,
+        approvals: Arc<ScriptedApprovals>,
+        sandbox: Arc<dyn Sandbox>,
+        max_steps: u32,
+        store: Arc<MemoryStore>,
+    ) -> Self {
         let sink = Arc::new(RecordingSink::default());
         let mut config = ControllerConfig::new(
             WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir().join("nixxa-controller-test") },
@@ -459,7 +499,6 @@ async fn happy_path_asks_runs_and_finishes() {
             Event::ActionFinished { turn: t0(), observation: exec_observation("act-1", "echo hi") },
             Event::TextDelta { turn: t0(), text: "The command finished.".into() },
             Event::Message { turn: t0(), message: text(Role::Agent, "The command finished.") },
-            Event::Message { turn: t0(), message: text(Role::Agent, "ran the command") },
             Event::Usage { account: AccountRef::new("scripted", "default"), usage: Usage::default() },
             Event::TurnDone { turn: t0() },
         ]
@@ -547,7 +586,7 @@ async fn denied_action_is_observed_and_the_turn_continues() {
         turn: t0(),
         observation: Observation::denied(ActionId::new("act-1"), "no")
     }));
-    assert_eq!(events[events.len() - 2], Event::Message { turn: t0(), message: text(Role::Agent, "gave up") });
+    assert_eq!(rig.brain.contexts().len(), 2, "the brain saw the denial and finished");
     assert_eq!(rig.store.record("s1").actions[0].verdict, Verdict::Deny("no".into()));
 }
 
@@ -753,4 +792,94 @@ async fn dropping_the_sender_ends_the_session() {
     drop(rig.tx);
     rig.task.await.expect("loop ends");
     assert_eq!(rig.sink.all().last(), Some(&Event::SessionEnded { session: SessionId::new("s1") }));
+}
+
+#[tokio::test]
+async fn done_is_recorded_but_not_announced() {
+    let brain = ScriptedBrain::new(vec![step(vec![
+        intent(Intent::Say { text: "All set.".into() }),
+        intent(Intent::Done { summary: "internal summary".into() }),
+    ])]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
+    let events = rig.turn("hello").await;
+
+    let shown: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Message { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(shown, vec![text(Role::User, "hello"), text(Role::Agent, "All set.")]);
+    assert_eq!(rig.store.record("s1").messages.last(), Some(&text(Role::Agent, "internal summary")));
+}
+
+#[tokio::test]
+async fn interrupt_while_running_an_action_records_a_failure_and_the_next_turn_runs() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: exec_request("act-1", "sleep 100") })]),
+        step(vec![intent(Intent::Done { summary: "next".into() })]),
+    ]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(HangingSandbox), DEFAULT_MAX_STEPS).await;
+    rig.say("hello").await;
+    rig.sink.wait(1, |e| matches!(e, Event::ActionStarted { .. })).await;
+    rig.tx.send(Command::Interrupt).await.unwrap();
+    rig.sink.wait(1, turn_done).await;
+
+    let failed = Observation::failed(ActionId::new("act-1"), "interrupted by the user");
+    assert!(rig.sink.all().contains(&Event::ActionFinished { turn: t0(), observation: failed.clone() }));
+    let record = rig.store.record("s1");
+    assert_eq!(record.actions.len(), 1);
+    assert_eq!(record.actions[0].verdict, Verdict::Allow);
+    assert_eq!(record.actions[0].observation, Some(failed));
+
+    let next = rig.turn("again").await;
+    assert_eq!(next.last(), Some(&Event::TurnDone { turn: TurnId::new("turn-1") }));
+}
+
+/// Regression (PR #3 review, B1): an interrupt that lands while the store is writing the action
+/// record must not leave a proposal without its observation.
+#[tokio::test]
+async fn interrupt_during_a_slow_store_write_keeps_the_action_whole() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: exec_request("act-1", "echo hi") })]),
+        step(vec![intent(Intent::Done { summary: "next".into() })]),
+    ]);
+    let rig = Rig::start_with_store(
+        brain,
+        ScriptedApprovals::allowing(),
+        Arc::new(EchoSandbox),
+        DEFAULT_MAX_STEPS,
+        MemoryStore::slow_actions(Duration::from_millis(300)),
+    )
+    .await;
+    rig.say("hello").await;
+    rig.sink.wait(1, |e| matches!(e, Event::ActionStarted { .. })).await;
+    rig.tx.send(Command::Interrupt).await.unwrap();
+    rig.sink.wait(1, turn_done).await;
+
+    assert!(
+        rig.sink
+            .all()
+            .contains(&Event::ActionFinished { turn: t0(), observation: exec_observation("act-1", "echo hi") })
+    );
+    let record = rig.store.record("s1");
+    assert_eq!(record.actions.len(), 1, "the action record was written");
+    assert_eq!(record.actions[0].observation, Some(exec_observation("act-1", "echo hi")));
+
+    rig.turn("again").await;
+    let messages = &rig.brain.contexts()[1].messages;
+    let proposal = Message {
+        role: Role::Agent,
+        content: Content::Action { request: exec_request("act-1", "echo hi") },
+        at: Timestamp(0),
+    };
+    let observation = Message {
+        role: Role::Observation,
+        content: Content::Observation { observation: exec_observation("act-1", "echo hi") },
+        at: Timestamp(0),
+    };
+    let at = messages.iter().position(|m| m == &proposal).expect("proposal in history");
+    assert_eq!(messages[at + 1], observation, "the observation follows its proposal");
+    assert_eq!(messages.last(), Some(&text(Role::User, "again")));
 }
