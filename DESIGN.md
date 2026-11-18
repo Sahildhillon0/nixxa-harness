@@ -181,6 +181,7 @@ Both appear in the activity pane as the last lines of the session.
 | D-015 | New `accounts` module owns all credentials for every provider and integration, many accounts per provider | One place to add, store, refresh and audit secrets; providers and sources just ask for a credential. | 0 |
 | D-016 | Secrets in the OS keychain; encrypted-file fallback only; never plain text | Keys are the most sensitive thing Nixxa holds. | 0 |
 | D-017 | Subscription sign-in only where the provider officially permits third-party apps; Anthropic via API key or cloud accounts | Anthropic does not currently allow third-party products to offer claude.ai login without approval; we stay within each provider's terms. | 0 |
+| D-018 | Controller runs turns one at a time, queues messages sent mid-turn, and cancels a turn by dropping its future | Keeps the conversation a single ordered history the brain can replay; dropping futures is the contracts' cancellation convention, so an interrupt reaches the brain stream, the approval prompt and the action without extra plumbing. An infrastructure error (trait error) ends the turn; action-level failures and denials go back to the brain. | 2 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
