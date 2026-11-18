@@ -198,8 +198,17 @@ impl Inner {
             return Ok(Credential::ApiKey(secret.clone()));
         }
         let registry = self.load()?;
-        if !registry.accounts.iter().any(|a| &a.account == account) {
-            return Err(CredentialsError::NotFound(account.clone()));
+        let info = registry
+            .accounts
+            .iter()
+            .find(|a| &a.account == account)
+            .ok_or_else(|| CredentialsError::NotFound(account.clone()))?;
+        if info.method == AuthMethod::Local {
+            // A local server has no secret: its base URL is the registry hint.
+            let base_url = info.hint.clone().ok_or_else(|| {
+                CredentialsError::Storage(format!("the base URL of `{account}` is missing from the registry"))
+            })?;
+            return Ok(Credential::Local { base_url });
         }
         match self.store.get(&entry_name(account)).map_err(storage)? {
             Some(value) => Ok(Credential::ApiKey(Secret::new(value))),
@@ -215,13 +224,22 @@ impl Inner {
             )));
         }
         check_names(&account)?;
-        let Credential::ApiKey(secret) = &credential else {
-            return Err(CredentialsError::Unsupported(format!(
-                "storing {:?} credentials (Stage 3 stores API keys only)",
-                credential.method()
-            )));
+        let secret = match &credential {
+            Credential::ApiKey(secret) => {
+                check_key(secret)?;
+                Some(secret)
+            }
+            Credential::Local { base_url } => {
+                check_base_url(base_url)?;
+                None
+            }
+            other => {
+                return Err(CredentialsError::Unsupported(format!(
+                    "storing {:?} credentials (Stage 3 stores API keys and local servers only)",
+                    other.method()
+                )));
+            }
         };
-        check_key(secret)?;
 
         let mut registry = self.load()?;
         let existing = registry.accounts.iter().position(|a| a.account == account);
@@ -230,11 +248,17 @@ impl Inner {
             Some(n) => registry.accounts.remove(n).is_default,
             None => first,
         };
-        let info = AccountInfo { account, method: AuthMethod::ApiKey, is_default, hint: credential.display_hint() };
+        let info = AccountInfo { account, method: credential.method(), is_default, hint: credential.display_hint() };
         // The secret first: a registry entry must never point at a missing secret.
-        self.store.set(&entry_name(&info.account), secret.expose()).map_err(storage)?;
+        if let Some(secret) = secret {
+            self.store.set(&entry_name(&info.account), secret.expose()).map_err(storage)?;
+        }
         registry.accounts.push(info.clone());
         self.save(&registry)?;
+        if secret.is_none() {
+            // An API key replaced by a local server leaves no secret behind.
+            self.store.delete(&entry_name(&info.account)).map_err(storage)?;
+        }
         Ok(info)
     }
 
@@ -311,6 +335,7 @@ impl Credentials for KeychainCredentials {
     async fn validate(&self, account: &AccountRef) -> Result<(), CredentialsError> {
         match self.get(account).await? {
             Credential::ApiKey(secret) => check_key(&secret),
+            Credential::Local { base_url } => check_base_url(&base_url),
             _ => Ok(()),
         }
     }
@@ -349,6 +374,27 @@ fn check_key(secret: &Secret) -> Result<(), CredentialsError> {
     }
     if key.chars().any(|c| c.is_whitespace() || c.is_control()) {
         return Err(CredentialsError::Invalid("the API key contains spaces or control characters".into()));
+    }
+    Ok(())
+}
+
+/// A local server's base URL: `http://` or `https://`, no credentials in it, no spaces or
+/// control characters. Not a secret, so it may appear in messages.
+fn check_base_url(url: &str) -> Result<(), CredentialsError> {
+    let invalid = |why: &str| CredentialsError::Invalid(format!("base URL `{}`: {why}", url.escape_debug()));
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .ok_or_else(|| invalid("must start with http:// or https://"))?;
+    if url.len() > 2048 || url.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err(invalid("must be one line without spaces"));
+    }
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() {
+        return Err(invalid("has no host"));
+    }
+    if authority.contains('@') {
+        return Err(invalid("must not contain a user name or password; store a key separately"));
     }
     Ok(())
 }
