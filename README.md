@@ -9,11 +9,10 @@ that connects to your memory, notes, code index and docs, the accounts module th
 logins and API keys, and the harness you look at.
 Replace one, and the rest never notice.
 
-> **Status: Stage 3 — Real brain (in progress).** With an Anthropic API key,
-> `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
-> tool use. The key is kept in the OS keychain, never in a file. The brain for local models
-> (LM Studio / Ollama, through their OpenAI-compatible endpoint) is in; still to come in Stage 3:
-> choosing a local model in the setup screen, and OpenRouter sign-in. The live checks against the Anthropic API haven't been run yet. The sandbox,
+> **Status: Stage 3 — Real brain (in progress).** `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
+> tool use, or to a **local model** (LM Studio / Ollama, through their OpenAI-compatible
+> endpoint), chosen on the setup screen. A key stays in the OS keychain, never in a file. Still to
+> come in Stage 3: OpenRouter sign-in. The live checks against the Anthropic API haven't been run yet. The sandbox,
 > store and knowledge are still fakes, and the sandbox says so (`NOT ISOLATED`). `--fake` runs the
 > scripted Stage 2 agent offline.
 
@@ -121,21 +120,28 @@ cargo test --workspace --all-features   # includes the conformance suites
 
 Requires Rust 1.85+ (edition 2024).
 
-## Setting up an API key
+## Setting up a model
 
-Nixxa uses Claude through the Anthropic API with your own API key (from the
-[Anthropic Console](https://console.anthropic.com)). Choose one of these:
+With nothing set up yet, Nixxa opens a setup screen with two choices. Press `ctrl-a` to come back to
+it later.
 
-- **In the TUI (recommended).** With no account yet, Nixxa shows a setup screen. Paste the key: it is
-  masked, and only the last four characters are ever shown. Nixxa checks it with Anthropic
-  (a free call) and saves it in your OS keychain (Secret Service on Linux, Keychain on macOS,
-  Credential Manager on Windows) as `anthropic:default`. It's remembered across restarts and
-  never written to a file. To replace it later, press `ctrl-a`.
-- **From the environment.** `ANTHROPIC_API_KEY=… nixxa`. The key is used as a read-only
-  `anthropic:env` account and never saved. A key saved in the keychain takes precedence.
+1. **Anthropic API key (Claude).** Paste a key from the
+   [Anthropic Console](https://console.anthropic.com). It's masked, and only the last four
+   characters are ever shown. Nixxa checks it with Anthropic (a free call) and saves it in your OS
+   keychain (Secret Service on Linux, Keychain on macOS, Credential Manager on Windows) as
+   `anthropic:default`, never in a file. Or set `ANTHROPIC_API_KEY=…`: it's used as a read-only
+   `anthropic:env` account and never saved.
+2. **Local model.** Start LM Studio's server (`http://localhost:1234/v1`) or Ollama
+   (`http://localhost:11434/v1`) with a model loaded, and give Nixxa the URL. It lists the
+   server's chat models; pick one that can call tools (e.g. gpt-oss, qwen3, llama3.1+).
+   Nixxa checks the server offers it and saves the server as `local:default`. Nothing leaves your
+   machine, and it costs nothing.
 
-Other settings: `NIXXA_MODEL` (default `claude-sonnet-5-5`), `NIXXA_EFFORT`
-(`low`…`max`), `NIXXA_LOG` (log level), `NO_COLOR`. See `nixxa --help`. Logs go to
+Nixxa starts with whichever account you set up last, and remembers it across restarts. Setting up
+another one switches to it right away, in a new session.
+
+Other settings: `NIXXA_MODEL` (the Claude model; default `claude-sonnet-5-5`), `NIXXA_EFFORT`
+(`low`…`max`, Claude), `NIXXA_LOG` (log level), `NO_COLOR`. See `nixxa --help`. Logs go to
 `<data dir>/nixxa/logs/` and contain metadata only, never your key or messages.
 
 ## Documents
