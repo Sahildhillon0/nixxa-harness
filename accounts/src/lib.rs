@@ -1,6 +1,10 @@
 //! `nixxa-accounts` — holds every account and API key, in the OS keychain.
 //!
-//! Stage 1: the contract lives in `nixxa-contracts`. The API-key / keychain credential
-//! store arrives in Stage 3; the multi-account and switching methods arrive in Stage 8.
+//! Stage 3: [`KeychainCredentials`] stores API-key accounts in the OS keychain and exposes
+//! environment-variable keys as read-only accounts. Multi-account switching, sign-in methods
+//! and the encrypted-file fallback arrive in Stage 8.
 
+mod keychain;
 pub mod memory;
+
+pub use keychain::{ENV_ACCOUNT, EnvKey, KeychainConfig, KeychainCredentials};
