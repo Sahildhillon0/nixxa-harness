@@ -16,4 +16,4 @@ serde_json = { workspace = true }
 
 [dev-dependencies]
 nixxa-contracts = { workspace = true, features = ["conformance"] }
-tokio = { version = "1", features = ["macros", "rt"] }
+tokio = { workspace = true }
