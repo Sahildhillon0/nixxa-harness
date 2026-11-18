@@ -43,6 +43,8 @@ OpenAI-compatible providers.
   - `content_filter` and an `error` chunk are provider errors;
   - a stream may end without `[DONE]` once a choice has finished.
 - **Cost:** `Some(0)` for a local server; otherwise `None` (never guessed).
+- **No tools:** a server's "does not support tools" error (any common wording) becomes
+  ``Provider("`<model>` can't use tools. Pick a tool-capable model …")``.
 - **`list_models`:** the ids, plus tool support (`supported_parameters` / `capabilities`) and free
   (`:free`, or both prices 0), only when the server reports them. `verify` checks that the
   configured model is offered and lists what is.
