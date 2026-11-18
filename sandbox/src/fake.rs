@@ -96,7 +96,7 @@ impl Sandbox for FakeSandbox {
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
-        self.files.lock().unwrap().clear();
+        // The fake never runs anything, so there is nothing to kill; the workspace is kept.
         Ok(())
     }
 }
@@ -104,11 +104,25 @@ impl Sandbox for FakeSandbox {
 #[cfg(all(test, feature = "conformance"))]
 mod tests {
     use nixxa_contracts::conformance::sandbox::run;
+    use nixxa_contracts::{ActionId, Outcome, Sandbox, SandboxAction};
 
     use super::FakeSandbox;
 
     #[tokio::test]
     async fn fake_sandbox_conforms() {
         run(FakeSandbox::default).await;
+    }
+
+    #[tokio::test]
+    async fn reset_keeps_the_workspace() {
+        let sandbox = FakeSandbox::default();
+        let id = ActionId::new("unit-reset");
+        sandbox
+            .execute(id, SandboxAction::WriteFile { path: "keep.txt".into(), content: "kept".into() })
+            .await
+            .expect("write");
+        sandbox.reset().await.expect("reset");
+        let read = sandbox.execute(id, SandboxAction::ReadFile { path: "keep.txt".into() }).await.expect("read");
+        assert!(matches!(read.outcome, Outcome::Text { .. }), "reset must keep the workspace");
     }
 }
