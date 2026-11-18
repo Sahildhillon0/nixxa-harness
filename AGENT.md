@@ -14,8 +14,9 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 2 — Walking skeleton (done); Stage 3 — Real brain is next.** Every module exists; brain,
-sandbox, store, knowledge and credentials are fakes, and the harness runs the TUI end to end.
+**Stage 3 — Real brain (done); Stage 4 — Real sandbox is next.** The brain is Claude
+(`AnthropicBrain`) and keys live in the OS keychain (`KeychainCredentials`). The sandbox, store
+and knowledge are still fakes. `--fake` runs the scripted brain.
 Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
