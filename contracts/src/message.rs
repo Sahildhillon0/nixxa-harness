@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionRequest, Observation, Timestamp};
+use crate::{ActionRequest, Observation, ProviderId, Timestamp};
 
 /// Who a [`Message`] is from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -36,6 +36,15 @@ pub enum Content {
     Observation {
         /// The result.
         observation: Observation,
+    },
+    /// Provider-owned data the brain asked to keep in the conversation (role [`Role::Agent`]),
+    /// e.g. a model's signed thinking block that must be sent back unchanged on later calls.
+    /// Opaque to everything but the brain that produced it; never shown to the user.
+    Reasoning {
+        /// The provider that produced it; other providers ignore it.
+        provider: ProviderId,
+        /// The provider's own representation, kept byte-for-byte equivalent.
+        data: serde_json::Value,
     },
 }
 

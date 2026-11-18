@@ -9,11 +9,18 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Answer from recorded responses instead of the network (tests of the real wiring).
+replay = []
+
 [dependencies]
 async-trait = { workspace = true }
+bytes = { workspace = true }
 futures = { workspace = true }
 nixxa-contracts = { workspace = true }
+reqwest = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 nixxa-contracts = { workspace = true, features = ["conformance"] }

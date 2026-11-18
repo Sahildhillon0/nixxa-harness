@@ -26,6 +26,8 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 
 /// What the agent is told when a turn is interrupted.
 const INTERRUPTED: &str = "interrupted by the user";
+/// What an action that never ran is told when the turn stopped before it.
+const NOT_RUN: &str = "not run: the turn stopped before this action";
 
 /// A command the harness sends to the controller's loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +269,12 @@ impl Controller {
         self.record_message(turn, message, true).await;
     }
 
-    /// One think step: build the context, stream the brain, apply its intents.
+    /// One think step: build the context, stream the brain, then run its actions.
+    ///
+    /// The brain's output for the step (reasoning, text, every proposed action) is recorded in
+    /// stream order first, and only then are the actions gated and run, so their observations
+    /// follow together. That keeps the model's message whole in the history, which providers
+    /// that sign their reasoning require (D-028).
     async fn step(&mut self, turn: &TurnId) -> Flow {
         let context = self.build_context().await;
         let mut stream = match cancellable(&self.cancel, self.brain.think(context)).await {
@@ -278,27 +285,51 @@ impl Controller {
                 return Flow::Finish;
             }
         };
-        let mut flow = Flow::Continue;
+        let mut pending: VecDeque<ActionRequest> = VecDeque::new();
+        let mut done = false;
         let mut saw_intent = false;
         loop {
-            let Some(next) = cancellable(&self.cancel, stream.next()).await else { return Flow::Cancelled };
+            let Some(next) = cancellable(&self.cancel, stream.next()).await else {
+                self.close_unrun(turn, pending, INTERRUPTED).await;
+                return Flow::Cancelled;
+            };
             let Some(item) = next else { break };
             match item {
                 // Usage is always reported, even after the turn has finished, so it is never lost.
                 Ok(BrainEvent::Usage { usage }) => {
                     self.emit(Event::Usage { account: self.config.account.clone(), usage });
                 }
-                Ok(_) if flow != Flow::Continue => {}
+                Ok(_) if done => {}
                 Ok(BrainEvent::TextDelta { text }) => self.emit(Event::TextDelta { turn: turn.clone(), text }),
+                Ok(BrainEvent::Reasoning { provider, data }) => {
+                    // Kept for the brain, in stream order; never shown.
+                    let content = Content::Reasoning { provider, data };
+                    let message = Message { role: Role::Agent, content, at: self.now() };
+                    self.record_message(turn, message, false).await;
+                }
                 Ok(BrainEvent::Intent { intent }) => {
                     saw_intent = true;
-                    flow = self.handle_intent(turn, intent).await;
-                    if flow == Flow::Cancelled {
-                        return flow;
+                    match intent {
+                        Intent::Say { text } => {
+                            let message = Message::text(Role::Agent, text, self.now());
+                            self.record_message(turn, message, true).await;
+                        }
+                        Intent::Act { request } => {
+                            self.propose(turn, &request).await;
+                            pending.push_back(request);
+                        }
+                        Intent::Done { summary } => {
+                            // Stored, but kept out of what the brain sees: it isn't part of the
+                            // model's own message (D-029).
+                            let message = Message::text(Role::Agent, summary, self.now());
+                            self.store_message(turn, &message).await;
+                            done = true;
+                        }
                     }
                 }
                 Err(err) => {
                     self.emit(Event::Error { turn: Some(turn.clone()), message: err.to_string() });
+                    self.close_unrun(turn, pending, NOT_RUN).await;
                     return Flow::Finish;
                 }
             }
@@ -310,38 +341,43 @@ impl Controller {
             });
             return Flow::Finish;
         }
-        flow
-    }
-
-    /// Applies one brain intent.
-    async fn handle_intent(&mut self, turn: &TurnId, intent: Intent) -> Flow {
-        match intent {
-            Intent::Say { text } => {
-                let message = Message::text(Role::Agent, text, self.now());
-                self.record_message(turn, message, true).await;
-                Flow::Continue
+        while let Some(request) = pending.pop_front() {
+            match self.act(turn, request).await {
+                Flow::Continue => {}
+                Flow::Finish => {
+                    self.close_unrun(turn, pending, NOT_RUN).await;
+                    return Flow::Finish;
+                }
+                Flow::Cancelled => {
+                    self.close_unrun(turn, pending, INTERRUPTED).await;
+                    return Flow::Cancelled;
+                }
             }
-            Intent::Done { summary } => {
-                // Kept for the brain and the db, but not shown: what the user sees is what the
-                // agent said.
-                let message = Message::text(Role::Agent, summary, self.now());
-                self.record_message(turn, message, false).await;
-                Flow::Finish
-            }
-            Intent::Act { request } => self.act(turn, request).await,
         }
+        if done { Flow::Finish } else { Flow::Continue }
     }
 
-    /// Gates, routes and records one proposed action. An infrastructure failure ends the turn;
-    /// denials and action-level failures go back to the brain as observations. An interrupt
-    /// while asking or running still closes the action with an observation, so the history
-    /// never holds a proposal without its result.
-    async fn act(&mut self, turn: &TurnId, request: ActionRequest) -> Flow {
+    /// Records a proposed action in the conversation and announces it.
+    async fn propose(&mut self, turn: &TurnId, request: &ActionRequest) {
         let proposal =
             Message { role: Role::Agent, content: Content::Action { request: request.clone() }, at: self.now() };
         self.record_message(turn, proposal, false).await;
         self.emit(Event::ActionProposed { turn: turn.clone(), request: request.clone() });
+    }
 
+    /// Closes proposals that will never run with a denial, so every proposal has a result.
+    async fn close_unrun(&mut self, turn: &TurnId, unrun: VecDeque<ActionRequest>, reason: &str) {
+        for request in unrun {
+            let observation = Observation::denied(request.id.clone(), reason);
+            self.finish_action(turn, request, Verdict::Deny(reason.into()), observation).await;
+        }
+    }
+
+    /// Gates, routes and records one already-proposed action. An infrastructure failure ends the
+    /// turn; denials and action-level failures go back to the brain as observations. An
+    /// interrupt while asking or running still closes the action with an observation, so the
+    /// history never holds a proposal without its result.
+    async fn act(&mut self, turn: &TurnId, request: ActionRequest) -> Flow {
         let verdict = match policy::gate(&request) {
             Verdict::Ask(reason) => {
                 self.emit(Event::ApprovalNeeded {
@@ -415,6 +451,14 @@ impl Controller {
                 let message = format!("could not save the action: {err}");
                 self.emit(Event::Error { turn: Some(turn.clone()), message });
             }
+        }
+    }
+
+    /// Saves a message to the store only: the brain never sees it.
+    async fn store_message(&mut self, turn: &TurnId, message: &Message) {
+        let Some(id) = self.session_id() else { return };
+        if let Err(err) = self.store.append_message(&id, message.clone()).await {
+            self.emit(Event::Error { turn: Some(turn.clone()), message: format!("could not save the message: {err}") });
         }
     }
 

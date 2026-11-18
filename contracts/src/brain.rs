@@ -51,6 +51,16 @@ pub enum BrainEvent {
         /// The intent.
         intent: Intent,
     },
+    /// Provider-owned data to keep in the conversation, in stream order relative to the
+    /// intents around it (e.g. a signed thinking block that precedes a tool call). The
+    /// controller records it as [`Content::Reasoning`](crate::Content::Reasoning) without showing
+    /// it, and the brain gets it back in later contexts.
+    Reasoning {
+        /// The provider that produced it.
+        provider: ProviderId,
+        /// The provider's own representation.
+        data: serde_json::Value,
+    },
     /// Usage for this step, usually last.
     Usage {
         /// The usage.
