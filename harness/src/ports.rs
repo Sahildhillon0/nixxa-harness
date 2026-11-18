@@ -77,7 +77,9 @@ impl ApprovalPort for TuiApprovals {
         if self.tx.send(UiEvent::Approval(prompt)).is_err() {
             return Verdict::Deny("the approval prompt is closed".into());
         }
-        answer.await.unwrap_or_else(|_| Verdict::Deny("the approval prompt is closed".into()))
+        let verdict = answer.await.unwrap_or_else(|_| Verdict::Deny("the approval prompt is closed".into()));
+        crate::logging::approval(&request.id, &verdict);
+        verdict
     }
 }
 

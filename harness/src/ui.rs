@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
+use crate::safe;
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
 const WIDE: u16 = 100;
@@ -74,6 +75,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, theme, input);
     frame.render_widget(Paragraph::new(hint_line(app, theme, hints.width)), hints);
     draw_approval(frame, app, theme, if side.area() > 0 { side } else { body });
+    safe::scrub(frame.buffer_mut());
 }
 
 fn pane(title: &str, focused: bool, theme: Theme) -> Block<'static> {
@@ -88,15 +90,17 @@ fn status_line(app: &App, theme: Theme) -> Line<'static> {
         spans.push(Span::styled(text, style));
     };
     if let Some(session) = &app.session {
-        part(&mut spans, session.to_string(), Style::new());
+        part(&mut spans, safe::line(session.as_str()), Style::new());
     }
     if let Some(account) = &app.account {
         let model = app.brain.as_ref().map(|b| format!(" · {}", b.model)).unwrap_or_default();
-        part(&mut spans, format!("{account}{model}"), Style::new());
+        part(&mut spans, safe::line(&format!("{account}{model}")), Style::new());
     }
     match &app.sandbox {
-        Some(caps) if caps.isolated => part(&mut spans, format!("{} ● isolated", caps.backend), theme.ok()),
-        Some(caps) => part(&mut spans, format!("{} ○ NOT ISOLATED", caps.backend), theme.bad()),
+        Some(caps) if caps.isolated => {
+            part(&mut spans, format!("{} ● isolated", safe::line(&caps.backend)), theme.ok())
+        }
+        Some(caps) => part(&mut spans, format!("{} ○ NOT ISOLATED", safe::line(&caps.backend)), theme.bad()),
         None => {}
     }
     if !app.sources.is_empty() {
@@ -107,7 +111,7 @@ fn status_line(app: &App, theme: Theme) -> Line<'static> {
                 SourceStatus::Missing => ("○", theme.dim()),
                 SourceStatus::Error(_) => ("✗", theme.bad()),
             };
-            spans.push(Span::raw(format!(" {} ", source.id)));
+            spans.push(Span::raw(format!(" {} ", safe::line(source.id.as_str()))));
             spans.push(Span::styled(icon, style));
         }
     }
@@ -127,19 +131,25 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, theme: Theme, area: Rect)
 
     let mut lines: Vec<Line<'static>> = Vec::new();
     let streaming = app.streaming.as_ref().map(|text| (Speaker::Agent, format!("{text}▌")));
-    let entries = app.conversation.iter().map(|e| (e.speaker, e.text.clone())).chain(streaming);
-    for (speaker, text) in entries {
+    let entries = app
+        .conversation
+        .iter()
+        .map(|e| (e.speaker, e.text.clone(), false))
+        .chain(streaming.map(|(s, t)| (s, t, false)));
+    let queued = app.queued.iter().map(|text| (Speaker::User, format!("{text} (queued)"), true));
+    for (speaker, text, waiting) in entries.chain(queued) {
         let (label, style) = match speaker {
+            Speaker::User if waiting => ("you", theme.dim()),
             Speaker::User => ("you", Style::new()),
             Speaker::Agent => ("nixxa", theme.accent()),
             Speaker::System => ("note", theme.dim()),
             Speaker::Error => ("error", theme.bad()),
         };
-        for (i, row) in wrap(&text, width).into_iter().enumerate() {
+        for (i, row) in wrap(&safe::lines(&text).join("\n"), width).into_iter().enumerate() {
             let label = if i == 0 { label } else { "" };
             lines.push(Line::from(vec![
                 Span::styled(format!("{label:<LABEL$}"), style.add_modifier(Modifier::BOLD)),
-                Span::styled(row, if speaker == Speaker::User { Style::new() } else { style }),
+                Span::styled(row, if speaker == Speaker::User && !waiting { Style::new() } else { style }),
             ]));
         }
         lines.push(Line::default());
@@ -207,8 +217,9 @@ fn state_icon(state: ActivityState, theme: Theme) -> (&'static str, Style) {
 }
 
 /// `(kind, target)` for an action, e.g. `("exec", "cargo test")` or `("notes", "search")`.
+/// Both are safe to draw.
 fn describe(request: &ActionRequest) -> (String, String) {
-    match &request.action {
+    let (kind, target) = match &request.action {
         Action::Sandbox { action } => match action {
             SandboxAction::Exec { command, .. } => ("exec".into(), command.clone()),
             SandboxAction::ReadFile { path } => ("read".into(), path.clone()),
@@ -219,7 +230,8 @@ fn describe(request: &ActionRequest) -> (String, String) {
             KnowledgeAction::Call { source, tool, args } => (source.to_string(), format!("{tool} {args}")),
             KnowledgeAction::Record { source, entry } => (source.to_string(), format!("record {}", entry.title)),
         },
-    }
+    };
+    (safe::line(&kind), safe::line(&target))
 }
 
 fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
@@ -233,28 +245,38 @@ fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     };
     let mut lines: Vec<Line> = Vec::new();
     if let Some(reason) = &activity.request.reason {
-        lines.push(Line::from(vec![Span::styled("why  ", theme.dim()), Span::raw(format!("\"{reason}\""))]));
+        lines.push(Line::from(vec![
+            Span::styled("why  ", theme.dim()),
+            Span::raw(format!("\"{}\"", safe::line(reason))),
+        ]));
     }
     match activity.observation.as_ref().map(|o| &o.outcome) {
         None => lines.push(Line::styled("waiting…", theme.dim())),
         Some(Outcome::Exec { exit_code, stdout, stderr }) => {
             let code = exit_code.map_or_else(|| "killed".to_string(), |c| c.to_string());
             lines.push(Line::from(vec![Span::styled("exit ", theme.dim()), Span::raw(code)]));
-            lines.extend(stdout.lines().map(|l| Line::raw(l.to_string())));
-            lines.extend(stderr.lines().map(|l| Line::styled(l.to_string(), theme.bad())));
+            lines.extend(output_lines(stdout).into_iter().map(Line::raw));
+            lines.extend(output_lines(stderr).into_iter().map(|l| Line::styled(l, theme.bad())));
         }
-        Some(Outcome::Text { content }) => lines.extend(content.lines().map(|l| Line::raw(l.to_string()))),
-        Some(Outcome::Listing { entries }) => lines
-            .extend(entries.iter().map(|e| Line::raw(if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }))),
+        Some(Outcome::Text { content }) => lines.extend(output_lines(content).into_iter().map(Line::raw)),
+        Some(Outcome::Listing { entries }) => lines.extend(
+            entries
+                .iter()
+                .map(|e| Line::raw(safe::line(&if e.is_dir { format!("{}/", e.name) } else { e.name.clone() }))),
+        ),
         Some(Outcome::Written { bytes }) => lines.push(Line::raw(format!("wrote {bytes} bytes"))),
         Some(Outcome::Recorded { location }) => {
             lines.push(Line::raw(format!(
                 "recorded{}",
-                location.as_ref().map(|l| format!(" at {l}")).unwrap_or_default()
+                location.as_ref().map(|l| format!(" at {}", safe::line(l))).unwrap_or_default()
             )));
         }
-        Some(Outcome::Denied { reason }) => lines.push(Line::styled(format!("denied: {reason}"), theme.bad())),
-        Some(Outcome::Failed { message }) => lines.push(Line::styled(format!("failed: {message}"), theme.bad())),
+        Some(Outcome::Denied { reason }) => {
+            lines.push(Line::styled(format!("denied: {}", safe::line(reason)), theme.bad()))
+        }
+        Some(Outcome::Failed { message }) => {
+            lines.push(Line::styled(format!("failed: {}", safe::line(message)), theme.bad()))
+        }
     }
     if activity.observation.as_ref().is_some_and(|o| o.truncated) {
         lines.push(Line::styled("(output truncated)", theme.dim()));
@@ -272,11 +294,11 @@ fn draw_input(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         .iter()
         .enumerate()
         .skip(visible)
-        .map(|(i, row)| Line::raw(format!("{}{row}", if i == 0 { "> " } else { "  " })))
+        .map(|(i, row)| Line::raw(format!("{}{}", if i == 0 { "> " } else { "  " }, safe::line(row))))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
     if app.focus == Focus::Input && inner.area() > 0 {
-        let last = rows.last().map_or(0, |r| r.chars().count());
+        let last = rows.last().map_or(0, |r| safe::line(r).chars().count());
         let x =
             inner.x.saturating_add(u16::try_from(last + 2).unwrap_or(u16::MAX)).min(inner.right().saturating_sub(1));
         let y = inner.y.saturating_add(u16::try_from((rows.len() - visible).saturating_sub(1)).unwrap_or(0));
@@ -288,7 +310,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     let keys = if app.approval().is_some() {
         "y allow · n deny · ctrl-c interrupt".to_string()
     } else if let Some(notice) = &app.notice {
-        notice.clone()
+        safe::line(notice)
     } else {
         "enter send · alt-enter newline · tab focus · j/k move · ctrl-c interrupt (twice: quit)".to_string()
     };
@@ -306,12 +328,15 @@ fn draw_approval(frame: &mut Frame, app: &mut App, theme: Theme, over: Rect) {
     let (kind, target) = describe(&prompt.request);
     let mut lines = vec![Line::from(vec![Span::styled(format!("{kind:<6}"), theme.dim()), Span::raw(target)])];
     if let Action::Sandbox { action: SandboxAction::Exec { cwd: Some(cwd), .. } } = &prompt.request.action {
-        lines.push(Line::from(vec![Span::styled("cwd   ", theme.dim()), Span::raw(cwd.clone())]));
+        lines.push(Line::from(vec![Span::styled("cwd   ", theme.dim()), Span::raw(safe::line(cwd))]));
     }
     if let Some(reason) = &prompt.request.reason {
-        lines.push(Line::from(vec![Span::styled("why   ", theme.dim()), Span::raw(format!("\"{reason}\""))]));
+        lines.push(Line::from(vec![
+            Span::styled("why   ", theme.dim()),
+            Span::raw(format!("\"{}\"", safe::line(reason))),
+        ]));
     }
-    lines.push(Line::styled(prompt.reason.clone(), theme.dim()));
+    lines.push(Line::styled(safe::line(&prompt.reason), theme.dim()));
     lines.push(Line::default());
     lines.push(Line::from(vec![
         Span::styled("[y]", theme.ok()),
@@ -326,6 +351,18 @@ fn draw_approval(frame: &mut Frame, app: &mut App, theme: Theme, over: Rect) {
     let block = Block::bordered().title(" Approve action? ").border_style(theme.pending());
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+}
+
+/// Untrusted output, one safe line per line; a trailing newline adds no empty line.
+fn output_lines(text: &str) -> Vec<String> {
+    let mut lines = safe::lines(text);
+    if text.ends_with('\n') {
+        lines.pop();
+    }
+    if text.is_empty() {
+        lines.clear();
+    }
+    lines
 }
 
 /// Greedy word wrap by characters; long words are split.
@@ -491,6 +528,110 @@ mod tests {
             screen(&mut app, width, height);
             app.focus = Focus::Input;
         }
+    }
+
+    /// Everything a hostile string can carry onto the terminal.
+    const HOSTILE: &str = "ok\x1b]0;PWNED-TITLE\x07\x1b]52;c;cHduZWQ=\x07\x1b[2J\r\u{202E}gnp.exe\u{9b}done";
+
+    fn hostile_app() -> App {
+        let mut app = started();
+        let turn = TurnId::new("turn-0");
+        app.apply(Event::Message { turn: turn.clone(), message: Message::text(Role::Agent, HOSTILE, Timestamp(0)) });
+        app.apply(Event::Error { turn: Some(turn.clone()), message: HOSTILE.into() });
+        let request = ActionRequest {
+            id: ActionId::new("a1"),
+            action: Action::Sandbox {
+                action: SandboxAction::Exec { command: HOSTILE.into(), cwd: Some(HOSTILE.into()), timeout_ms: None },
+            },
+            reason: Some(HOSTILE.into()),
+        };
+        app.apply(Event::ActionProposed { turn: turn.clone(), request });
+        app.apply(Event::ActionFinished {
+            turn,
+            observation: Observation::new(
+                ActionId::new("a1"),
+                Outcome::Exec { exit_code: Some(0), stdout: HOSTILE.into(), stderr: HOSTILE.into() },
+            ),
+        });
+        app.streaming = Some(HOSTILE.into());
+        app.input = HOSTILE.into();
+        app
+    }
+
+    /// Regression (PR #4 review, B1): content must never put its own control sequences on the
+    /// host terminal. Drawn through the real crossterm backend into a byte buffer.
+    #[test]
+    fn hostile_content_never_reaches_the_terminal_raw() {
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::{TerminalOptions, Viewport};
+
+        let mut app = hostile_app();
+        let (prompt, _answer) = crate::ports::PendingApproval::for_test(app.activity[0].request.clone(), HOSTILE);
+        app.ask(prompt);
+        /// Keeps what the backend writes, readable after the draw.
+        #[derive(Clone, Default)]
+        struct Captured(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let captured = Captured::default();
+        let viewport = Viewport::Fixed(Rect::new(0, 0, 160, 40));
+        let mut terminal =
+            Terminal::with_options(CrosstermBackend::new(captured.clone()), TerminalOptions { viewport }).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let bytes = captured.0.borrow().clone();
+        let output = String::from_utf8_lossy(&bytes);
+
+        assert!(!output.contains("\x1b]"), "an OSC sequence (title, clipboard) reached the terminal");
+        assert!(!output.contains('\x07'), "a BEL reached the terminal");
+        assert!(!output.contains("\x1b[2J"), "a clear-screen reached the terminal");
+        assert!(!output.contains('\r'), "a carriage return reached the terminal");
+        assert!(!output.contains('\u{202E}'), "a bidi override reached the terminal");
+        assert!(!output.contains('\u{9b}'), "a C1 control reached the terminal");
+        assert!(output.contains("^[]0;PWNED-TITLE^G"), "the sequence is shown, visibly");
+    }
+
+    #[test]
+    fn every_pane_shows_hostile_content_visibly() {
+        let mut app = hostile_app();
+        let screen = screen(&mut app, 200, 40);
+        assert!(!screen.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(screen.contains("^[]0;PWNED-TITLE^G"));
+    }
+
+    #[test]
+    fn the_approval_prompt_cannot_be_spoofed() {
+        let mut app = started();
+        let request = ActionRequest {
+            id: ActionId::new("a1"),
+            action: Action::Sandbox {
+                action: SandboxAction::Exec {
+                    command: "rm -rf ~ \r\x1b[2Kecho harmless".into(),
+                    cwd: None,
+                    timeout_ms: None,
+                },
+            },
+            reason: Some("tidy \u{202E}up".into()),
+        };
+        let (prompt, _answer) = crate::ports::PendingApproval::for_test(request, "approval needed");
+        app.ask(prompt);
+        let screen = screen(&mut app, 120, 24);
+        assert!(screen.contains("rm -rf ~ ^M^[[2Kecho harmless"), "the real command is shown in full:\n{screen}");
+        assert!(screen.contains("tidy <U+202E>up"));
+    }
+
+    #[test]
+    fn queued_messages_show_dimmed_after_the_conversation() {
+        let mut app = started();
+        app.queued.push_back("later".into());
+        assert!(screen(&mut app, 120, 20).contains("you   later (queued)"));
     }
 
     #[test]

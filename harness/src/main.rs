@@ -5,7 +5,10 @@
 //! to end. See ARCHITECTURE.md § Stages.
 
 mod app;
+mod logging;
+mod paths;
 mod ports;
+mod safe;
 mod tui;
 mod ui;
 mod wiring;

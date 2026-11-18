@@ -97,6 +97,8 @@ pub(crate) struct App {
     pub(crate) conversation: Vec<Entry>,
     /// Text streamed for the agent message being written; replaced by the final message.
     pub(crate) streaming: Option<String>,
+    /// Messages sent while a turn was running, waiting for the controller to start them.
+    pub(crate) queued: VecDeque<String>,
     pub(crate) activity: Vec<Activity>,
     /// The selected activity line; `None` = follow the newest.
     selected: Option<usize>,
@@ -124,6 +126,7 @@ impl App {
             cost_micro_usd: 0,
             conversation: Vec::new(),
             streaming: None,
+            queued: VecDeque::new(),
             activity: Vec::new(),
             selected: None,
             scroll_back: 0,
@@ -141,6 +144,11 @@ impl App {
     pub(crate) fn approval(&mut self) -> Option<&PendingApproval> {
         self.approvals.retain(|prompt| !prompt.is_abandoned());
         self.approvals.front()
+    }
+
+    /// Adds a note from the harness itself to the conversation.
+    pub(crate) fn note(&mut self, text: impl Into<String>) {
+        self.conversation.push(Entry { speaker: Speaker::System, text: text.into() });
     }
 
     /// Queues an approval prompt.
@@ -177,7 +185,13 @@ impl App {
             Event::Message { message, .. } => {
                 let Content::Text { text } = message.content else { return };
                 let speaker = match message.role {
-                    Role::User => Speaker::User,
+                    Role::User => {
+                        // Its turn started: it is no longer waiting.
+                        if self.queued.front() == Some(&text) {
+                            self.queued.pop_front();
+                        }
+                        Speaker::User
+                    }
                     Role::Agent => {
                         // The final message replaces whatever was streamed for it.
                         self.streaming = None;
@@ -282,6 +296,10 @@ impl App {
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.input);
                 if !text.trim().is_empty() {
+                    if self.busy {
+                        // The controller runs it after the current turn; show it until then.
+                        self.queued.push_back(text.clone());
+                    }
                     return vec![Effect::Send(Command::UserMessage(text))];
                 }
             }
@@ -358,6 +376,23 @@ pub(crate) mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::Send(Command::UserMessage("hi".into()))]);
         assert!(app.input.is_empty());
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "blank input is not sent");
+    }
+
+    #[test]
+    fn a_message_sent_during_a_turn_shows_as_queued_until_its_turn_starts() {
+        let mut app = App::new(true);
+        app.apply(Event::TurnStarted { turn: turn() });
+        type_text(&mut app, "next");
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.queued, ["next"]);
+        app.apply(Event::TurnDone { turn: turn() });
+        app.apply(Event::TurnStarted { turn: TurnId::new("turn-1") });
+        app.apply(Event::Message {
+            turn: TurnId::new("turn-1"),
+            message: Message::text(Role::User, "next", Timestamp(0)),
+        });
+        assert!(app.queued.is_empty());
+        assert_eq!(app.conversation, vec![Entry { speaker: Speaker::User, text: "next".into() }]);
     }
 
     #[test]

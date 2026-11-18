@@ -22,6 +22,9 @@ nixxa-knowledge = { workspace = true }
 nixxa-sandbox = { workspace = true }
 ratatui = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true }
 
 [[bin]]
 name = "nixxa"
