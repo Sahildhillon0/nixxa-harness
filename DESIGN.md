@@ -114,7 +114,7 @@ The mode is always shown in the hint bar and changeable with one key.
 | `y` / `n` | approve / deny in a prompt |
 | `ctrl-s` | session list |
 | `ctrl-k` | knowledge panel: source status, paths found, enable/disable per source |
-| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account (Stage 3: the setup screen: Anthropic key or local model) |
+| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account (Stage 3: the setup screen: Anthropic key, local model, or OpenRouter sign-in) |
 | `?` | help overlay |
 
 ### Visual language
@@ -203,6 +203,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-034 | A local-server account stores no secret: its base URL is the registry hint; a key is never sent over plain http to another machine | A base URL isn't secret, and local servers need no auth. Sending a bearer key in clear text across a network would leak it. | 3 |
 | D-035 | Small non-secret settings (`active_account`, a local account's `model.<account>`) live in the keychain account registry (`KeychainCredentials::setting` / `set_setting`) | It keeps the harness file-free like the accounts (D-022) without a contract change: `AccountInfo` has no model field, and which account to start with is per installation. Never secrets. | 3 |
 | D-036 | Nixxa starts with the account set up last; setting up an account switches to it at once in a new session (except rotating the key of the account in use) | Setting up a local model and then still talking to Claude would surprise; the conversation isn't persisted yet (Stage 5), so a new session loses nothing that could be kept. | 3 |
+| D-037 | OpenRouter OAuth (PKCE) moved forward from Stage 8 as the first `SignIn` method; claude.ai or any other subscription login stays excluded, and no other app's tokens are reused | OpenRouter's docs offer the PKCE flow to third-party apps and issue a key the user controls and can revoke, so it's within D-017. It gives a hosted option without pasting keys. A privacy notice is confirmed first, because the conversation (workspace files, notes, memory) leaves the machine and free models may log or train on it. | 3 |
+| D-038 | The harness opens sign-in pages through the OS with the URL as one argument and no shell (`xdg-open`, `open`, `rundll32 url.dll,FileProtocolHandler`), and shows the address to copy if that fails | A shell would read the URL as commands. `start` is a `cmd` built-in, so on Windows it would need a shell. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 

@@ -318,7 +318,7 @@ Any account, any provider, any integration — and as many per provider as the u
 |---|---|---|
 | `ApiKey` | Anthropic Console, OpenAI, Gemini, OpenRouter, Mistral, Groq, Context7, OpenAI-compatible endpoints | key in OS keychain |
 | `Cloud` | Bedrock, Vertex AI, Azure / Microsoft Foundry | a reference to the cloud's own profile/credentials (Nixxa does not copy them) |
-| `SignIn` | providers that officially allow third-party OAuth sign-in | access + refresh token in OS keychain; refreshed automatically |
+| `SignIn` | providers that officially allow third-party OAuth sign-in. First: OpenRouter's OAuth PKCE flow (Stage 3), which issues a user-controlled key | the key or token in the OS keychain; refresh where a provider issues expiring tokens (Stage 8) |
 | `Local` | Ollama, LM Studio, llama.cpp | base URL only |
 | `Env` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … | not stored; read at startup, shown as a read-only account |
 
@@ -340,6 +340,10 @@ recorded in the DESIGN.md decision log before it is built.
 - **Metadata** (provider, label, method, default, hint): a JSON registry in the keychain entry
   `nixxa/_registry`, no secrets, so accounts need no file and only the harness reads config
   (D-022).
+- **Sign-in methods** live in `accounts/src/methods/`: a provider-neutral PKCE helper and a
+  loopback callback listener (127.0.0.1 only, one request, timeout, cancellable), plus one
+  concrete flow per provider (`OpenRouterSignIn`). The harness drives them and opens the browser;
+  accounts never does.
 - **Env accounts:** the harness reads `ANTHROPIC_API_KEY` (and later others) and hands them to
   `accounts`, which lists them as read-only `<provider>:env` accounts and never stores them.
   An env account is its provider's default whenever no stored account is.
@@ -479,6 +483,9 @@ Every stage ends with something that runs and a checklist that must be true befo
 - First real provider with streaming and tool calling.
 - `accounts` comes alive: add an API key from the TUI (stored in the OS keychain) or use an env
   var; one account per provider for now.
+- Re-planned (no Anthropic key available): an OpenAI-compatible provider for local models (LM
+  Studio / Ollama) as a second setup option, and OpenRouter OAuth sign-in moved forward from
+  Stage 8 as the first sign-in method (D-037).
 - Token counting and context-window trimming.
 - **Exit:** a real model chats and proposes real actions (still executed by fakes); the key
   survives a restart without ever being written to a plain-text file.
@@ -517,7 +524,7 @@ Every stage ends with something that runs and a checklist that must be true befo
   AI, Azure / Microsoft Foundry).
 - Multiple accounts per provider, default account, per-session and mid-session switching.
 - Sign-in (OAuth) flows for providers whose terms allow third-party apps; each recorded in the
-  decision log.
+  decision log. (OpenRouter's arrived early, in Stage 3.)
 - Encrypted-file fallback for headless Linux; token refresh and revocation.
 - Accounts screen in the TUI; per-account usage and cost.
 - **Exit:** add two accounts for one provider and one for another, switch between them in a

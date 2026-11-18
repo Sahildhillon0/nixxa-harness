@@ -11,8 +11,8 @@ Replace one, and the rest never notice.
 
 > **Status: Stage 3 — Real brain (in progress).** `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
 > tool use, or to a **local model** (LM Studio / Ollama, through their OpenAI-compatible
-> endpoint), chosen on the setup screen. A key stays in the OS keychain, never in a file. Still to
-> come in Stage 3: OpenRouter sign-in. The live checks against the Anthropic API haven't been run yet. The sandbox,
+> endpoint), or to **OpenRouter** after signing in through the browser, all chosen on the setup
+> screen. Keys stay in the OS keychain, never in a file. The live checks against the Anthropic API haven't been run yet. The sandbox,
 > store and knowledge are still fakes, and the sandbox says so (`NOT ISOLATED`). `--fake` runs the
 > scripted Stage 2 agent offline.
 
@@ -136,6 +136,16 @@ it later.
    server's chat models; pick one that can call tools (e.g. gpt-oss, qwen3, llama3.1+).
    Nixxa checks the server offers it and saves the server as `local:default`. Nothing leaves your
    machine, and it costs nothing.
+
+3. **Sign in with OpenRouter.** First Nixxa shows what leaves your machine, and you confirm it:
+   everything in the conversation (workspace files the agent reads, notes, memory) goes to
+   OpenRouter and the model's host, and free models may log or train on prompts, so don't use it
+   with private code. Then your browser opens OpenRouter's sign-in page; if it can't, Nixxa shows
+   the address to copy. Approve it, and OpenRouter gives Nixxa a key of your own (OAuth PKCE,
+   through a one-time listener on this machine). Pick a model that can use tools (free ones are
+   marked), and the key is saved in the OS keychain as `openrouter:default`. Usage is billed to
+   your OpenRouter account. Nixxa can't revoke the key for you: delete it in your OpenRouter key
+   settings when you're done.
 
 Nixxa starts with whichever account you set up last, and remembers it across restarts. Setting up
 another one switches to it right away, in a new session.
