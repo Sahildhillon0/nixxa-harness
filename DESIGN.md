@@ -198,6 +198,13 @@ New decisions get the next ID. A reversed decision is struck through, not delete
 - Which LLM provider ships first in Stage 3? (Leaning Anthropic via API key.)
 - Which providers, if any, permit third-party subscription sign-in at the time Stage 8 starts?
 - Should an account be pinnable per workspace (e.g. this repo always uses `anthropic:work`)?
+- Stage 8, account registry (from the PR #5 review): Windows caps a Credential Manager blob at
+  about 2.5 KB, so a single `nixxa/_registry` entry fits only a dozen or two accounts. Shard it
+  (one entry per provider) or use a more compact format? And the registry lock is per process:
+  two Nixxa instances adding accounts at once can lose an update. Re-read and retry, or an
+  advisory lock?
+- Stage 3 PR C: when the registry is unreadable but an env key exists, `list` quietly falls back
+  to the env account and the stored accounts disappear. How should the harness tell the user?
 - User-added external tools (Stage 11): MCP only, or also a native plugin trait?
 - Sandbox network policy: off / allow-list / proxy-with-log?
 - Windows sandbox backend: AppContainer, WSL2, or container-only?
