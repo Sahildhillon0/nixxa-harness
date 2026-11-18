@@ -35,8 +35,10 @@ claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md
   provider's default unless a stored account is.
 - **Unavailable keychain:** `CredentialsError::Storage` with a clear message. Env accounts keep
   working. The encrypted-file fallback is Stage 8.
-- **Stage 3 scope:** API keys only. Other credential kinds return `Unsupported` until their
-  methods land (Stage 8).
+- **Stage 3 scope:** API keys and local servers (`Credential::Local { base_url }`). A local server
+  has no secret: its base URL (plain `http(s)://`, no credentials in it) is the registry hint,
+  and no keychain secret entry is written. Other credential kinds return `Unsupported` until their
+  methods land.
 - **Checks:** keys are checked locally (non-empty, no spaces or control characters). Provider
   and label must be plain lower-case (`a-z 0-9 - _ .`), because they become entry names and
   Windows Credential Manager matches names case-insensitively.

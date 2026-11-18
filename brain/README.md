@@ -14,6 +14,47 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
 ## Stage 3 status
 
+Two providers share `src/providers/common/`:
+- the HTTP transport, the SSE parser and the replay transport;
+- tool definitions and strict input validation;
+- trimming, the system prompt with its `<untrusted-context>` primer block, and observation text;
+- key scrubbing.
+
+### OpenAI-compatible (`src/providers/openai_compat/`)
+
+`OpenAiCompatBrain` speaks the Chat Completions API (`/chat/completions` with `stream: true` and
+`stream_options.include_usage`, plus `/models`). It's for local models through LM Studio
+(`http://localhost:1234/v1`) or Ollama (`http://localhost:11434/v1`), and later for hosted
+OpenAI-compatible providers.
+
+- **Accounts and auth:**
+  - a `Credential::Local { base_url }` account supplies the server and needs no auth header;
+  - an `ApiKey` account uses `OpenAiCompatConfig::base_url` with `Authorization: Bearer`. A key is
+    never sent over plain http to anything but this machine.
+- **Messages:** the system prompt, then the conversation.
+  - Consecutive user text merges, because strict chat templates need alternating roles.
+  - One step's text and calls make one assistant message, followed by one `tool` message per
+    result (`Error: …` for denials and failures).
+  - A missing result is filled in and an orphan dropped. Other providers' reasoning is skipped.
+- **Streaming:**
+  - text deltas are passed on live; text and calls are held until the stream ends;
+  - any completed call counts, even when a server finishes with `stop` (Ollama sends whole calls);
+  - `length` keeps the text and drops the cut-off call, then `Done("stopped: output limit")`;
+  - `content_filter` and an `error` chunk are provider errors;
+  - a stream may end without `[DONE]` once a choice has finished.
+- **Cost:** `Some(0)` for a local server; otherwise `None` (never guessed).
+- **No tools:** a server's "does not support tools" error (any common wording) becomes
+  ``Provider("`<model>` can't use tools. Pick a tool-capable model …")``.
+- **`list_models`:** the ids, plus tool support (`supported_parameters` / `capabilities`) and free
+  (`:free`, or both prices 0), only when the server reports them. `verify` checks that the
+  configured model is offered and lists what is.
+- **Defaults:** a 32k context window, 4k output, and a 15-minute read timeout (local models can
+  take minutes before the first token on a CPU).
+- **Live check:** run by hand with a server running:
+  `NIXXA_LOCAL_MODEL=… cargo test -p nixxa-brain -- --ignored live_local_tool_loop`.
+
+### Anthropic (`src/providers/anthropic/`)
+
 `AnthropicBrain` (`src/providers/anthropic/`) implements `Brain` over the Messages API: raw
 HTTP (reqwest, rustls on `ring`, OS trust store), SSE streaming and tool use.
 

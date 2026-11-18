@@ -15,10 +15,12 @@ Linux, macOS and Windows. See
 ## Current stage
 
 **Stage 3 — Real brain (in progress).**
-- **Done so far:** Claude (`AnthropicBrain`) with keys in the OS keychain (`KeychainCredentials`),
-  and the harness's Anthropic setup path. `--fake` runs the scripted brain.
+- **Done so far:**
+  - Claude (`AnthropicBrain`) with keys in the OS keychain (`KeychainCredentials`);
+  - the OpenAI-compatible provider for local models (`OpenAiCompatBrain`, `Credential::Local`
+    accounts);
+  - the harness's Anthropic setup path; `--fake` runs the scripted brain.
 - **Still to come:**
-  - an OpenAI-compatible local provider (`Credential::Local`; LM Studio / Ollama);
   - setup option 2, a local model, with the wiring picking the brain from the default account's
     provider;
   - OpenRouter sign-in.

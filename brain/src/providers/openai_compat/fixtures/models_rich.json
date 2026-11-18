@@ -1,0 +1,35 @@
+{
+  "data": [
+    {
+      "id": "vendor/tool-model",
+      "supported_parameters": [
+        "tools",
+        "temperature"
+      ],
+      "pricing": {
+        "prompt": "0.000001",
+        "completion": "0.000002"
+      }
+    },
+    {
+      "id": "vendor/free-model:free",
+      "supported_parameters": [
+        "temperature"
+      ],
+      "pricing": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    },
+    {
+      "id": "vendor/zero-priced",
+      "capabilities": [
+        "tool_use"
+      ],
+      "pricing": {
+        "prompt": "0",
+        "completion": "0"
+      }
+    }
+  ]
+}

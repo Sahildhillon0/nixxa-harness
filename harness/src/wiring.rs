@@ -251,7 +251,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn stage_three_end_to_end_with_recorded_claude() {
         let replay = Replay::new();
-        replay.push_fixture("tool_use.sse").push_fixture("text.sse");
+        replay.push_fixture("anthropic/fixtures/tool_use.sse").push_fixture("anthropic/fixtures/text.sse");
         let anthropic = replaying(&replay);
         let account = AccountRef::new(ANTHROPIC, SETUP_LABEL);
         anthropic.credentials.add(account.clone(), Credential::ApiKey(Secret::new("sk-ant-test-0000"))).await.unwrap();

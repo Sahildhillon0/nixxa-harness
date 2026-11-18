@@ -13,8 +13,8 @@ use serde_json::{Value, json};
 use super::errors;
 use super::pricing::{self, Tokens};
 use super::request::PROVIDER;
-use super::sse::SseEvent;
-use super::tools::{self, ToolMap};
+use crate::providers::common::sse::SseEvent;
+use crate::providers::common::tools::{self, ToolMap};
 
 /// One content block as it streams in.
 #[derive(Debug)]

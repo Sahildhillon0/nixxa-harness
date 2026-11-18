@@ -199,11 +199,59 @@ async fn names_that_differ_only_in_case_cannot_coexist() {
 }
 
 #[tokio::test]
-async fn only_api_keys_are_stored_in_stage_3() {
+async fn only_api_keys_and_local_servers_are_stored_in_stage_3() {
     let credentials = KeychainCredentials::in_memory(KeychainConfig::default());
     let profile = Credential::CloudProfile { profile: "default".into() };
     let err = credentials.add(AccountRef::new("bedrock", "work"), profile).await.unwrap_err();
     assert!(matches!(err, CredentialsError::Unsupported(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_local_server_is_stored_without_a_secret_and_survives_a_restart() {
+    let store = Arc::new(MemoryStore::default());
+    let local = AccountRef::new("local", "default");
+    let credential = Credential::Local { base_url: "http://localhost:1234/v1".into() };
+    let info = over(&store, KeychainConfig::default()).add(local.clone(), credential.clone()).await.unwrap();
+    assert_eq!(info.method, AuthMethod::Local);
+    assert_eq!(info.hint.as_deref(), Some("http://localhost:1234/v1"));
+    assert!(info.is_default);
+    assert_eq!(store.names(), vec!["nixxa/_registry"], "no secret entry for a local server");
+
+    let relaunched = over(&store, KeychainConfig::default());
+    assert_eq!(relaunched.get(&local).await.unwrap(), credential);
+    relaunched.validate(&local).await.unwrap();
+    relaunched.remove(&local).await.unwrap();
+    assert!(relaunched.list(None).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replacing_a_key_with_a_local_server_deletes_the_key() {
+    let store = Arc::new(MemoryStore::default());
+    let credentials = over(&store, KeychainConfig::default());
+    let account = AccountRef::new("local", "default");
+    credentials.add(account.clone(), api_key(KEY)).await.unwrap();
+    credentials.add(account.clone(), Credential::Local { base_url: "http://127.0.0.1:11434/v1".into() }).await.unwrap();
+    assert_eq!(store.names(), vec!["nixxa/_registry"], "the old key is gone");
+}
+
+#[tokio::test]
+async fn bad_base_urls_are_refused() {
+    let credentials = KeychainCredentials::in_memory(KeychainConfig::default());
+    for url in [
+        "localhost:1234",
+        "ftp://host/v1",
+        "http://",
+        "http://user:pass@host/v1",
+        "http://host/ v1",
+        "http://host/\x1b[2J",
+    ] {
+        let err = credentials
+            .add(AccountRef::new("local", "default"), Credential::Local { base_url: url.into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, CredentialsError::Invalid(_)), "{url:?} → {err:?}");
+        assert!(!err.to_string().contains('\x1b'), "escaped in the message: {err}");
+    }
 }
 
 #[tokio::test]

@@ -11,9 +11,9 @@ Replace one, and the rest never notice.
 
 > **Status: Stage 3 — Real brain (in progress).** With an Anthropic API key,
 > `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
-> tool use. The key is kept in the OS keychain, never in a file. Still to come in Stage 3: a local
-> model through an OpenAI-compatible endpoint (LM Studio / Ollama) as a second setup option, and
-> OpenRouter sign-in. The live checks against the Anthropic API haven't been run yet. The sandbox,
+> tool use. The key is kept in the OS keychain, never in a file. The brain for local models
+> (LM Studio / Ollama, through their OpenAI-compatible endpoint) is in; still to come in Stage 3:
+> choosing a local model in the setup screen, and OpenRouter sign-in. The live checks against the Anthropic API haven't been run yet. The sandbox,
 > store and knowledge are still fakes, and the sandbox says so (`NOT ISOLATED`). `--fake` runs the
 > scripted Stage 2 agent offline.
 

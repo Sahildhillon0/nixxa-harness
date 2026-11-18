@@ -16,9 +16,9 @@ use nixxa_contracts::{
     SandboxAction, SandboxActionKind, Secret, SessionId, SourceId, Timestamp, ToolSpec,
 };
 
-use super::request::TRIMMED_NOTE;
-use super::transport::{Method, Request, Response, Transport};
 use super::{AnthropicBrain, AnthropicConfig, DEFAULT_MODEL};
+use crate::providers::common::history::TRIMMED_NOTE;
+use crate::providers::common::transport::{Method, Request, Response, Transport};
 
 const KEY: &str = "sk-ant-api03-test-key-never-shown-9f2c";
 

@@ -7,11 +7,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures::StreamExt;
-use nixxa_contracts::Credentials;
 use serde_json::Value;
 
 use super::transport::{Request, Response, Transport};
-use super::{AnthropicBrain, AnthropicConfig};
 
 /// Responses to hand out in order, and the request bodies that were sent.
 #[derive(Clone, Default)]
@@ -37,9 +35,10 @@ impl Replay {
         self
     }
 
-    /// Queues one of the brain's recorded SSE fixtures (e.g. `"parallel_tool_use.sse"`) as a 200.
-    pub fn push_fixture(&self, name: &str) -> &Self {
-        let path = format!("{}/src/providers/anthropic/fixtures/{name}", env!("CARGO_MANIFEST_DIR"));
+    /// Queues one of the brain's recorded fixtures as a 200, by its path under
+    /// `brain/src/providers/` (e.g. `"anthropic/fixtures/parallel_tool_use.sse"`).
+    pub fn push_fixture(&self, path: &str) -> &Self {
+        let path = format!("{}/src/providers/{path}", env!("CARGO_MANIFEST_DIR"));
         let body = std::fs::read(&path).unwrap_or_else(|err| panic!("fixture {path}: {err}"));
         self.push(200, body)
     }
@@ -60,12 +59,5 @@ impl Transport for Replay {
         let (status, body) = next.ok_or_else(|| "the replay has no response left".to_string())?;
         let chunks: Vec<Result<Bytes, String>> = body.chunks(7).map(|c| Ok(Bytes::copy_from_slice(c))).collect();
         Ok(Response { status, retry_after: None, body: futures::stream::iter(chunks).boxed() })
-    }
-}
-
-impl AnthropicBrain {
-    /// A brain that answers from `replay` instead of the network.
-    pub fn replaying(credentials: Arc<dyn Credentials>, config: AnthropicConfig, replay: &Replay) -> Self {
-        Self::with_transport(credentials, config, Arc::new(replay.clone()))
     }
 }
