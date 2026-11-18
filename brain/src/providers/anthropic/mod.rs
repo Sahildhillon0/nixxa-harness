@@ -2,6 +2,8 @@
 
 mod errors;
 mod pricing;
+#[cfg(feature = "replay")]
+pub(crate) mod replay;
 mod request;
 mod sse;
 mod stream;
@@ -43,6 +45,33 @@ const FALLBACK_MODELS: &[&str] = &["claude-sonnet-5-5", "claude-opus-5-5", "clau
 /// The most of an error response body that is read.
 const MAX_ERROR_BODY: usize = 64 * 1024;
 
+/// How much the model thinks and spends per step (`output_config.effort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Effort {
+    /// Least thinking; fine for chat.
+    Low,
+    /// A good start for multi-step tool use.
+    Medium,
+    /// The default on Claude Sonnet 5.5.
+    High,
+    /// More than `High`.
+    XHigh,
+    /// The most.
+    Max,
+}
+
+impl Effort {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+
 /// Settings for [`AnthropicBrain`]. The harness fills them from its config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicConfig {
@@ -59,6 +88,8 @@ pub struct AnthropicConfig {
     /// Opt into server-side refusal fallbacks (`fallbacks: "default"`) on models that support
     /// them. Claude API only: turn it off for other endpoints.
     pub refusal_fallback: bool,
+    /// Effort level; `None` leaves the model's default.
+    pub effort: Option<Effort>,
 }
 
 impl Default for AnthropicConfig {
@@ -70,6 +101,7 @@ impl Default for AnthropicConfig {
             context_window: 1_000_000,
             prompt_caching: true,
             refusal_fallback: true,
+            effort: None,
         }
     }
 }
@@ -192,6 +224,9 @@ impl AnthropicBrain {
         }
         if fallback {
             body["fallbacks"] = json!("default");
+        }
+        if let Some(effort) = self.config.effort {
+            body["output_config"] = json!({ "effort": effort.as_str() });
         }
         Ok((body, map))
     }

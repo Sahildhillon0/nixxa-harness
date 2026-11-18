@@ -42,8 +42,8 @@ fixtures = {
     "text.sse": START + PING + thinking(0, "EqQBsig-text") + text(1, "Hello", " there.") + msg_delta("end_turn", 12) + STOP,
     "tool_use.sse": START + thinking(0, "EqQBsig-tool") + text(1, "Let me look.")
         + tool(2, "toolu_01A", "exec", "", '{"command": "ls', ' -la"}') + msg_delta("tool_use", 40) + STOP,
-    "parallel_tool_use.sse": START + tool(0, "toolu_01A", "exec", '{"command":"cargo test"}')
-        + tool(1, "toolu_01B", "notes__search", '{"query":', '"build notes"}') + msg_delta("tool_use", 50) + STOP,
+    "parallel_tool_use.sse": START + thinking(0, "EqQBsig-parallel") + tool(1, "toolu_01A", "exec", '{"command":"cargo test"}')
+        + tool(2, "toolu_01B", "notes__search", '{"query":', '"build notes"}') + msg_delta("tool_use", 50) + STOP,
     "max_tokens.sse": START + text(0, "Partial an") + tool(1, "toolu_01C", "exec", '{"comm') + msg_delta("max_tokens", 64) + STOP,
     "refusal.sse": START + text(0, "I will")
         + msg_delta("refusal", 3, delta={"stop_details": {"type": "refusal", "category": "cyber", "explanation": None}}) + STOP,

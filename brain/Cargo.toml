@@ -9,6 +9,10 @@ publish.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Answer from recorded responses instead of the network (tests of the real wiring).
+replay = []
+
 [dependencies]
 async-trait = { workspace = true }
 bytes = { workspace = true }

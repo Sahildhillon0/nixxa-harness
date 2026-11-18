@@ -24,7 +24,11 @@ from `Credentials` on every request. Config fields:
 - `max_output_tokens` (64 000, unless the context sets a limit);
 - `base_url` and `context_window`;
 - `prompt_caching` (on);
-- `refusal_fallback` (on: `fallbacks: "default"`, Claude API only).
+- `refusal_fallback` (on: `fallbacks: "default"`, Claude API only);
+- `effort` (unset = the model's default; `Medium` is a good start for multi-step tool use).
+
+HTTPS goes through the OS trust store and honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`
+(D-030).
 
 **Request:**
 - **System prompt:** the instructions, then the primer inside an `<untrusted-context>` block
@@ -81,10 +85,15 @@ There are no automatic retries. The key never appears in an error or in `Debug`.
 
 **`verify` / `verify_key`:** a free live check that reads the model's entry from the Models API.
 
+**Feature `replay`:** `AnthropicBrain::replaying(credentials, config, &Replay)` answers from recorded
+responses instead of the network, so the harness can test the real wiring offline. It's test-only;
+nothing enables it in a normal build.
+
 **Tests:** recorded SSE fixtures behind an internal transport seam; no network.
 `fixtures/generate.py` writes the fixtures from the documented event shapes. The live check is
 ignored. Run it by hand (costs a few tokens):
 
 ```sh
 ANTHROPIC_API_KEY=… cargo test -p nixxa-brain -- --ignored live_conformance
+ANTHROPIC_API_KEY=… cargo test -p nixxa-brain -- --ignored live_tool_loop   # request 1 calls a tool, request 2 replays it
 ```

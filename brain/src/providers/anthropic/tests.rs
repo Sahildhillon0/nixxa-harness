@@ -382,6 +382,17 @@ async fn fallback_and_caching_can_be_turned_off() {
 }
 
 #[tokio::test]
+async fn effort_is_sent_only_when_configured() {
+    let fixtures = Fixtures::with(vec![sse("text.sse"), sse("text.sse")]);
+    collect(&brain(&fixtures), hello()).await;
+    let config = AnthropicConfig { effort: Some(super::Effort::Medium), ..AnthropicConfig::default() };
+    collect(&brain_with(&fixtures, config), hello()).await;
+    let sent = fixtures.sent();
+    assert!(sent[0].body.as_ref().unwrap().get("output_config").is_none());
+    assert_eq!(sent[1].body.as_ref().unwrap()["output_config"], json!({ "effort": "medium" }));
+}
+
+#[tokio::test]
 async fn history_with_reasoning_is_replayed_in_order() {
     let fixtures = Fixtures::with(vec![sse("text.sse")]);
     let request = ActionRequest { id: ActionId::new("toolu_01A"), action: exec("ls -la"), reason: None };
@@ -550,4 +561,69 @@ async fn live_conformance() {
             .expect("client");
     brain.verify(&anthropic()).await.expect("the key works");
     run(&brain, anthropic()).await;
+}
+
+/// A two-request tool loop against the real API: request 1 makes the model call `exec`;
+/// request 2 replays that turn (thinking included) exactly as the controller records it, with
+/// the result. A history edit would show up here as a 400. By hand only; costs a few cents:
+/// `ANTHROPIC_API_KEY=… cargo test -p nixxa-brain -- --ignored live_tool_loop`.
+#[tokio::test]
+#[ignore = "calls the real Anthropic API"]
+async fn live_tool_loop() {
+    let key = std::env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY");
+    let brain =
+        AnthropicBrain::new(Arc::new(OneKey(Credential::ApiKey(Secret::new(key.trim())))), AnthropicConfig::default())
+            .expect("client");
+    let at = Timestamp(0);
+    let mut context = context(vec![Message::text(
+        Role::User,
+        "Use the exec tool to run `echo nixxa-live-check`, then reply with only its output.",
+        at,
+    )]);
+    context.knowledge_tools.clear();
+    context.limits.max_output_tokens = Some(4_000);
+
+    // Request 1, recorded the way the controller records it: the model's blocks in order, then
+    // every observation together. The Done summary is never sent back.
+    let mut proposals = Vec::new();
+    for item in collect(&brain, context.clone()).await {
+        match item.expect("request 1") {
+            BrainEvent::Reasoning { provider, data } => {
+                context.messages.push(Message {
+                    role: Role::Agent,
+                    content: Content::Reasoning { provider, data },
+                    at,
+                });
+            }
+            BrainEvent::Intent { intent: Intent::Say { text } } => {
+                context.messages.push(Message::text(Role::Agent, text, at))
+            }
+            BrainEvent::Intent { intent: Intent::Act { request } } => {
+                context.messages.push(Message {
+                    role: Role::Agent,
+                    content: Content::Action { request: request.clone() },
+                    at,
+                });
+                proposals.push(request);
+            }
+            _ => {}
+        }
+    }
+    assert!(!proposals.is_empty(), "the model called the tool");
+    for request in proposals {
+        let observation = nixxa_contracts::Observation::new(
+            request.id,
+            nixxa_contracts::Outcome::Exec {
+                exit_code: Some(0),
+                stdout: "nixxa-live-check\n".into(),
+                stderr: String::new(),
+            },
+        );
+        context.messages.push(Message { role: Role::Observation, content: Content::Observation { observation }, at });
+    }
+
+    // Request 2: the replayed turn must be accepted.
+    let items = collect(&brain, context).await;
+    assert!(items.iter().all(Result::is_ok), "request 2 failed: {items:?}");
+    assert!(items.iter().any(|i| matches!(i, Ok(BrainEvent::Intent { .. }))));
 }

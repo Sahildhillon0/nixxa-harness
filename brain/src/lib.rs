@@ -6,4 +6,6 @@
 pub mod fake;
 mod providers;
 
-pub use providers::anthropic::{AnthropicBrain, AnthropicConfig, DEFAULT_BASE_URL, DEFAULT_MODEL};
+#[cfg(feature = "replay")]
+pub use providers::anthropic::replay::Replay;
+pub use providers::anthropic::{AnthropicBrain, AnthropicConfig, DEFAULT_BASE_URL, DEFAULT_MODEL, Effort};
