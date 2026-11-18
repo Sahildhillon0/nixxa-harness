@@ -12,8 +12,10 @@ use nixxa_contracts::{
 use nixxa_controller::Command;
 
 use crate::ports::PendingApproval;
-use nixxa_contracts::{AccountInfo, Secret};
-use zeroize::Zeroizing;
+use nixxa_brain::ModelInfo;
+use nixxa_contracts::{AccountInfo, AuthMethod, Secret};
+
+use crate::setup::Setup;
 
 /// How long a first ctrl-c waits for a second one to quit.
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
@@ -81,7 +83,7 @@ pub(crate) struct Activity {
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
 /// on Windows, AltGr arrives as ctrl+alt and is how many layouts type `@`, `€` or `{`.
-fn types_text(key: &KeyEvent) -> bool {
+pub(crate) fn types_text(key: &KeyEvent) -> bool {
     !key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::ALT)
 }
 
@@ -92,48 +94,13 @@ pub(crate) enum Effect {
     Quit,
     /// Check this key with the provider, then store it.
     SaveKey(Secret),
-}
-
-/// Where the API-key setup form is.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SetupState {
-    Editing,
-    Checking,
-    Failed(String),
-}
-
-/// The API-key setup form. The typed key is zeroised when the form goes away.
-pub(crate) struct SetupForm {
-    key: Zeroizing<String>,
-    pub(crate) state: SetupState,
-    /// No account exists yet: the form can't be dismissed, only completed (or quit).
-    pub(crate) first_run: bool,
-}
-
-impl SetupForm {
-    fn new(first_run: bool) -> Self {
-        Self { key: Zeroizing::new(String::new()), state: SetupState::Editing, first_run }
-    }
-
-    /// The key as shown: bullets, and the last four characters once it is long enough to be a
-    /// key. Never more.
-    pub(crate) fn masked(&self) -> String {
-        let n = self.key.chars().count();
-        if n < 8 {
-            return "•".repeat(n);
-        }
-        let tail: String = self.key.chars().skip(n - 4).collect();
-        format!("{}{tail}", "•".repeat((n - 4).min(32)))
-    }
-
-    fn push(&mut self, text: &str) {
-        if self.state == SetupState::Checking {
-            return;
-        }
-        // Keys are one line: whatever a paste brings, keep only printable characters.
-        self.key.extend(text.chars().filter(|c| !c.is_control() && !c.is_whitespace()));
-        self.state = SetupState::Editing;
-    }
+    /// Ask the local server at this URL for its models.
+    ListModels(String),
+    /// Check the local server offers this model, then store the account.
+    SaveLocal {
+        url: String,
+        model: String,
+    },
 }
 
 /// Everything the TUI shows.
@@ -163,8 +130,8 @@ pub(crate) struct App {
     pub(crate) notice: Option<String>,
     pub(crate) ended: bool,
     last_ctrl_c: Option<Instant>,
-    /// The API-key setup form, when open.
-    pub(crate) setup: Option<SetupForm>,
+    /// The setup screen, when open.
+    pub(crate) setup: Option<Setup>,
     /// Whether the setup form can be opened (not with `--fake`).
     pub(crate) setup_available: bool,
 }
@@ -198,31 +165,46 @@ impl App {
         }
     }
 
-    /// Opens the API-key setup form.
+    /// Opens the setup screen at its first step.
     pub(crate) fn open_setup(&mut self, first_run: bool) {
-        self.setup = Some(SetupForm::new(first_run));
+        self.setup = Some(Setup::new(first_run));
     }
 
-    /// The setup form's key was checked and saved, or why not.
-    pub(crate) fn key_saved(&mut self, result: &Result<AccountInfo, String>) {
+    /// An account was set up and saved, or why not.
+    pub(crate) fn account_saved(&mut self, result: &Result<AccountInfo, String>) {
         match result {
             Ok(info) => {
                 self.setup = None;
-                let hint = info.hint.as_ref().map(|h| format!(" (…{h})")).unwrap_or_default();
-                self.note(format!("Saved the API key{hint} for {} in the OS keychain.", info.account));
+                match info.method {
+                    AuthMethod::Local => {
+                        let url = info.hint.as_deref().unwrap_or("the local server");
+                        self.note(format!("Saved {} ({url}).", info.account));
+                    }
+                    _ => {
+                        let hint = info.hint.as_ref().map(|h| format!(" (…{h})")).unwrap_or_default();
+                        self.note(format!("Saved the API key{hint} for {} in the OS keychain.", info.account));
+                    }
+                }
             }
             Err(message) => {
-                if let Some(form) = self.setup.as_mut() {
-                    form.state = SetupState::Failed(message.clone());
+                if let Some(setup) = self.setup.as_mut() {
+                    setup.failed(message);
                 }
             }
         }
     }
 
-    /// Pasted text (bracketed paste): into the setup form when it is open, else the input.
+    /// The local server's models arrived (or why not).
+    pub(crate) fn models_listed(&mut self, result: Result<Vec<ModelInfo>, String>) {
+        if let Some(setup) = self.setup.as_mut() {
+            setup.models_listed(result);
+        }
+    }
+
+    /// Pasted text (bracketed paste): into the setup screen when it is open, else the input.
     pub(crate) fn paste(&mut self, text: &str) {
-        if let Some(form) = self.setup.as_mut() {
-            form.push(text);
+        if let Some(setup) = self.setup.as_mut() {
+            setup.paste(text);
         } else if self.approvals.is_empty() && self.focus == Focus::Input {
             self.input.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
         }
@@ -365,30 +347,12 @@ impl App {
     }
 
     fn setup_key(&mut self, key: KeyEvent) -> Vec<Effect> {
-        let Some(form) = self.setup.as_mut() else { return Vec::new() };
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        match key.code {
-            KeyCode::Esc if !form.first_run && form.state != SetupState::Checking => self.setup = None,
-            KeyCode::Char('u') if ctrl && form.state != SetupState::Checking => {
-                form.key = Zeroizing::new(String::new());
-                form.state = SetupState::Editing;
-            }
-            KeyCode::Char(c) if types_text(&key) => form.push(&c.to_string()),
-            KeyCode::Backspace if form.state != SetupState::Checking => {
-                form.key.pop();
-                form.state = SetupState::Editing;
-            }
-            KeyCode::Enter if form.state != SetupState::Checking => {
-                if form.key.is_empty() {
-                    form.state = SetupState::Failed("Paste a key first.".into());
-                } else {
-                    form.state = SetupState::Checking;
-                    return vec![Effect::SaveKey(Secret::new(form.key.as_str()))];
-                }
-            }
-            _ => {}
+        let Some(setup) = self.setup.as_mut() else { return Vec::new() };
+        let outcome = setup.key(key);
+        if outcome.close {
+            self.setup = None;
         }
-        Vec::new()
+        outcome.effects
     }
 
     fn ctrl_c(&mut self) -> Vec<Effect> {
@@ -468,6 +432,14 @@ pub(crate) mod tests {
     use nixxa_contracts::{Action, ActionId, Message, SandboxAction, SourceId, SourceStatus, Timestamp, TurnId, Usage};
 
     use super::*;
+    use crate::setup::{KeyForm, Step};
+
+    fn key_form(app: &App) -> &KeyForm {
+        match &app.setup.as_ref().expect("setup is open").step {
+            Step::Key(form) => form,
+            _ => panic!("not on the key form"),
+        }
+    }
 
     pub(crate) fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -507,10 +479,11 @@ pub(crate) mod tests {
     fn the_setup_form_masks_all_but_the_last_four() {
         let mut app = App::new(true);
         app.open_setup(true);
+        app.handle_key(key(KeyCode::Char('1')));
         type_text(&mut app, "sk-ant");
-        assert_eq!(app.setup.as_ref().unwrap().masked(), "••••••", "short input shows no characters");
+        assert_eq!(key_form(&app).masked(), "••••••", "short input shows no characters");
         type_text(&mut app, &KEY["sk-ant".len()..]);
-        let masked = app.setup.as_ref().unwrap().masked();
+        let masked = key_form(&app).masked();
         assert!(masked.ends_with("wxyz") && !masked.contains("SECRET") && !masked.contains("sk-ant"), "{masked}");
     }
 
@@ -518,30 +491,32 @@ pub(crate) mod tests {
     fn enter_checks_the_key_and_typing_waits_while_it_runs() {
         let mut app = App::new(true);
         app.open_setup(true);
+        app.handle_key(key(KeyCode::Char('1')));
         type_text(&mut app, KEY);
         let effects = app.handle_key(key(KeyCode::Enter));
         assert_eq!(effects, vec![Effect::SaveKey(Secret::new(KEY))]);
-        assert_eq!(app.setup.as_ref().unwrap().state, SetupState::Checking);
+        assert_eq!(key_form(&app).state, crate::setup::SetupState::Checking);
         type_text(&mut app, "zz");
         assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "one check at a time");
-        assert!(app.setup.as_ref().unwrap().masked().ends_with("wxyz"), "typing is ignored while checking");
+        assert!(key_form(&app).masked().ends_with("wxyz"), "typing is ignored while checking");
     }
 
     #[test]
     fn a_failed_check_is_shown_and_can_be_retried() {
         let mut app = App::new(true);
         app.open_setup(true);
+        app.handle_key(key(KeyCode::Char('1')));
         type_text(&mut app, KEY);
         app.handle_key(key(KeyCode::Enter));
-        app.key_saved(&Err("Anthropic rejected this key: invalid x-api-key".into()));
+        app.account_saved(&Err("Anthropic rejected this key: invalid x-api-key".into()));
         assert_eq!(
-            app.setup.as_ref().unwrap().state,
-            SetupState::Failed("Anthropic rejected this key: invalid x-api-key".into())
+            key_form(&app).state,
+            crate::setup::SetupState::Failed("Anthropic rejected this key: invalid x-api-key".into())
         );
         app.handle_key(ctrl('u'));
-        assert_eq!(app.setup.as_ref().unwrap().masked(), "");
+        assert_eq!(key_form(&app).masked(), "");
         assert!(matches!(app.handle_key(key(KeyCode::Enter)).as_slice(), []), "an empty key isn't sent");
-        assert_eq!(app.setup.as_ref().unwrap().state, SetupState::Failed("Paste a key first.".into()));
+        assert_eq!(key_form(&app).state, crate::setup::SetupState::Failed("Paste a key first.".into()));
     }
 
     #[test]
@@ -554,7 +529,7 @@ pub(crate) mod tests {
             is_default: true,
             hint: Some("wxyz".into()),
         };
-        app.key_saved(&Ok(info));
+        app.account_saved(&Ok(info));
         assert!(app.setup.is_none());
         assert_eq!(
             app.conversation.last().unwrap().text,
@@ -587,6 +562,7 @@ pub(crate) mod tests {
     fn a_paste_goes_to_the_setup_form_without_whitespace() {
         let mut app = App::new(true);
         app.open_setup(true);
+        app.handle_key(key(KeyCode::Char('1')));
         app.paste(&format!("  {KEY}\n"));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::SaveKey(Secret::new(KEY))]);
         assert!(app.input.is_empty());
@@ -653,10 +629,11 @@ pub(crate) mod tests {
         assert_eq!(app.input, "@", "AltGr (ctrl+alt on Windows) still types");
 
         app.open_setup(false);
+        app.handle_key(key(KeyCode::Char('1')));
         app.handle_key(ctrl('x'));
-        assert_eq!(app.setup.as_ref().unwrap().masked(), "", "nor in the key field");
+        assert_eq!(key_form(&app).masked(), "", "nor in the key field");
         app.handle_key(KeyEvent::new(KeyCode::Char('{'), KeyModifiers::CONTROL | KeyModifiers::ALT));
-        assert_eq!(app.setup.as_ref().unwrap().masked(), "•");
+        assert_eq!(key_form(&app).masked(), "•");
     }
 
     #[test]

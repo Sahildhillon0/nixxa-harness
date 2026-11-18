@@ -10,6 +10,7 @@ mod paths;
 mod ports;
 mod safe;
 mod settings;
+mod setup;
 mod tui;
 mod ui;
 mod wiring;

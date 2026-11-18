@@ -14,7 +14,8 @@ use tokio::task::JoinHandle;
 use crate::app::{App, Effect};
 use crate::ports::UiEvent;
 use crate::settings::Settings;
-use crate::wiring::{self, Anthropic};
+use crate::setup::Setup;
+use crate::wiring::{self, Models};
 use crate::{logging, paths, ui};
 
 /// How long quitting waits for the controller to end the session.
@@ -47,6 +48,14 @@ fn start_session(
     Session { commands, task, account }
 }
 
+/// Ends a session in the background (the controller emits `SessionEnded`).
+fn end_session(session: Session) {
+    tokio::spawn(async move {
+        let _ = session.commands.send(Command::Shutdown).await;
+        let _ = tokio::time::timeout(SHUTDOWN_GRACE, session.task).await;
+    });
+}
+
 /// Runs the TUI until the user quits.
 pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let workspace = wiring::workspace(&std::env::current_dir()?);
@@ -60,29 +69,38 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
 
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
     let mut session: Option<Session> = None;
-    let mut anthropic: Option<Arc<Anthropic>> = None;
+    let mut models: Option<Arc<Models>> = None;
     if settings.fake {
         tracing::info!(brain = "scripted", "using the fake brain");
         let (brain, account) = wiring::scripted();
         session = Some(start_session(brain, account, workspace.clone(), ui_tx.clone()));
     } else {
-        match Anthropic::new(&settings) {
-            Ok(claude) => {
-                let claude = Arc::new(claude);
+        match Models::new(&settings) {
+            Ok(found) => {
+                let found = Arc::new(found);
                 app.setup_available = true;
-                if let Some(problem) = claude.storage_problem().await {
+                if let Some(problem) = found.storage_problem().await {
                     tracing::warn!("the OS keychain is unavailable");
                     let fallback = if settings.env_key.is_some() { " Using ANTHROPIC_API_KEY." } else { "" };
-                    app.note(format!("The OS keychain can't be used: {problem}. Keys can't be saved.{fallback}"));
+                    app.note(format!("The OS keychain can't be used: {problem}. Accounts can't be saved.{fallback}"));
                 }
-                match claude.default_account().await {
-                    Some(account) => {
-                        tracing::info!(account = %account, "starting with the default account");
-                        session = Some(start_session(claude.brain.clone(), account, workspace.clone(), ui_tx.clone()));
-                    }
+                match found.start_account().await {
+                    Some(account) => match found.brain_for(&account).await {
+                        Ok(brain) => {
+                            tracing::info!(account = %account, "starting with the active account");
+                            session = Some(start_session(brain, account, workspace.clone(), ui_tx.clone()));
+                        }
+                        Err(why) => {
+                            app.note(why);
+                            app.setup = Some(match found.local_url(&account).await {
+                                Some(url) => Setup::local(true, &url),
+                                None => Setup::new(true),
+                            });
+                        }
+                    },
                     None => app.open_setup(true),
                 }
-                anthropic = Some(claude);
+                models = Some(found);
             }
             Err(err) => app.note(err),
         }
@@ -114,20 +132,28 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     events.push(event);
                 }
                 for event in events {
-                    if let (UiEvent::KeySaved(Ok(info)), Some(claude)) = (&event, &anthropic) {
-                        match &session {
-                            None => {
-                                let brain = claude.brain.clone();
-                                session = Some(start_session(brain, info.account.clone(), workspace.clone(), ui_tx.clone()));
+                    let saved = match (&event, &models) {
+                        (UiEvent::AccountSaved(Ok(info)), Some(found)) => Some((info.account.clone(), found.clone())),
+                        _ => None,
+                    };
+                    receive(&mut app, event);
+                    if let Some((account, found)) = saved {
+                        // A key rotation for the account in use needs nothing: the brain reads the
+                        // key on every request. Anything else starts a session with the new brain.
+                        let rotation = session.as_ref().is_some_and(|s| s.account == account && account.provider.as_str() == wiring::ANTHROPIC);
+                        if !rotation {
+                            match found.brain_for(&account).await {
+                                Ok(brain) => {
+                                    if let Some(old) = session.take() {
+                                        end_session(old);
+                                        app.note(format!("Switched to {account}: a new session started."));
+                                    }
+                                    session = Some(start_session(brain, account, workspace.clone(), ui_tx.clone()));
+                                }
+                                Err(why) => app.note(why),
                             }
-                            Some(current) if current.account != info.account => app.note(format!(
-                                "This session keeps using {}; new sessions use {}.",
-                                current.account, info.account
-                            )),
-                            Some(_) => {}
                         }
                     }
-                    receive(&mut app, event);
                 }
                 Vec::new()
             }
@@ -142,11 +168,29 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     }
                 }
                 Effect::SaveKey(key) => {
-                    if let Some(claude) = anthropic.clone() {
+                    if let Some(found) = models.clone() {
                         let ui_tx = ui_tx.clone();
                         tokio::spawn(async move {
-                            let result = claude.save_key(key).await;
-                            let _ = ui_tx.send(UiEvent::KeySaved(result));
+                            let result = found.save_key(key).await;
+                            let _ = ui_tx.send(UiEvent::AccountSaved(result));
+                        });
+                    }
+                }
+                Effect::ListModels(url) => {
+                    if let Some(found) = models.clone() {
+                        let ui_tx = ui_tx.clone();
+                        tokio::spawn(async move {
+                            let result = found.list_local_models(&url).await;
+                            let _ = ui_tx.send(UiEvent::ModelsListed(result));
+                        });
+                    }
+                }
+                Effect::SaveLocal { url, model } => {
+                    if let Some(found) = models.clone() {
+                        let ui_tx = ui_tx.clone();
+                        tokio::spawn(async move {
+                            let result = found.save_local(&url, &model).await;
+                            let _ = ui_tx.send(UiEvent::AccountSaved(result));
                         });
                     }
                 }
@@ -186,6 +230,7 @@ fn receive(app: &mut App, event: UiEvent) {
             app.apply(event);
         }
         UiEvent::Approval(prompt) => app.ask(prompt),
-        UiEvent::KeySaved(result) => app.key_saved(&result),
+        UiEvent::AccountSaved(result) => app.account_saved(&result),
+        UiEvent::ModelsListed(result) => app.models_listed(result),
     }
 }
