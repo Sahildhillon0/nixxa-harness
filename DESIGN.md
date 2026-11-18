@@ -106,7 +106,7 @@ The mode is always shown in the hint bar and changeable with one key.
 
 | Key | Action |
 |---|---|
-| `enter` / `shift-enter` | send / newline |
+| `enter` / `shift-enter` (or `alt-enter`) | send / newline — many terminals can't tell `shift-enter` from `enter`, so `alt-enter` works too |
 | `tab` / `shift-tab` | cycle pane focus |
 | `j` `k` / arrows | move within focused pane |
 | `ctrl-c` | interrupt the agent (twice: quit) |
@@ -182,6 +182,7 @@ Both appear in the activity pane as the last lines of the session.
 | D-016 | Secrets in the OS keychain; encrypted-file fallback only; never plain text | Keys are the most sensitive thing Nixxa holds. | 0 |
 | D-017 | Subscription sign-in only where the provider officially permits third-party apps; Anthropic via API key or cloud accounts | Anthropic does not currently allow third-party products to offer claude.ai login without approval; we stay within each provider's terms. | 0 |
 | D-018 | Controller runs turns one at a time, queues messages sent mid-turn, and cancels a turn with a signal checked at its cancellation points (brain stream, approval prompt, action) | Keeps the conversation a single ordered history the brain can replay. Cancelling only at those points (dropping just that future, per the contracts' cancellation convention) means store writes and history updates always complete, so an interrupt never leaves a proposal without its observation. An infrastructure error (trait error) ends the turn; action-level failures and denials go back to the brain. | 2 |
+| D-019 | ratatui 0.29 + crossterm 0.28 (not ratatui 0.30) | ratatui 0.30 needs Rust 1.88, above the workspace MSRV of 1.85; 0.29 has everything Stage 2 needs. Revisit when the MSRV moves. | 2 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 

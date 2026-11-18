@@ -9,9 +9,10 @@ that connects to your memory, notes, code index and docs, the accounts module th
 logins and API keys, and the harness you look at.
 Replace one, and the rest never notice.
 
-> **Status: Stage 1 — Contracts.** Cargo workspace with all eight crates; the `contracts` crate
-> defines every type, trait, event and error, with conformance suites. Nothing to run yet —
-> the TUI arrives in Stage 2.
+> **Status: Stage 2 — Walking skeleton (done).** `cargo run -p nixxa-harness` opens the TUI with
+> every module wired to its fake: a scripted agent queries fake knowledge, proposes a sandbox
+> action, you approve it and see the result. The sandbox is a fake and says so (`NOT ISOLATED`).
+> Next: Stage 3, a real brain.
 
 ---
 
@@ -93,8 +94,8 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | Stage | Name | Delivers | Status |
 |---|---|---|---|
 | 0 | Foundations | Repo, docs, folder skeleton | done |
-| 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | **in progress** |
-| 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | planned |
+| 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | done |
+| 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | done |
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | planned |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | planned |
 | 5 | Real memory | SQLite store, session resume, transcript search | planned |
@@ -109,6 +110,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 
 ```sh
 cargo build --workspace
+cargo run -p nixxa-harness              # the TUI (Stage 2: every module is a fake)
 cargo test --workspace --all-features   # includes the conformance suites
 ./scripts/check-deps.sh                 # the dependency rule (needs jq)
 ```
