@@ -290,6 +290,12 @@ impl Controller {
                 }
                 Ok(_) if flow != Flow::Continue => {}
                 Ok(BrainEvent::TextDelta { text }) => self.emit(Event::TextDelta { turn: turn.clone(), text }),
+                Ok(BrainEvent::Reasoning { provider, data }) => {
+                    // Kept for the brain, in stream order; never shown.
+                    let content = Content::Reasoning { provider, data };
+                    let message = Message { role: Role::Agent, content, at: self.now() };
+                    self.record_message(turn, message, false).await;
+                }
                 Ok(BrainEvent::Intent { intent }) => {
                     saw_intent = true;
                     flow = self.handle_intent(turn, intent).await;

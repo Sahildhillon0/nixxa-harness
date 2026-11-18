@@ -536,6 +536,43 @@ async fn happy_path_asks_runs_and_finishes() {
 }
 
 #[tokio::test]
+async fn reasoning_is_recorded_in_order_but_never_shown() {
+    let reasoning = || BrainEvent::Reasoning {
+        provider: ProviderId::new("scripted"),
+        data: serde_json::json!({ "type": "thinking", "signature": "sig" }),
+    };
+    let brain = ScriptedBrain::new(vec![
+        step(vec![Ok(reasoning()), intent(Intent::Act { request: exec_request("act-1", "echo hi") })]),
+        step(vec![intent(Intent::Done { summary: "ok".into() })]),
+    ]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
+    let events = rig.turn("hello").await;
+
+    assert!(
+        !events.iter().any(
+            |e| matches!(e, Event::Message { message, .. } if matches!(message.content, Content::Reasoning { .. }))
+        ),
+        "reasoning is never announced"
+    );
+    let reasoning_message = Message {
+        role: Role::Agent,
+        content: Content::Reasoning {
+            provider: ProviderId::new("scripted"),
+            data: serde_json::json!({ "type": "thinking", "signature": "sig" }),
+        },
+        at: Timestamp(0),
+    };
+    let proposal = Message {
+        role: Role::Agent,
+        content: Content::Action { request: exec_request("act-1", "echo hi") },
+        at: Timestamp(0),
+    };
+    let next = &rig.brain.contexts()[1].messages;
+    assert_eq!(next[1..3], [reasoning_message.clone(), proposal], "reasoning precedes the tool call it came with");
+    assert_eq!(rig.store.record("s1").messages[1], reasoning_message, "and is persisted");
+}
+
+#[tokio::test]
 async fn knowledge_actions_route_to_knowledge() {
     let brain = ScriptedBrain::new(vec![
         step(vec![intent(Intent::Act { request: search_request("k-1") })]),
