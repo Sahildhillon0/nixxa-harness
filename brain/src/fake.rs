@@ -104,12 +104,9 @@ impl Brain for ScriptedBrain {
         let mut events: Vec<Result<BrainEvent, BrainError>> = Vec::new();
         for intent in intents {
             let intent_for_event = intent.clone();
-            let delta = match &intent {
-                Intent::Say { text } => text.clone(),
-                Intent::Act { request } => format!("I will {}.", request.reason.as_deref().unwrap_or("do that")),
-                Intent::Done { summary } => summary.clone(),
-            };
-            events.push(Ok(BrainEvent::TextDelta { text: delta }));
+            if let Intent::Say { text } = &intent {
+                events.push(Ok(BrainEvent::TextDelta { text: text.clone() }));
+            }
             events.push(Ok(BrainEvent::Intent { intent: intent_for_event }));
         }
         events.push(Ok(BrainEvent::Usage { usage: Usage::default() }));
