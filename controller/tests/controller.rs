@@ -717,7 +717,7 @@ async fn the_step_budget_bounds_the_turn_and_says_so() {
 #[tokio::test]
 async fn the_conversation_carries_across_turns() {
     let brain = ScriptedBrain::new(vec![
-        step(vec![intent(Intent::Done { summary: "hi there".into() })]),
+        step(vec![intent(Intent::Say { text: "hi there".into() }), intent(Intent::Done { summary: "greeted".into() })]),
         step(vec![intent(Intent::Done { summary: "still here".into() })]),
     ]);
     let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
@@ -728,6 +728,120 @@ async fn the_conversation_carries_across_turns() {
     assert_eq!(
         rig.brain.contexts()[1].messages,
         vec![text(Role::User, "hello"), text(Role::Agent, "hi there"), text(Role::User, "again")]
+    );
+}
+
+/// Regression (PR #6 review, B2): the `Done` summary is not part of the model's message, so the
+/// brain must never see it; it is still stored.
+#[tokio::test]
+async fn the_done_summary_is_stored_but_never_sent_back_to_the_brain() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Say { text: "Hello!".into() }), intent(Intent::Done { summary: "done".into() })]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
+    rig.turn("hi").await;
+    rig.turn("again").await;
+
+    let seen = &rig.brain.contexts()[1].messages;
+    assert_eq!(seen[1], text(Role::Agent, "Hello!"), "the model's own last block ends its turn");
+    assert!(!seen.contains(&text(Role::Agent, "done")), "{seen:?}");
+    assert!(rig.store.record("s1").messages.contains(&text(Role::Agent, "done")), "but it is stored");
+}
+
+fn reasoning_message(signature: &str) -> Message {
+    Message {
+        role: Role::Agent,
+        content: Content::Reasoning {
+            provider: ProviderId::new("scripted"),
+            data: serde_json::json!({ "type": "thinking", "signature": signature }),
+        },
+        at: Timestamp(0),
+    }
+}
+
+fn proposal(request: ActionRequest) -> Message {
+    Message { role: Role::Agent, content: Content::Action { request }, at: Timestamp(0) }
+}
+
+fn observed(observation: Observation) -> Message {
+    Message { role: Role::Observation, content: Content::Observation { observation }, at: Timestamp(0) }
+}
+
+/// Regression (PR #6 review, B1): one step's parallel calls stay one assistant message: every
+/// proposal is recorded before any action runs, and the observations follow together.
+#[tokio::test]
+async fn parallel_actions_are_recorded_together_before_their_results() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![
+            Ok(BrainEvent::Reasoning {
+                provider: ProviderId::new("scripted"),
+                data: serde_json::json!({ "type": "thinking", "signature": "sig" }),
+            }),
+            intent(Intent::Say { text: "Running both.".into() }),
+            intent(Intent::Act { request: exec_request("a1", "echo one") }),
+            intent(Intent::Act { request: exec_request("a2", "echo two") }),
+        ]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
+    rig.turn("go").await;
+
+    assert_eq!(
+        rig.brain.contexts()[1].messages,
+        vec![
+            text(Role::User, "go"),
+            reasoning_message("sig"),
+            text(Role::Agent, "Running both."),
+            proposal(exec_request("a1", "echo one")),
+            proposal(exec_request("a2", "echo two")),
+            observed(exec_observation("a1", "echo one")),
+            observed(exec_observation("a2", "echo two")),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn an_interrupt_during_the_first_approval_still_closes_the_second_call() {
+    let brain = ScriptedBrain::new(vec![step(vec![
+        intent(Intent::Act { request: exec_request("a1", "echo one") }),
+        intent(Intent::Act { request: exec_request("a2", "echo two") }),
+    ])]);
+    let rig = Rig::start(brain, ScriptedApprovals::hanging(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
+    rig.say("go").await;
+    rig.sink.wait(1, |e| matches!(e, Event::ApprovalNeeded { .. })).await;
+    rig.tx.send(Command::Interrupt).await.unwrap();
+    rig.sink.wait(1, turn_done).await;
+
+    let record = rig.store.record("s1");
+    let closed: Vec<_> =
+        record.actions.iter().map(|a| (a.request.id.as_str().to_string(), a.verdict.clone())).collect();
+    assert_eq!(
+        closed,
+        vec![
+            ("a1".to_string(), Verdict::Deny("interrupted by the user".into())),
+            ("a2".to_string(), Verdict::Deny("interrupted by the user".into())),
+        ]
+    );
+    let observations = record.messages.iter().filter(|m| matches!(m.content, Content::Observation { .. })).count();
+    assert_eq!(observations, 2, "every proposal has a result");
+}
+
+#[tokio::test]
+async fn a_failed_first_call_closes_the_calls_after_it() {
+    let brain = ScriptedBrain::new(vec![step(vec![
+        intent(Intent::Act { request: exec_request("a1", "echo one") }),
+        intent(Intent::Act { request: exec_request("a2", "echo two") }),
+    ])]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(FailingSandbox), DEFAULT_MAX_STEPS).await;
+    rig.turn("go").await;
+
+    let record = rig.store.record("s1");
+    assert_eq!(record.actions.len(), 2);
+    assert_eq!(record.actions[0].observation, Some(Observation::failed(ActionId::new("a1"), "timed out")));
+    assert_eq!(
+        record.actions[1].observation,
+        Some(Observation::denied(ActionId::new("a2"), "not run: the turn stopped before this action"))
     );
 }
 
