@@ -101,7 +101,7 @@ impl Sandbox for FakeSandbox {
     }
 }
 
-#[cfg(all(test, feature = "conformance"))]
+#[cfg(test)]
 mod tests {
     use nixxa_contracts::conformance::sandbox::run;
     use nixxa_contracts::{ActionId, Outcome, Sandbox, SandboxAction};

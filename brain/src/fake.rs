@@ -114,7 +114,7 @@ impl Brain for ScriptedBrain {
     }
 }
 
-#[cfg(all(test, feature = "conformance"))]
+#[cfg(test)]
 mod tests {
     use nixxa_contracts::AccountRef;
     use nixxa_contracts::conformance::brain::run;

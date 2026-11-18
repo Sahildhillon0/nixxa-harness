@@ -69,7 +69,7 @@ impl Knowledge for FakeKnowledge {
     }
 }
 
-#[cfg(all(test, feature = "conformance"))]
+#[cfg(test)]
 mod tests {
     use nixxa_contracts::conformance::knowledge::run;
 

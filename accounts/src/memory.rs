@@ -77,7 +77,7 @@ impl Credentials for MemoryCredentials {
     }
 }
 
-#[cfg(all(test, feature = "conformance"))]
+#[cfg(test)]
 mod tests {
     use nixxa_contracts::conformance::credentials::run;
 

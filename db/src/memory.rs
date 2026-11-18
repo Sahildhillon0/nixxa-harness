@@ -71,7 +71,7 @@ impl Store for MemoryStore {
     }
 }
 
-#[cfg(all(test, feature = "conformance"))]
+#[cfg(test)]
 mod tests {
     use nixxa_contracts::conformance::store::run;
 

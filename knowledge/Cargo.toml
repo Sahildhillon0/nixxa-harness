@@ -9,13 +9,11 @@ publish.workspace = true
 [lints]
 workspace = true
 
-[features]
-conformance = ["nixxa-contracts/conformance"]
-
 [dependencies]
 async-trait = { workspace = true }
 nixxa-contracts = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+nixxa-contracts = { workspace = true, features = ["conformance"] }
 tokio = { version = "1", features = ["macros", "rt"] }
