@@ -14,8 +14,9 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 1 — Contracts.** The workspace and `contracts` crate exist; the other seven crates are
-deliberately empty. Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
+**Stage 2 — Walking skeleton (done); Stage 3 — Real brain is next.** Every module exists; brain,
+sandbox, store, knowledge and credentials are fakes, and the harness runs the TUI end to end.
+Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
 

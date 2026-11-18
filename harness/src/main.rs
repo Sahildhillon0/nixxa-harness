@@ -1,11 +1,18 @@
 //! # nixxa
 //!
-//! The harness: TUI + composition root. In Stage 1 there is nothing to run yet; the TUI and
-//! wiring arrive in Stage 2 — see ARCHITECTURE.md § Stages.
+//! The harness: the TUI and the composition root. Stage 2 wires every module to its fake —
+//! scripted brain, echo sandbox, in-memory store, fake knowledge — so the whole loop runs end
+//! to end. See ARCHITECTURE.md § Stages.
 
-fn main() {
-    println!(
-        "nixxa {} — Stage 1 (contracts). Nothing to run yet; the TUI arrives in Stage 2.",
-        env!("CARGO_PKG_VERSION")
-    );
+mod app;
+mod logging;
+mod paths;
+mod ports;
+mod safe;
+mod tui;
+mod ui;
+mod wiring;
+
+fn main() -> std::io::Result<()> {
+    tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(tui::run())
 }

@@ -450,14 +450,14 @@ Every stage ends with something that runs and a checklist that must be true befo
 - Repo, README, ARCHITECTURE, DESIGN, AGENT, one folder per module with its own README.
 - **Exit:** docs agreed; module boundaries, integrations and stage plan accepted.
 
-### Stage 1 — Contracts *(current)*
+### Stage 1 — Contracts *(done — macOS/Windows CI pending)*
 - Cargo workspace with eight crates (empty bodies except `contracts`).
 - All types, traits, events and error enums from §3, including `Knowledge` and the
   `Action` split, `Credentials`, `Credential` and `AccountRef`. Conformance test suites.
 - CI on Linux, macOS and Windows: fmt, clippy (`-D warnings`), test, dependency-rule check.
 - **Exit:** workspace builds on all three OSs; CI fails if any crate imports a sibling.
 
-### Stage 2 — Walking skeleton
+### Stage 2 — Walking skeleton *(done)*
 - Harness: ratatui app with conversation pane, activity pane, input line, status bar
   (including knowledge-source indicators).
 - Controller: the loop from §4 with routing; policy = "ask for everything".
