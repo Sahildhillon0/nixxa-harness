@@ -450,7 +450,7 @@ Every stage ends with something that runs and a checklist that must be true befo
 - Repo, README, ARCHITECTURE, DESIGN, AGENT, one folder per module with its own README.
 - **Exit:** docs agreed; module boundaries, integrations and stage plan accepted.
 
-### Stage 1 — Contracts *(done)*
+### Stage 1 — Contracts *(done — macOS/Windows CI pending)*
 - Cargo workspace with eight crates (empty bodies except `contracts`).
 - All types, traits, events and error enums from §3, including `Knowledge` and the
   `Action` split, `Credentials`, `Credential` and `AccountRef`. Conformance test suites.

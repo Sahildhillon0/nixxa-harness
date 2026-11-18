@@ -123,6 +123,9 @@ The mode is always shown in the hint bar and changeable with one key.
   red = denied/error, dim = sandbox internals, accent = the agent's voice.
 - Status is never colour-only: every state also has an icon (`✓ ● ? ✗`).
 - Uses the terminal's own palette; honours `NO_COLOR`.
+- Text Nixxa did not write (agent output, command output, notes, proposed commands) never
+  reaches the terminal raw: control characters show as `^[`, `^M`…, C1 controls as `�`, and
+  bidi overrides as `<U+202E>`, so output can't drive the terminal or disguise an approval.
 - Sandbox state is unmissable: `● isolated` in green, `○ NOT ISOLATED` in red (Stages 2–3).
 - When vault or memory content is about to be sent to the model, the activity line carries a
   `↑` marker, so leaving the machine is always visible.
@@ -183,6 +186,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-017 | Subscription sign-in only where the provider officially permits third-party apps; Anthropic via API key or cloud accounts | Anthropic does not currently allow third-party products to offer claude.ai login without approval; we stay within each provider's terms. | 0 |
 | D-018 | Controller runs turns one at a time, queues messages sent mid-turn, and cancels a turn with a signal checked at its cancellation points (brain stream, approval prompt, action) | Keeps the conversation a single ordered history the brain can replay. Cancelling only at those points (dropping just that future, per the contracts' cancellation convention) means store writes and history updates always complete, so an interrupt never leaves a proposal without its observation. An infrastructure error (trait error) ends the turn; action-level failures and denials go back to the brain. | 2 |
 | D-019 | ratatui 0.29 + crossterm 0.28 (not ratatui 0.30) | ratatui 0.30 needs Rust 1.88, above the workspace MSRV of 1.85; 0.29 has everything Stage 2 needs. Revisit when the MSRV moves. | 2 |
+| D-020 | The harness sanitises every untrusted string it draws, and scrubs the whole frame as a backstop | Escape sequences in model or command output could retitle the window, write the host clipboard (OSC 52) or spoof the approval prompt with `\r` or bidi overrides, which would defeat the human-in-the-loop principle. One choke point (`harness/src/safe.rs`) plus a buffer scrub keeps a forgotten call site from reopening the hole. | 2 |
+| D-021 | Logs go to daily files in `<data dir>/nixxa/logs` (kept 7 days), metadata only | The TUI owns stdout/stderr. Logging ids, kinds, verdicts and errors, never message text or action output, keeps file contents and secrets out of logs. `NIXXA_LOG` sets the level. | 2 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
