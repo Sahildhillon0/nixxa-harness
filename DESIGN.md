@@ -194,6 +194,9 @@ Both appear in the activity pane as the last lines of the session.
 | D-025 | Anthropic over raw HTTP with reqwest 0.12 (rustls on `ring`, OS trust store); API version `2026-10-21` | There's no official Rust SDK. reqwest 0.13's default TLS uses aws-lc, which needs a C toolchain on Windows. `2026-10-21` is the latest version, and its Messages API changes don't touch what we send. | 3 |
 | D-026 | The Anthropic brain holds every intent until `message_stop`; only text deltas stream live | A server-side refusal fallback can replace a partial answer mid-stream, and `max_tokens` can cut a tool call short. Holding the batch means no call from a declined or truncated partial is ever proposed. | 3 |
 | D-027 | Server-side refusal fallback (`fallbacks: "default"`) on by default, configurable | Recommended for current Claude models; Claude API only, so it's a config switch for other endpoints. Sent only for models that support it. | 3 |
+| D-028 | The controller records a step's whole output (reasoning, text, every proposal) in stream order before it runs any action; the observations follow together. Unrun proposals are closed with a denial when a step stops early. | Refines D-018. The model's message must reach the provider again unchanged: splitting parallel calls into separate turns edits it (a 400 with signed thinking blocks) and teaches the model to stop calling tools in parallel. | 3 |
+| D-029 | `Done` summaries are stored in the db but kept out of the conversation the brain sees | The summary isn't part of the model's message; appending it to the model's last turn is a history edit. | 3 |
+| D-030 | The brain's HTTP client honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (reqwest `system-proxy`) | Corporate networks need it to reach the API at all. It's the one place a module reads the environment, an exception to D-007, and limited to the standard proxy variables. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
@@ -207,6 +210,9 @@ New decisions get the next ID. A reversed decision is struck through, not delete
   (one entry per provider) or use a more compact format? And the registry lock is per process:
   two Nixxa instances adding accounts at once can lose an update. Re-read and retry, or an
   advisory lock?
+- Stage 5 resume: `Done` summaries are stored in the db but must not be replayed to the brain
+  (D-029). The db can't tell them apart from agent text yet. Mark them (e.g. a role or a
+  record), or skip them on resume?
 - Stage 3 PR C: when the registry is unreadable but an env key exists, `list` quietly falls back
   to the env account and the stored accounts disappear. How should the harness tell the user?
 - User-added external tools (Stage 11): MCP only, or also a native plugin trait?
