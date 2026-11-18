@@ -119,7 +119,7 @@ fn outcome_kind(outcome: &Outcome) -> &'static str {
     }
 }
 
-fn appender(dir: &Path) -> Result<RollingFileAppender, String> {
+pub(crate) fn appender(dir: &Path) -> Result<RollingFileAppender, String> {
     std::fs::create_dir_all(dir).map_err(|err| format!("could not create {}: {err}", dir.display()))?;
     RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
@@ -138,7 +138,20 @@ fn level(filter: Option<&str>) -> Result<Level, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+    /// Tests on other threads hit the same callsites with no subscriber, and tracing caches a
+    /// callsite as disabled when nothing wants it. A global, everything-enabled subscriber
+    /// (writing nowhere) means no callsite can be cached as disabled. Call before capturing.
+    pub(crate) fn enable_every_callsite() {
+        static GLOBAL: std::sync::Once = std::sync::Once::new();
+        GLOBAL.call_once(|| {
+            let sink =
+                tracing_subscriber::fmt().with_writer(std::io::sink).with_max_level(tracing::Level::TRACE).finish();
+            tracing::subscriber::set_global_default(sink).expect("no other global subscriber in tests");
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+
     use std::io::Write;
 
     use super::*;
@@ -171,15 +184,7 @@ mod tests {
             .with_ansi(false)
             .with_max_level(Level::TRACE)
             .finish();
-        // Tests on other threads hit the same callsites with no subscriber, and tracing caches a
-        // callsite as disabled when nothing wants it. A global, everything-enabled subscriber
-        // (writing nowhere) means no callsite can be cached as disabled.
-        static GLOBAL: std::sync::Once = std::sync::Once::new();
-        GLOBAL.call_once(|| {
-            let sink = tracing_subscriber::fmt().with_writer(std::io::sink).with_max_level(Level::TRACE).finish();
-            tracing::subscriber::set_global_default(sink).expect("no other global subscriber in tests");
-            tracing::callsite::rebuild_interest_cache();
-        });
+        enable_every_callsite();
         tracing::subscriber::with_default(subscriber, f);
         let bytes = buf.0.lock().unwrap().clone();
         String::from_utf8(bytes).unwrap()

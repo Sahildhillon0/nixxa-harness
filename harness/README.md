@@ -12,7 +12,29 @@ The `nixxa` binary: the ratatui TUI and the composition root that picks concrete
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
-## Stage 2 status
+## Stage 3 status
+
+`cargo run -p nixxa-harness` opens the TUI on the current directory.
+
+- **Brain:** Claude (`AnthropicBrain`), with keys from `KeychainCredentials` (OS keychain plus a
+  read-only `anthropic:env` account from `ANTHROPIC_API_KEY`). `--fake` uses the scripted Stage 2
+  brain instead. The sandbox, store and knowledge are still the Stage 2 fakes.
+- **First run:** with no Anthropic account, a setup screen asks for a key. It is masked (bullets
+  plus the last four characters), checked with `AnthropicBrain::verify_key`, then stored as
+  `anthropic:default`; the session starts once it's saved. A bad key shows the error and can be
+  retried; `ctrl-u` clears; `ctrl-a` reopens the screen later. Paste uses bracketed paste.
+- **Startup:** if the keychain can't be read, the conversation says so (`check_storage`).
+- **Settings:** `settings.rs` reads the arguments and `ANTHROPIC_API_KEY` (trimmed), `NIXXA_MODEL`
+  and `NIXXA_EFFORT`. Modules never read the environment (D-007).
+- **Errors:** a turn that ends in an error drops its half-streamed text (D-032).
+- **Tests:**
+  - an offline end-to-end run with recorded Claude responses through the real wiring
+    (`stage_three_end_to_end_with_recorded_claude`, `tests/anthropic_loop.rs`);
+  - setup-screen masking;
+  - a full setup run whose screens, logs and data directory are scanned for the key
+    (`setup_never_writes_the_key_to_the_screen_logs_or_disk`).
+
+## Stage 2 notes
 
 `cargo run -p nixxa-harness` opens the TUI on the current directory with every module wired to
 its fake (scripted brain, fake sandbox, in-memory store, fake knowledge).

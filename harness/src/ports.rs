@@ -12,6 +12,8 @@ pub(crate) enum UiEvent {
     Controller(Event),
     /// The controller is waiting for the human to decide on an action.
     Approval(PendingApproval),
+    /// The setup screen's key was checked and saved, or why not.
+    KeySaved(Result<nixxa_contracts::AccountInfo, String>),
 }
 
 /// An approval prompt waiting for the human.

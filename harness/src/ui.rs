@@ -7,7 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 
-use crate::app::{Activity, ActivityState, App, Focus, Speaker};
+use crate::app::{Activity, ActivityState, App, Focus, SetupState, Speaker};
 use crate::safe;
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
@@ -75,6 +75,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, theme, input);
     frame.render_widget(Paragraph::new(hint_line(app, theme, hints.width)), hints);
     draw_approval(frame, app, theme, if side.area() > 0 { side } else { body });
+    draw_setup(frame, app, theme, body);
     safe::scrub(frame.buffer_mut());
 }
 
@@ -307,20 +308,55 @@ fn draw_input(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
 }
 
 fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
-    let keys = if app.approval().is_some() {
+    let setup = app.setup.as_ref().map(|form| form.first_run);
+    let keys = if let Some(first_run) = setup {
+        let leave = if first_run { "ctrl-c twice quit" } else { "esc cancel" };
+        format!("enter check & save · ctrl-u clear · {leave}")
+    } else if app.approval().is_some() {
         "y allow · n deny · ctrl-c interrupt".to_string()
     } else if let Some(notice) = &app.notice {
         safe::line(notice)
     } else {
-        "enter send · alt-enter newline · tab focus · j/k move · ctrl-c interrupt (twice: quit)".to_string()
+        let key = if app.setup_available { " · ctrl-a API key" } else { "" };
+        format!("enter send · alt-enter newline · tab focus · j/k move{key} · ctrl-c interrupt (twice: quit)")
     };
     let mode = format!("mode: {} ", format!("{:?}", app.mode).to_uppercase());
-    let style = if app.approval().is_some() || app.notice.is_some() { theme.pending() } else { theme.dim() };
+    let urgent = setup.is_some() || app.approval().is_some() || app.notice.is_some();
+    let style = if urgent { theme.pending() } else { theme.dim() };
     let room = usize::from(width).saturating_sub(mode.chars().count() + 1);
     Line::from(vec![
         Span::styled(format!(" {:<room$}", truncate(&keys, room.saturating_sub(1))), style),
         Span::raw(mode),
     ])
+}
+
+/// The API-key setup form, over the panes. The key is only ever drawn masked.
+fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
+    let Some(form) = app.setup.as_ref() else { return };
+    let masked = form.masked();
+    let mut lines = vec![
+        Line::raw("Paste an API key from the Anthropic Console (console.anthropic.com)."),
+        Line::styled("It is checked with Anthropic, then kept in the OS keychain, never in a file.", theme.dim()),
+        Line::default(),
+        Line::from(vec![Span::styled("Key  ", theme.dim()), Span::raw(masked.clone())]),
+        Line::default(),
+    ];
+    match &form.state {
+        SetupState::Editing => lines.push(Line::styled("Only the last four characters are ever shown.", theme.dim())),
+        SetupState::Checking => lines.push(Line::styled("● Checking the key with Anthropic…", theme.pending())),
+        SetupState::Failed(message) => lines.push(Line::styled(format!("✗ {}", safe::line(message)), theme.bad())),
+    }
+    let width = over.width.min(78);
+    let height = 9.min(over.height);
+    let area = Rect { x: over.x + (over.width - width) / 2, y: over.y + (over.height - height) / 2, width, height };
+    let block = Block::bordered().title(" Anthropic API key ").border_style(theme.accent());
+    let inner = block.inner(area);
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+    if form.state != SetupState::Checking && inner.height > 3 {
+        let x = inner.x.saturating_add(u16::try_from(5 + masked.chars().count()).unwrap_or(u16::MAX));
+        frame.set_cursor_position((x.min(inner.right().saturating_sub(1)), inner.y + 3));
+    }
 }
 
 fn draw_approval(frame: &mut Frame, app: &mut App, theme: Theme, over: Rect) {
@@ -411,7 +447,7 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use nixxa_contracts::{
         AccountRef, ActionId, BrainInfo, Event, Message, Observation, ProviderId, Role, SandboxActionKind,
         SandboxCapabilities, SessionId, SourceId, SourceInfo, Timestamp, TurnId,
@@ -632,6 +668,34 @@ mod tests {
         let mut app = started();
         app.queued.push_back("later".into());
         assert!(screen(&mut app, 120, 20).contains("you   later (queued)"));
+    }
+
+    #[test]
+    fn the_setup_screen_never_draws_the_key() {
+        let key = "sk-ant-api03-SECRETSECRET-wxyz";
+        let mut app = started();
+        app.open_setup(true);
+        app.paste(key);
+        let screen = screen(&mut app, 120, 24);
+        assert!(screen.contains("Anthropic API key") && screen.contains("wxyz"), "{screen}");
+        assert!(!screen.contains("SECRET") && !screen.contains("sk-ant"), "{screen}");
+        assert!(screen.contains("enter check & save") && screen.contains("ctrl-c twice quit"));
+
+        app.key_saved(&Err("Anthropic rejected this key: invalid x-api-key".into()));
+        let screen = screen_of(&mut app);
+        assert!(screen.contains("✗ Anthropic rejected this key"), "{screen}");
+    }
+
+    #[test]
+    fn the_hint_bar_offers_the_key_setup_when_available() {
+        let mut app = started();
+        assert!(!screen(&mut app, 140, 20).contains("ctrl-a API key"));
+        app.setup_available = true;
+        assert!(screen(&mut app, 140, 20).contains("ctrl-a API key"));
+    }
+
+    fn screen_of(app: &mut App) -> String {
+        screen(app, 120, 24)
     }
 
     #[test]
