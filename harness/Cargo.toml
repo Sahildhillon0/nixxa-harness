@@ -10,6 +10,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+crossterm = { workspace = true }
+futures = { workspace = true }
 nixxa-accounts = { workspace = true }
 nixxa-brain = { workspace = true }
 nixxa-contracts = { workspace = true }
@@ -17,6 +20,8 @@ nixxa-controller = { workspace = true }
 nixxa-db = { workspace = true }
 nixxa-knowledge = { workspace = true }
 nixxa-sandbox = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 
 [[bin]]
 name = "nixxa"
