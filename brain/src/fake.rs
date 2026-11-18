@@ -44,37 +44,52 @@ impl ScriptedBrain {
             let nixxa_contracts::Content::Observation { observation } = &last.content else {
                 return vec![Intent::Done { summary: "end".into() }];
             };
-            if let Outcome::Denied { reason } = &observation.outcome {
+            // Branch on the action this observation answers, not on how it failed: a failed
+            // action must end the turn instead of sending the agent down the same script again.
+            let request = context
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match &m.content {
+                    nixxa_contracts::Content::Action { request } => Some(request.clone()),
+                    _ => None,
+                })
+                .filter(|r| r.id == observation.action_id);
+            if let Some(request) = &request {
+                if let Outcome::Denied { reason } = &observation.outcome {
+                    return vec![
+                        Intent::Say { text: format!("okay, skipping that: {reason}") },
+                        Intent::Done { summary: "denied".into() },
+                    ];
+                }
+                if let Action::Sandbox { action: SandboxAction::Exec { command, .. } } = &request.action {
+                    return Self::after_exec(&observation.outcome, command);
+                }
+                // The knowledge lookup answered; run the scripted sandbox exec.
                 return vec![
-                    Intent::Say { text: format!("okay, skipping that: {reason}") },
-                    Intent::Done { summary: "denied".into() },
+                    Intent::Say { text: "I looked into that.".into() },
+                    Intent::Act { request: Self::exec_request(context) },
                 ];
             }
-            if let Outcome::Exec { .. } = &observation.outcome {
-                return vec![
-                    Intent::Say { text: "The command finished.".into() },
-                    Intent::Done { summary: "sandbox exec done".into() },
-                ];
-            }
-            // A knowledge observation: say a short line, then propose the sandbox exec.
-            return vec![
-                Intent::Say { text: "I looked into that.".into() },
-                Intent::Act {
-                    request: ActionRequest {
-                        id: ActionId::new(format!("act-{}-{}", context.session, context.messages.len())),
-                        action: Action::Sandbox {
-                            action: SandboxAction::Exec {
-                                command: "echo hello from the sandbox".into(),
-                                cwd: None,
-                                timeout_ms: Some(5_000),
-                            },
-                        },
-                        reason: Some("run the command".into()),
-                    },
-                },
-            ];
+            // The observation does not answer a known action; close the turn.
+            return vec![Intent::Done { summary: "no matching action".into() }];
         }
         vec![Intent::Done { summary: "nothing to do".into() }]
+    }
+
+    /// Closes the turn after a scripted sandbox exec, whether it succeeded or failed.
+    fn after_exec(outcome: &Outcome, command: &str) -> Vec<Intent> {
+        if matches!(outcome, Outcome::Exec { .. }) {
+            vec![
+                Intent::Say { text: "The command finished.".into() },
+                Intent::Done { summary: "sandbox exec done".into() },
+            ]
+        } else {
+            vec![
+                Intent::Say { text: format!("The command failed: {command}") },
+                Intent::Done { summary: "sandbox exec failed".into() },
+            ]
+        }
     }
 }
 
