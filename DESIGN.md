@@ -114,7 +114,7 @@ The mode is always shown in the hint bar and changeable with one key.
 | `y` / `n` | approve / deny in a prompt |
 | `ctrl-s` | session list |
 | `ctrl-k` | knowledge panel: source status, paths found, enable/disable per source |
-| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account |
+| `ctrl-a` | accounts screen: add / remove / validate / set default; switch the session's account (Stage 3: the API-key setup screen) |
 | `?` | help overlay |
 
 ### Visual language
@@ -197,6 +197,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-028 | The controller records a step's whole output (reasoning, text, every proposal) in stream order before it runs any action; the observations follow together. Unrun proposals are closed with a denial when a step stops early. | Refines D-018. The model's message must reach the provider again unchanged: splitting parallel calls into separate turns edits it (a 400 with signed thinking blocks) and teaches the model to stop calling tools in parallel. | 3 |
 | D-029 | `Done` summaries are stored in the db but kept out of the conversation the brain sees | The summary isn't part of the model's message; appending it to the model's last turn is a history edit. | 3 |
 | D-030 | The brain's HTTP client honours `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` (reqwest `system-proxy`) | Corporate networks need it to reach the API at all. It's the one place a module reads the environment, an exception to D-007, and limited to the standard proxy variables. | 3 |
+| D-031 | First-run API-key setup in the TUI: paste (masked, last four only) → free check with Anthropic → saved to the keychain as `anthropic:default`; `ctrl-a` reopens it; `ANTHROPIC_API_KEY` works as a read-only account; `--fake` keeps the scripted brain | The key never touches a file or a log, a bad key is caught before it's saved, and offline demos still work. A storage problem is reported at startup instead of hidden. | 3 |
+| D-032 | A turn that ends in an error drops its half-streamed answer from the screen | A refused or failed answer isn't an answer; the docs say to discard a refused partial. An interrupted turn still keeps what streamed, as before. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
@@ -213,8 +215,6 @@ New decisions get the next ID. A reversed decision is struck through, not delete
 - Stage 5 resume: `Done` summaries are stored in the db but must not be replayed to the brain
   (D-029). The db can't tell them apart from agent text yet. Mark them (e.g. a role or a
   record), or skip them on resume?
-- Stage 3 PR C: when the registry is unreadable but an env key exists, `list` quietly falls back
-  to the env account and the stored accounts disappear. How should the harness tell the user?
 - User-added external tools (Stage 11): MCP only, or also a native plugin trait?
 - Sandbox network policy: off / allow-list / proxy-with-log?
 - Windows sandbox backend: AppContainer, WSL2, or container-only?
@@ -224,6 +224,9 @@ New decisions get the next ID. A reversed decision is struck through, not delete
   one note per session.)
 - Should the agent be allowed to edit existing vault notes, or only create new ones?
 - License.
+
+Resolved: *an unreadable registry hides stored accounts behind the env account?* → the harness
+calls `KeychainCredentials::check_storage` at startup and says why keys can't be saved (D-031).
 
 Resolved: *long-term memory as its own module?* → yes, external memory lives in `knowledge`
 (D-009); Nixxa's own transcripts stay in `db`.

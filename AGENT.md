@@ -14,8 +14,17 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 2 — Walking skeleton (done); Stage 3 — Real brain is next.** Every module exists; brain,
-sandbox, store, knowledge and credentials are fakes, and the harness runs the TUI end to end.
+**Stage 3 — Real brain (in progress).**
+- **Done so far:** Claude (`AnthropicBrain`) with keys in the OS keychain (`KeychainCredentials`),
+  and the harness's Anthropic setup path. `--fake` runs the scripted brain.
+- **Still to come:**
+  - an OpenAI-compatible local provider (`Credential::Local`; LM Studio / Ollama);
+  - setup option 2, a local model, with the wiring picking the brain from the default account's
+    provider;
+  - OpenRouter sign-in.
+- **Pending:** the Anthropic live checks, which need a key.
+
+The sandbox, store and knowledge are still fakes.
 Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
