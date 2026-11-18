@@ -130,6 +130,18 @@ async fn env_accounts_still_work_when_the_keychain_is_unavailable() {
 }
 
 #[tokio::test]
+async fn check_storage_reports_what_list_hides_behind_the_env_account() {
+    let store = Arc::new(MemoryStore::default());
+    let credentials = over(&store, env_config());
+    credentials.check_storage().await.expect("a working store");
+
+    store.break_with("the OS keychain is not available");
+    assert_eq!(credentials.list(None).await.unwrap().len(), 1, "list quietly shows only the env account");
+    let Err(CredentialsError::Storage(message)) = credentials.check_storage().await else { panic!("expected Storage") };
+    assert!(message.contains("not available"), "{message}");
+}
+
+#[tokio::test]
 async fn an_unreadable_registry_is_reported_and_never_overwritten() {
     let store = Arc::new(MemoryStore::default());
     store_raw(&store, REGISTRY, "{ not json");

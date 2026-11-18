@@ -107,6 +107,13 @@ impl KeychainCredentials {
         Self { inner: Arc::new(Inner { store, env, lock: Mutex::new(()) }) }
     }
 
+    /// Checks that the keychain and the account registry can be read. `list` falls back to
+    /// environment accounts when they can't, so the harness calls this to tell the user why the
+    /// stored accounts are missing.
+    pub async fn check_storage(&self) -> Result<(), CredentialsError> {
+        self.blocking(|inner| inner.load().map(|_| ())).await
+    }
+
     /// Runs `f` on the blocking pool with the registry lock held.
     async fn blocking<T: Send + 'static>(
         &self,
