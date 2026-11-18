@@ -142,6 +142,45 @@ async fn check_storage_reports_what_list_hides_behind_the_env_account() {
 }
 
 #[tokio::test]
+async fn settings_are_kept_with_the_accounts_and_survive_a_restart() {
+    let store = Arc::new(MemoryStore::default());
+    let credentials = over(&store, KeychainConfig::default());
+    assert_eq!(credentials.setting("active_account").await.unwrap(), None);
+    credentials.add(anthropic("default"), api_key(KEY)).await.unwrap();
+    credentials.set_setting("active_account", Some("local:default")).await.unwrap();
+    credentials.set_setting("model.local:default", Some("openai/gpt-oss-20b")).await.unwrap();
+
+    let relaunched = over(&store, KeychainConfig::default());
+    assert_eq!(relaunched.setting("active_account").await.unwrap().as_deref(), Some("local:default"));
+    assert_eq!(relaunched.setting("model.local:default").await.unwrap().as_deref(), Some("openai/gpt-oss-20b"));
+    assert_eq!(relaunched.list(None).await.unwrap().len(), 1, "accounts are untouched");
+    relaunched.set_setting("active_account", None).await.unwrap();
+    assert_eq!(relaunched.setting("active_account").await.unwrap(), None);
+    let registry = store.raw(REGISTRY).unwrap();
+    assert!(!registry.contains("very-secret"), "{registry}");
+}
+
+#[tokio::test]
+async fn an_older_registry_without_settings_still_reads() {
+    let store = Arc::new(MemoryStore::default());
+    store_raw(&store, REGISTRY, r#"{"version":1,"accounts":[]}"#);
+    let credentials = over(&store, KeychainConfig::default());
+    assert_eq!(credentials.setting("active_account").await.unwrap(), None);
+    credentials.set_setting("active_account", Some("anthropic:default")).await.unwrap();
+    assert!(store.raw(REGISTRY).unwrap().contains("\"settings\""));
+}
+
+#[tokio::test]
+async fn setting_names_and_values_are_checked() {
+    let credentials = KeychainCredentials::in_memory(KeychainConfig::default());
+    for key in ["", "has space", "a/b", &"x".repeat(129)] {
+        assert!(matches!(credentials.set_setting(key, Some("v")).await, Err(CredentialsError::Invalid(_))), "{key:?}");
+    }
+    assert!(credentials.set_setting("ok", Some("two\nlines")).await.is_err());
+    assert!(credentials.set_setting("ok", Some(&"v".repeat(1025))).await.is_err());
+}
+
+#[tokio::test]
 async fn an_unreadable_registry_is_reported_and_never_overwritten() {
     let store = Arc::new(MemoryStore::default());
     store_raw(&store, REGISTRY, "{ not json");
