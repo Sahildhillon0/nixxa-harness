@@ -2,3 +2,5 @@
 //!
 //! Stage 1: the contract lives in `nixxa-contracts`. The MCP client and the first sources
 //! arrive in Stage 6.
+
+pub mod fake;

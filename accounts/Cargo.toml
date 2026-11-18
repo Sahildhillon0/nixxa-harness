@@ -10,4 +10,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
 nixxa-contracts = { workspace = true }
+
+[dev-dependencies]
+nixxa-contracts = { workspace = true, features = ["conformance"] }
+tokio = { workspace = true }
