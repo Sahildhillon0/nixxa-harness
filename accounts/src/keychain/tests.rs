@@ -171,6 +171,21 @@ async fn names_that_would_break_the_entry_layout_are_rejected() {
     }
 }
 
+/// Regression (PR #5 review, S1): Windows Credential Manager matches entry names
+/// case-insensitively, so names that differ only in case would share one secret.
+#[tokio::test]
+async fn names_that_differ_only_in_case_cannot_coexist() {
+    let credentials = KeychainCredentials::in_memory(KeychainConfig::default());
+    credentials.add(anthropic("work"), api_key(KEY)).await.unwrap();
+    for account in [anthropic("Work"), anthropic("WORK"), AccountRef::new("Anthropic", "work")] {
+        let err = credentials.add(account.clone(), api_key(ENV_KEY)).await.unwrap_err();
+        let CredentialsError::Invalid(message) = &err else { panic!("{account} → {err:?}") };
+        assert!(message.contains("lower-case"), "{message}");
+    }
+    assert_eq!(credentials.get(&anthropic("work")).await.unwrap(), api_key(KEY), "the original key is intact");
+    assert_eq!(credentials.list(None).await.unwrap().len(), 1);
+}
+
 #[tokio::test]
 async fn only_api_keys_are_stored_in_stage_3() {
     let credentials = KeychainCredentials::in_memory(KeychainConfig::default());

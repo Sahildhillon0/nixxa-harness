@@ -38,7 +38,8 @@ claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md
 - **Stage 3 scope:** API keys only. Other credential kinds return `Unsupported` until their
   methods land (Stage 8).
 - **Checks:** keys are checked locally (non-empty, no spaces or control characters). Provider
-  and label must be plain (letters, digits, `-` `_` `.`), because they become entry names.
+  and label must be plain lower-case (`a-z 0-9 - _ .`), because they become entry names and
+  Windows Credential Manager matches names case-insensitively.
 - **Threading:** keychain calls run on tokio's blocking pool, so use it inside a tokio runtime.
 - **In memory:** `KeychainCredentials::in_memory` behaves the same but keeps everything in
   memory, for tests and offline demos.

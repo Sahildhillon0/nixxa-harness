@@ -314,19 +314,22 @@ fn entry_name(account: &AccountRef) -> String {
     format!("nixxa/{}/{}", account.provider, account.account)
 }
 
-/// Provider and label become part of a keychain entry name, so keep them plain.
+/// Provider and label become part of a keychain entry name, so keep them plain. Lower-case
+/// only: Windows Credential Manager matches names case-insensitively, so `anthropic:Work` and
+/// `anthropic:work` would share one secret.
 fn check_names(account: &AccountRef) -> Result<(), CredentialsError> {
     let ok = |s: &str| {
         !s.is_empty()
             && s.len() <= 64
             && !s.starts_with('_')
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+            && s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'))
     };
     if ok(account.provider.as_str()) && ok(&account.account) {
         Ok(())
     } else {
         Err(CredentialsError::Invalid(format!(
-            "`{account}`: provider and label must be 1–64 letters, digits, `-`, `_` or `.`, not starting with `_`"
+            "`{account}`: provider and label must be 1–64 lower-case letters, digits, `-`, `_` or `.`, \
+             not starting with `_`"
         )))
     }
 }
