@@ -12,6 +12,7 @@ use nixxa_contracts::{
 use nixxa_controller::Command;
 
 use crate::ports::PendingApproval;
+use nixxa_accounts::methods::openrouter::KEYS_PAGE;
 use nixxa_brain::ModelInfo;
 use nixxa_contracts::{AccountInfo, AuthMethod, Secret};
 
@@ -101,6 +102,14 @@ pub(crate) enum Effect {
         url: String,
         model: String,
     },
+    /// Start an OpenRouter sign-in (the user confirmed the privacy notice).
+    StartSignIn,
+    /// Stop the OpenRouter sign-in, and forget its key if it already arrived.
+    CancelSignIn,
+    /// Check the signed-in OpenRouter key and this model, then store the account.
+    SaveOpenRouter {
+        model: String,
+    },
 }
 
 /// Everything the TUI shows.
@@ -176,6 +185,14 @@ impl App {
             Ok(info) => {
                 self.setup = None;
                 match info.method {
+                    AuthMethod::SignIn => {
+                        let hint = info.hint.as_ref().map(|h| format!(" (…{h})")).unwrap_or_default();
+                        self.note(format!(
+                            "Signed in: the OpenRouter key{hint} is saved for {} in the OS keychain. \
+                             Nixxa can't revoke it for you; to revoke it, delete it at {KEYS_PAGE}.",
+                            info.account
+                        ));
+                    }
                     AuthMethod::Local => {
                         let url = info.hint.as_deref().unwrap_or("the local server");
                         self.note(format!("Saved {} ({url}).", info.account));

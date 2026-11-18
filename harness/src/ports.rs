@@ -16,6 +16,11 @@ pub(crate) enum UiEvent {
     AccountSaved(Result<nixxa_contracts::AccountInfo, String>),
     /// The local server's models, or why they couldn't be read.
     ModelsListed(Result<Vec<nixxa_brain::ModelInfo>, String>),
+    /// The sign-in listener is up: the page to open (or why it couldn't start).
+    SignInStarted(Result<String, String>),
+    /// The browser came back with a key (or why not). The key goes no further than the UI loop,
+    /// which holds it until a model is chosen.
+    SignedIn(Result<nixxa_contracts::Secret, String>),
 }
 
 /// An approval prompt waiting for the human.

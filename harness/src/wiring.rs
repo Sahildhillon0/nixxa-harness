@@ -66,6 +66,8 @@ pub(crate) fn controller(
 
 /// The provider id of local-model accounts.
 pub(crate) const LOCAL: &str = "local";
+/// The provider id of OpenRouter accounts (signed in through the browser).
+pub(crate) const OPENROUTER: &str = nixxa_accounts::methods::openrouter::PROVIDER;
 /// Setting: the account sessions start with.
 const ACTIVE_ACCOUNT: &str = "active_account";
 
@@ -116,7 +118,7 @@ impl Models {
                 }
             }
         }
-        for provider in [ANTHROPIC, LOCAL] {
+        for provider in [ANTHROPIC, LOCAL, OPENROUTER] {
             if let Some(account) = accounts.iter().find(|a| a.account.provider.as_str() == provider && a.is_default) {
                 return Some(account.account.clone());
             }
@@ -139,8 +141,60 @@ impl Models {
                     .map_err(|err| format!("could not set up the local model client: {err}"))?;
                 Ok(Arc::new(brain))
             }
+            OPENROUTER => {
+                let model = self
+                    .credentials
+                    .setting(&model_setting(account))
+                    .await
+                    .map_err(|err| err.to_string())?
+                    .ok_or_else(|| format!("no model is chosen for {account} yet"))?;
+                let brain = (self.local)(self.credentials.clone(), OpenAiCompatConfig::openrouter(model))
+                    .map_err(|err| format!("could not set up the OpenRouter client: {err}"))?;
+                Ok(Arc::new(brain))
+            }
             other => Err(format!("Nixxa can't use {other} accounts yet")),
         }
+    }
+
+    /// A brain for a signed-in key that isn't saved yet, through a throwaway in-memory account.
+    async fn openrouter_probe(&self, key: &Secret, model: &str) -> Result<(OpenAiCompatBrain, AccountRef), String> {
+        let account = AccountRef::new(OPENROUTER, SETUP_LABEL);
+        let scratch = Arc::new(KeychainCredentials::in_memory(KeychainConfig::default()));
+        let token = Credential::BearerToken { token: key.clone(), expires_at: None };
+        scratch.add(account.clone(), token).await.map_err(|err| err.to_string())?;
+        let brain = (self.local)(scratch, OpenAiCompatConfig::openrouter(model))
+            .map_err(|err| format!("could not set up the OpenRouter client: {err}"))?;
+        Ok((brain, account))
+    }
+
+    /// OpenRouter's models, for the picker (setup keeps the ones that can use tools).
+    pub(crate) async fn list_openrouter_models(&self, key: &Secret) -> Result<Vec<ModelInfo>, String> {
+        let (brain, account) = self.openrouter_probe(key, "").await?;
+        brain.list_models(&account).await.map_err(|err| local_words(&err))
+    }
+
+    /// Checks the signed-in key and that OpenRouter offers `model`, then saves the key as
+    /// `openrouter:default` with that model and makes it the account sessions start with.
+    pub(crate) async fn save_openrouter(&self, key: Secret, model: &str) -> Result<AccountInfo, String> {
+        let (brain, account) = self.openrouter_probe(&key, model).await?;
+        if let Err(err) = brain.verify(&account).await {
+            tracing::warn!("OpenRouter key or model check failed");
+            return Err(local_words(&err));
+        }
+        let token = Credential::BearerToken { token: key, expires_at: None };
+        let info = self.credentials.add(account.clone(), token).await.map_err(|err| match err {
+            CredentialsError::Storage(message) => {
+                format!("Signed in, but the OS keychain couldn't store the key ({message}).")
+            }
+            other => other.to_string(),
+        })?;
+        let saved = async {
+            self.credentials.set_setting(&model_setting(&account), Some(model)).await?;
+            self.credentials.set_setting(ACTIVE_ACCOUNT, Some(&account.to_string())).await
+        };
+        saved.await.map_err(|err| format!("Couldn't save the model choice: {err}"))?;
+        tracing::info!(account = %account, "OpenRouter account saved");
+        Ok(info)
     }
 
     /// A local account's server URL.
@@ -323,7 +377,10 @@ pub(crate) mod tests {
                     prompts += 1;
                     app.handle_key(key(KeyCode::Char('y')));
                 }
-                UiEvent::AccountSaved(_) | UiEvent::ModelsListed(_) => panic!("no setup in this test"),
+                UiEvent::AccountSaved(_)
+                | UiEvent::ModelsListed(_)
+                | UiEvent::SignInStarted(_)
+                | UiEvent::SignedIn(_) => panic!("no setup in this test"),
             }
         }
     }
@@ -548,6 +605,49 @@ pub(crate) mod tests {
         assert_eq!(app.cost_micro_usd, 0, "a local model costs nothing");
         cmd_tx.send(Command::Shutdown).await.unwrap();
         task.await.unwrap();
+    }
+
+    const OPENROUTER_KEY: &str = "sk-or-v1-signed-in-key-for-tests-5e5e";
+
+    #[tokio::test]
+    async fn a_signed_in_key_and_model_are_saved_and_become_the_start_account() {
+        let replay = Replay::new();
+        replay
+            .push(200, r#"{"data":{"label":"nixxa","limit":null,"usage":0}}"#)
+            .push_fixture("openai_compat/fixtures/models_rich.json");
+        let models = replaying(&replay);
+        let info = models.save_openrouter(Secret::new(OPENROUTER_KEY), "vendor/tool-model").await.expect("saved");
+        let account = AccountRef::new(OPENROUTER, SETUP_LABEL);
+        assert_eq!(info.account, account);
+        assert_eq!(info.method, nixxa_contracts::AuthMethod::SignIn);
+        assert_eq!(info.hint.as_deref(), Some("5e5e"));
+        assert_eq!(models.start_account().await, Some(account.clone()));
+        assert_eq!(
+            models.credentials.get(&account).await.unwrap(),
+            Credential::BearerToken { token: Secret::new(OPENROUTER_KEY), expires_at: None }
+        );
+        let brain = models.brain_for(&account).await.unwrap();
+        assert_eq!(brain.describe().model, "vendor/tool-model");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_openrouter_key_is_not_saved() {
+        let replay = Replay::new();
+        replay.push(401, r#"{"error":{"message":"No auth credentials found","code":401}}"#);
+        let models = replaying(&replay);
+        let err = models.save_openrouter(Secret::new(OPENROUTER_KEY), "vendor/tool-model").await.unwrap_err();
+        assert_eq!(err, "No auth credentials found");
+        assert!(!err.contains(OPENROUTER_KEY));
+        assert_eq!(models.start_account().await, None);
+    }
+
+    #[tokio::test]
+    async fn openrouters_models_are_listed_with_the_signed_in_key() {
+        let replay = Replay::new();
+        replay.push_fixture("openai_compat/fixtures/models_rich.json");
+        let models = replaying(&replay);
+        let listed = models.list_openrouter_models(&Secret::new(OPENROUTER_KEY)).await.unwrap();
+        assert_eq!(listed.iter().filter(|m| m.supports_tools == Some(true)).count(), 2);
     }
 
     /// Every file under `dir`, recursively.

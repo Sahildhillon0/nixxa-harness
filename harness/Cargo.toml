@@ -28,6 +28,7 @@ tracing-subscriber = { workspace = true }
 zeroize = { workspace = true }
 
 [dev-dependencies]
+nixxa-contracts = { workspace = true, features = ["conformance"] }
 nixxa-brain = { workspace = true, features = ["replay"] }
 serde_json = { workspace = true }
 

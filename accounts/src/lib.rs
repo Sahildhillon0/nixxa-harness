@@ -6,5 +6,6 @@
 
 mod keychain;
 pub mod memory;
+pub mod methods;
 
 pub use keychain::{ENV_ACCOUNT, EnvKey, KeychainConfig, KeychainCredentials};

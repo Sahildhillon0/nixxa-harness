@@ -32,6 +32,7 @@ struct Sent {
     method: Method,
     url: String,
     authorization: Option<String>,
+    headers: Vec<(String, String)>,
     body: Option<Value>,
 }
 
@@ -58,6 +59,12 @@ impl Transport for Fixtures {
             method: request.method,
             url: request.url.clone(),
             authorization: request.headers.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_string),
+            headers: request
+                .headers
+                .iter()
+                .filter(|(name, _)| name.as_str() != "authorization")
+                .map(|(name, value)| (name.to_string(), value.to_str().unwrap_or_default().to_string()))
+                .collect(),
             body: request.body.as_deref().map(|b| serde_json::from_slice(b).unwrap()),
         });
         let canned = self.responses.lock().unwrap().pop_front().expect("a canned response")?;
@@ -487,6 +494,91 @@ async fn debug_output_never_shows_the_key() {
         fixtures,
     );
     assert!(!format!("{brain:?}").contains(KEY));
+}
+
+const OPENROUTER_TOKEN: &str = "sk-or-v1-signed-in-test-key-81aa";
+
+fn openrouter_brain(fixtures: &Arc<Fixtures>) -> OpenAiCompatBrain {
+    let account = AccountRef::new("openrouter", "default");
+    let token = Credential::BearerToken { token: Secret::new(OPENROUTER_TOKEN), expires_at: None };
+    OpenAiCompatBrain::with_transport(
+        Arc::new(OneAccount(account, token)),
+        OpenAiCompatConfig::openrouter("vendor/tool-model"),
+        fixtures.clone(),
+    )
+}
+
+fn openrouter_context() -> Context {
+    let mut ctx = hello();
+    ctx.account = AccountRef::new("openrouter", "default");
+    ctx
+}
+
+#[tokio::test]
+async fn openrouter_gets_the_signed_in_key_its_url_and_attribution_headers() {
+    let fixtures = Fixtures::with(vec![fixture("openrouter_text.sse")]);
+    let items = collect(&openrouter_brain(&fixtures), openrouter_context()).await;
+    let sent = fixtures.sent().remove(0);
+    assert_eq!(sent.url, "https://openrouter.ai/api/v1/chat/completions");
+    assert_eq!(sent.authorization.as_deref(), Some(format!("Bearer {OPENROUTER_TOKEN}").as_str()));
+    let header = |name: &str| sent.headers.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone());
+    assert_eq!(header("http-referer").as_deref(), Some("https://github.com/Sahildhillon0/nixxa-harness"));
+    assert_eq!(header("x-openrouter-title").as_deref(), Some("Nixxa"));
+    assert!(sent.headers.iter().all(|(_, v)| !v.contains(OPENROUTER_TOKEN)), "the key is only in authorization");
+    let usage = items.into_iter().filter_map(Result::ok).find_map(|e| match e {
+        BrainEvent::Usage { usage } => Some(usage),
+        _ => None,
+    });
+    assert_eq!(
+        usage,
+        Some(Usage { input_tokens: 50, output_tokens: 5, cost_micro_usd: Some(421) }),
+        "the reported cost"
+    );
+}
+
+#[tokio::test]
+async fn a_cost_from_a_server_not_known_to_report_one_is_ignored() {
+    let fixtures = Fixtures::with(vec![fixture("openrouter_text.sse")]);
+    let account = AccountRef::new("compat", "work");
+    let mut config = OpenAiCompatConfig::new("compat", "m");
+    config.base_url = Some("https://llm.example.com/v1".into());
+    let brain = OpenAiCompatBrain::with_transport(
+        Arc::new(OneAccount(account.clone(), Credential::ApiKey(Secret::new(KEY)))),
+        config,
+        fixtures.clone(),
+    );
+    let mut ctx = hello();
+    ctx.account = account;
+    let usage = collect(&brain, ctx).await.into_iter().filter_map(Result::ok).find_map(|e| match e {
+        BrainEvent::Usage { usage } => Some(usage),
+        _ => None,
+    });
+    assert_eq!(usage.unwrap().cost_micro_usd, None);
+}
+
+#[tokio::test]
+async fn openrouter_verify_checks_the_key_then_the_model() {
+    let fixtures = Fixtures::with(vec![
+        Ok(Canned { status: 200, body: br#"{"data":{"label":"nixxa","limit":null,"usage":0}}"#.to_vec() }),
+        fixture("models_rich.json"),
+        Ok(Canned { status: 401, body: br#"{"error":{"message":"No auth credentials found","code":401}}"#.to_vec() }),
+    ]);
+    let brain = openrouter_brain(&fixtures);
+    let account = AccountRef::new("openrouter", "default");
+    brain.verify(&account).await.expect("valid key, offered model");
+    let err = brain.verify(&account).await.unwrap_err();
+    assert!(matches!(&err, BrainError::Auth(m) if m.contains("No auth credentials")), "{err:?}");
+    let sent = fixtures.sent();
+    let urls: Vec<_> = sent.iter().map(|s| s.url.as_str()).collect();
+    assert_eq!(
+        urls,
+        vec![
+            "https://openrouter.ai/api/v1/key",
+            "https://openrouter.ai/api/v1/models",
+            "https://openrouter.ai/api/v1/key"
+        ],
+        "a rejected key stops before the model list"
+    );
 }
 
 #[tokio::test]

@@ -5,11 +5,11 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
 use crate::safe;
-use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, SetupState, Step};
+use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
 const WIDE: u16 = 100;
@@ -309,33 +309,32 @@ fn draw_input(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
 }
 
 fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
-    let setup = app.setup.as_ref().map(|setup| {
-        let first = matches!(setup.step, Step::Choose { .. });
-        (setup.first_run && first, first, matches!(setup.step, Step::Choose { .. } | Step::LocalModel(_)))
-    });
-    let keys = if let Some((stuck, first, choosing)) = setup {
-        let leave = if !first {
-            "esc back"
-        } else if stuck {
-            "ctrl-c twice quit"
-        } else {
-            "esc cancel"
+    let setup_keys = app.setup.as_ref().map(|setup| {
+        let leave = match setup.step {
+            Step::Choose { .. } if setup.first_run => "ctrl-c twice quit",
+            Step::Choose { .. } => "esc cancel",
+            _ => "esc back",
         };
-        if choosing {
-            format!("↑/↓ choose · enter select · {leave}")
-        } else {
-            format!("enter check & save · ctrl-u clear · {leave}")
+        match setup.step {
+            Step::Choose { .. } => format!("↑/↓ choose · enter select · {leave}"),
+            Step::Pick(_) => format!("type to filter · ↑/↓ choose · enter select · {leave}"),
+            Step::OpenRouterNotice => "y sign in · esc back".to_string(),
+            Step::SigningIn(_) => "esc cancel".to_string(),
+            Step::Key(_) | Step::LocalUrl(_) => format!("enter check & save · ctrl-u clear · {leave}"),
         }
+    });
+    let keys = if let Some(keys) = setup_keys {
+        keys
     } else if app.approval().is_some() {
         "y allow · n deny · ctrl-c interrupt".to_string()
     } else if let Some(notice) = &app.notice {
         safe::line(notice)
     } else {
-        let key = if app.setup_available { " · ctrl-a API key" } else { "" };
+        let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
         format!("enter send · alt-enter newline · tab focus · j/k move{key} · ctrl-c interrupt (twice: quit)")
     };
     let mode = format!("mode: {} ", format!("{:?}", app.mode).to_uppercase());
-    let urgent = setup.is_some() || app.approval().is_some() || app.notice.is_some();
+    let urgent = app.setup.is_some() || app.approval().is_some() || app.notice.is_some();
     let style = if urgent { theme.pending() } else { theme.dim() };
     let room = usize::from(width).saturating_sub(mode.chars().count() + 1);
     Line::from(vec![
@@ -351,7 +350,11 @@ fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     let (title, mut lines): (&str, Vec<Line>) = match &setup.step {
         Step::Choose { selected } => {
             let mut lines = vec![Line::raw("How should Nixxa think?"), Line::default()];
-            let details = ["Claude, with your API key", "LM Studio, Ollama or another server on this machine"];
+            let details = [
+                "Claude, with your API key",
+                "LM Studio, Ollama or another server on this machine",
+                "many models, billed to your OpenRouter account",
+            ];
             for (i, (choice, detail)) in CHOICES.iter().zip(details).enumerate() {
                 let marker = if i == *selected { "›" } else { " " };
                 let style = if i == *selected { theme.accent() } else { Style::new() };
@@ -401,22 +404,40 @@ fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
             ));
             (" Local model server ", lines)
         }
-        Step::LocalModel(picker) => {
+        Step::Pick(picker) => {
+            let openrouter = picker.source == Source::OpenRouter;
+            let place = if openrouter { "OpenRouter".to_string() } else { safe::line(&picker.url) };
             let mut lines = vec![
-                Line::from(vec![Span::raw("Models on "), Span::styled(safe::line(&picker.url), theme.dim())]),
-                Line::default(),
+                Line::from(vec![Span::raw("Models on "), Span::styled(place, theme.dim())]),
+                Line::from(vec![Span::styled("Filter ", theme.dim()), Span::raw(safe::line(&picker.filter))]),
             ];
-            let room = usize::from(over.height).saturating_sub(8).max(3);
+            if openrouter {
+                lines.push(Line::styled(PRIVACY_SHORT, theme.pending()));
+            }
+            lines.push(Line::default());
+            let visible = picker.visible();
+            let room = usize::from(over.height).saturating_sub(if openrouter { 11 } else { 9 }).max(3);
             let first = (picker.selected + 1).saturating_sub(room);
-            for (i, model) in picker.models.iter().enumerate().skip(first).take(room) {
+            for (i, model) in visible.iter().enumerate().skip(first).take(room) {
                 let chosen = i == picker.selected;
                 let marker = if chosen { "›" } else { " " };
-                let tools = if model.supports_tools == Some(true) { "  tools ✓" } else { "" };
+                let mut marks = String::new();
+                if model.supports_tools == Some(true) && !openrouter {
+                    marks.push_str("  tools ✓");
+                }
+                if model.free == Some(true) {
+                    marks.push_str("  free");
+                }
                 let style = if chosen { theme.accent().add_modifier(Modifier::BOLD) } else { Style::new() };
                 lines.push(Line::from(vec![
                     Span::styled(format!("{marker} {}", safe::line(&model.id)), style),
-                    Span::styled(tools.to_string(), theme.ok()),
+                    Span::styled(marks, theme.ok()),
                 ]));
+            }
+            if visible.is_empty() {
+                lines.push(Line::styled("  no model matches", theme.dim()));
+            } else if visible.len() > room {
+                lines.push(Line::styled(format!("  … {} models, type to narrow", visible.len()), theme.dim()));
             }
             lines.push(Line::default());
             lines.push(state_line(
@@ -425,18 +446,65 @@ fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
                 "Checking the model…",
                 theme,
             ));
-            (" Pick a local model ", lines)
+            (if openrouter { " Pick an OpenRouter model " } else { " Pick a local model " }, lines)
+        }
+        Step::OpenRouterNotice => {
+            let mut lines = vec![Line::raw("Sign in with OpenRouter in your browser. Before you do:"), Line::default()];
+            for line in PRIVACY_NOTICE {
+                lines.push(Line::raw(format!("• {line}")));
+            }
+            lines.push(Line::default());
+            lines.push(Line::from(vec![
+                Span::styled("[y]", theme.ok()),
+                Span::raw(" I understand, sign in    "),
+                Span::styled("[esc]", theme.dim()),
+                Span::raw(" back"),
+            ]));
+            (" OpenRouter: privacy ", lines)
+        }
+        Step::SigningIn(wait) => {
+            let mut lines = Vec::new();
+            match &wait.url {
+                None => lines.push(Line::raw("Starting the sign-in…")),
+                Some(url) => {
+                    lines.push(Line::raw(if wait.browser_opened {
+                        "Your browser opened OpenRouter's sign-in page. If it didn't, open this address:"
+                    } else {
+                        "Open this address in your browser to sign in:"
+                    }));
+                    lines.push(Line::styled(safe::line(url), theme.accent()));
+                }
+            }
+            lines.push(Line::default());
+            let waiting = if wait.signed_in {
+                "Signed in. Loading OpenRouter's models…"
+            } else {
+                "Waiting for sign-in… (esc to cancel)"
+            };
+            match &wait.state {
+                SetupState::Failed(message) => {
+                    lines.push(Line::styled(format!("✗ {}", safe::line(message)), theme.bad()));
+                    lines.push(Line::styled("enter: try again · esc: back", theme.dim()));
+                }
+                _ => lines.push(Line::styled(format!("● {waiting}"), theme.pending())),
+            }
+            (" Sign in with OpenRouter ", lines)
         }
     };
     lines.insert(0, Line::default());
-    let width = over.width.min(84);
+    // The sign-in page's address must copy cleanly: full width, no side borders to select by
+    // accident.
+    let full_width = matches!(setup.step, Step::SigningIn(_));
+    let width = if full_width { over.width } else { over.width.min(84) };
+    let side = if full_width { 0 } else { 2 };
     // Rows once wrapped to the panel's inner width, plus the border.
-    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let inner_width = usize::from(width.saturating_sub(side)).max(1);
     let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(inner_width)).sum();
     let needed = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2);
     let height = needed.min(over.height);
     let area = Rect { x: over.x + (over.width - width) / 2, y: over.y + (over.height - height) / 2, width, height };
-    let block = Block::bordered().title(title).border_style(theme.accent());
+    let borders = if full_width { Borders::TOP | Borders::BOTTOM } else { Borders::ALL };
+    let block = Block::default().borders(borders).title(title).border_style(theme.accent());
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
@@ -816,6 +884,37 @@ pub(crate) mod tests {
         assert!(screen.contains("↑/↓ choose · enter select · esc back"));
     }
 
+    #[test]
+    fn the_openrouter_steps_show_the_notice_the_url_and_marked_models() {
+        use crossterm::event::KeyCode;
+        let key = crate::app::tests::key;
+        let mut app = started();
+        app.open_setup(false);
+        assert!(screen_of(&mut app).contains("Sign in with OpenRouter"));
+        app.handle_key(key(KeyCode::Char('3')));
+        let shown = screen(&mut app, 140, 30);
+        assert!(shown.contains("OpenRouter: privacy") && shown.contains("Free models may log"), "{shown}");
+        assert!(shown.contains("workspace") && shown.contains("[y] I understand, sign in"), "{shown}");
+        app.handle_key(key(KeyCode::Char('y')));
+        let url = "https://openrouter.ai/auth?callback_url=http%3A%2F%2Flocalhost%3A5555%2Fcallback&code_challenge=abc&code_challenge_method=S256";
+        app.setup.as_mut().unwrap().sign_in_started(url.into(), false);
+        let shown = screen(&mut app, 200, 30);
+        assert!(shown.contains("Open this address in your browser") && shown.contains("code_challenge=abc"), "{shown}");
+        assert!(shown.contains("Waiting for sign-in… (esc to cancel)"));
+        app.models_listed(Ok(vec![
+            nixxa_brain::ModelInfo { id: "qwen/qwen3-coder:free".into(), supports_tools: Some(true), free: Some(true) },
+            nixxa_brain::ModelInfo {
+                id: "anthropic/claude-sonnet-5.5".into(),
+                supports_tools: Some(true),
+                free: Some(false),
+            },
+        ]));
+        let shown = screen(&mut app, 140, 30);
+        assert!(shown.contains("Pick an OpenRouter model") && shown.contains("qwen/qwen3-coder:free  free"), "{shown}");
+        assert!(shown.contains("free models may log"), "the picker repeats the warning: {shown}");
+        assert!(shown.contains("type to filter"));
+    }
+
     /// Regression: on a narrow terminal the choices wrap, and the panel must grow to show both.
     #[test]
     fn both_choices_stay_visible_on_a_narrow_terminal() {
@@ -828,9 +927,9 @@ pub(crate) mod tests {
     #[test]
     fn the_hint_bar_offers_the_key_setup_when_available() {
         let mut app = started();
-        assert!(!screen(&mut app, 140, 20).contains("ctrl-a API key"));
+        assert!(!screen(&mut app, 140, 20).contains("ctrl-a model setup"));
         app.setup_available = true;
-        assert!(screen(&mut app, 140, 20).contains("ctrl-a API key"));
+        assert!(screen(&mut app, 140, 20).contains("ctrl-a model setup"));
     }
 
     fn screen_of(app: &mut App) -> String {

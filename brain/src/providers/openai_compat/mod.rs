@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
 use nixxa_contracts::{
@@ -53,7 +53,19 @@ pub struct OpenAiCompatConfig {
     pub max_output_tokens: u32,
     /// The model's context window in tokens; trimming keeps requests well inside it.
     pub context_window: u64,
+    /// Extra headers on every request (e.g. OpenRouter's app attribution). Never secrets.
+    pub headers: Vec<(String, String)>,
+    /// The server reports each step's cost as `usage.cost` in US dollars (OpenRouter does).
+    /// Otherwise cost is `None` for hosted servers: never estimated.
+    pub reports_cost: bool,
+    /// A path that answers 200 only for a valid key (OpenRouter: `key`); `verify` checks it.
+    pub key_check: Option<String>,
 }
+
+/// OpenRouter's API.
+pub const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1";
+/// The app URL sent to OpenRouter (its `HTTP-Referer` attribution header).
+const NIXXA_URL: &str = "https://github.com/Sahildhillon0/nixxa-harness";
 
 impl OpenAiCompatConfig {
     /// Defaults sized for local models: a 32k window and 4k output.
@@ -64,6 +76,24 @@ impl OpenAiCompatConfig {
             base_url: None,
             max_output_tokens: 4_096,
             context_window: 32_768,
+            headers: Vec::new(),
+            reports_cost: false,
+            key_check: None,
+        }
+    }
+
+    /// OpenRouter (<https://openrouter.ai/docs>): the API at `https://openrouter.ai/api/v1`, the
+    /// recommended `HTTP-Referer` and `X-OpenRouter-Title` headers, cost from `usage.cost`, and
+    /// key checks at `GET /key`.
+    pub fn openrouter(model: impl Into<String>) -> Self {
+        Self {
+            base_url: Some(OPENROUTER_URL.into()),
+            max_output_tokens: 8_192,
+            context_window: 128_000,
+            headers: vec![("http-referer".into(), NIXXA_URL.into()), ("x-openrouter-title".into(), "Nixxa".into())],
+            reports_cost: true,
+            key_check: Some("key".into()),
+            ..Self::new("openrouter", model)
         }
     }
 }
@@ -131,6 +161,13 @@ impl OpenAiCompatBrain {
 
     /// A free live check: the account's server answers, and offers the configured model.
     pub async fn verify(&self, account: &AccountRef) -> Result<(), BrainError> {
+        if let Some(path) = &self.config.key_check {
+            let endpoint = self.endpoint(account).await?;
+            let response = self.send(&endpoint, Method::Get, path, None).await?;
+            if response.status != 200 {
+                return Err(error_response(response, &endpoint).await);
+            }
+        }
         let models = self.list_models(account).await?;
         if models.iter().any(|m| m.id == self.config.model) {
             return Ok(());
@@ -158,7 +195,7 @@ impl OpenAiCompatBrain {
         };
         let (base_url, key, local) = match credential {
             Credential::Local { base_url } => (base_url, None, true),
-            Credential::ApiKey(key) => {
+            Credential::ApiKey(key) | Credential::BearerToken { token: key, .. } => {
                 let base_url = self.config.base_url.clone().ok_or_else(|| {
                     BrainError::Auth(format!("`{account}` has a key but no server URL is configured"))
                 })?;
@@ -186,6 +223,12 @@ impl OpenAiCompatBrain {
         body: Option<Vec<u8>>,
     ) -> Result<Response, BrainError> {
         let mut headers = HeaderMap::new();
+        for (name, value) in &self.config.headers {
+            let (Ok(name), Ok(value)) = (HeaderName::from_bytes(name.as_bytes()), HeaderValue::from_str(value)) else {
+                return Err(BrainError::Other(format!("the configured header `{name}` is invalid")));
+            };
+            headers.insert(name, value);
+        }
         if let Some(key) = &endpoint.key {
             header(&mut headers, "authorization", &format!("Bearer {key}"), true).map_err(BrainError::Auth)?;
         }
@@ -246,7 +289,7 @@ impl Brain for OpenAiCompatBrain {
             return Err(errors::explain_no_tools(error_response(response, &endpoint).await, &model));
         }
         let key = endpoint.key.clone().unwrap_or_default();
-        Ok(decode(response, Decoder::new(map, key, endpoint.local, model)))
+        Ok(decode(response, Decoder::new(map, key, endpoint.local, model, self.config.reports_cost)))
     }
 }
 

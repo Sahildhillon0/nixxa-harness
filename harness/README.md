@@ -34,6 +34,14 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
      models the server says can't use tools, are hidden; `tools ✓` when it says they can) →
      `verify` → saved as `local:default` with the model.
 
+  3. **Sign in with OpenRouter:** a privacy notice the user confirms (`y`) → `OpenRouterSignIn`
+     starts a loopback listener → the browser opens the page (`browser.rs`: `xdg-open` / `open` /
+     `rundll32 url.dll,FileProtocolHandler`, the URL as one argument, no shell), or the address
+     is shown full width to copy → "Waiting for sign-in… (esc to cancel)" → the key is held in
+     memory only → a picker of OpenRouter's tool-capable models (type to filter; free ones marked;
+     the privacy reminder repeated) → `verify` (key at `GET /key`, then the model) → saved as
+     `openrouter:default`. The note after saving says where to revoke the key.
+
   Saving an account starts a session with it, replacing the running one (key rotation for the
   account in use excepted).
 - **Startup:** if the keychain can't be read, the conversation says so (`check_storage`).

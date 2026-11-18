@@ -5,6 +5,7 @@
 //! still fakes. See ARCHITECTURE.md § Stages.
 
 mod app;
+mod browser;
 mod logging;
 mod paths;
 mod ports;

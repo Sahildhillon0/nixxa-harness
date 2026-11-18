@@ -250,6 +250,9 @@ impl Inner {
             return Ok(Credential::Local { base_url });
         }
         match self.store.get(&entry_name(account)).map_err(storage)? {
+            Some(value) if info.method == AuthMethod::SignIn => {
+                Ok(Credential::BearerToken { token: Secret::new(value), expires_at: None })
+            }
             Some(value) => Ok(Credential::ApiKey(Secret::new(value))),
             None => Err(CredentialsError::Storage(format!("the keychain entry for `{account}` is missing"))),
         }
@@ -272,9 +275,15 @@ impl Inner {
                 check_base_url(base_url)?;
                 None
             }
+            // A sign-in key (OpenRouter): stored like an API key. Expiring tokens need refresh,
+            // which arrives with the methods that issue them.
+            Credential::BearerToken { token, expires_at: None } => {
+                check_key(token)?;
+                Some(token)
+            }
             other => {
                 return Err(CredentialsError::Unsupported(format!(
-                    "storing {:?} credentials (Stage 3 stores API keys and local servers only)",
+                    "storing {:?} credentials (Stage 3 stores API keys, sign-in keys without expiry and local servers)",
                     other.method()
                 )));
             }
@@ -373,7 +382,7 @@ impl Credentials for KeychainCredentials {
 
     async fn validate(&self, account: &AccountRef) -> Result<(), CredentialsError> {
         match self.get(account).await? {
-            Credential::ApiKey(secret) => check_key(&secret),
+            Credential::ApiKey(secret) | Credential::BearerToken { token: secret, .. } => check_key(&secret),
             Credential::Local { base_url } => check_base_url(&base_url),
             _ => Ok(()),
         }

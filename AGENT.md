@@ -20,9 +20,9 @@ Linux, macOS and Windows. See
   - the OpenAI-compatible provider for local models (`OpenAiCompatBrain`, `Credential::Local`
     accounts);
   - setup in the harness, either (1) an Anthropic API key or (2) a local model; the wiring picks
-    the brain from the start account's provider; `--fake` runs the scripted brain.
-- **Still to come:**
-  - OpenRouter sign-in.
+    the brain from the start account's provider; `--fake` runs the scripted brain;
+  - option (3), signing in with OpenRouter (OAuth PKCE, `accounts/src/methods/`), the first
+    sign-in method.
 - **Pending:** the Anthropic live checks, which need a key.
 
 The sandbox, store and knowledge are still fakes.
