@@ -44,7 +44,7 @@ async fn parallel_calls_are_replayed_as_one_assistant_turn() {
     credentials.add(account.clone(), Credential::ApiKey(Secret::new("sk-ant-test-key-0000"))).await.unwrap();
 
     let replay = Replay::new();
-    replay.push_fixture("parallel_tool_use.sse").push_fixture("text.sse");
+    replay.push_fixture("anthropic/fixtures/parallel_tool_use.sse").push_fixture("anthropic/fixtures/text.sse");
     let brain = AnthropicBrain::replaying(credentials, AnthropicConfig::default(), &replay);
 
     let sink = Arc::new(Sink::default());
