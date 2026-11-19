@@ -31,6 +31,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The real sandbox's tests need bubblewrap and unprivileged user namespaces, which Ubuntu
+      # restricts through AppArmor by default.
+      - name: Allow the sandbox tests (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace
       - run: cargo test --workspace --all-features
