@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
+use crate::place::{PLACES, Place};
 use crate::safe;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 
@@ -77,6 +78,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(hint_line(app, theme, hints.width)), hints);
     draw_approval(frame, app, theme, if side.area() > 0 { side } else { body });
     draw_setup(frame, app, theme, body);
+    draw_place(frame, app, theme, body);
     safe::scrub(frame.buffer_mut());
 }
 
@@ -323,7 +325,9 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
             Step::Key(_) | Step::LocalUrl(_) => format!("enter check & save · ctrl-u clear · {leave}"),
         }
     });
-    let keys = if let Some(keys) = setup_keys {
+    let keys = if app.place.is_some() {
+        "↑/↓ choose · enter select · 1/2 pick · ctrl-c twice quit".to_string()
+    } else if let Some(keys) = setup_keys {
         keys
     } else if app.approval().is_some() {
         "y allow · n deny · ctrl-c interrupt".to_string()
@@ -334,7 +338,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         format!("enter send · alt-enter newline · tab focus · j/k move{key} · ctrl-c interrupt (twice: quit)")
     };
     let mode = format!("mode: {} ", format!("{:?}", app.mode).to_uppercase());
-    let urgent = app.setup.is_some() || app.approval().is_some() || app.notice.is_some();
+    let urgent = app.place.is_some() || app.setup.is_some() || app.approval().is_some() || app.notice.is_some();
     let style = if urgent { theme.pending() } else { theme.dim() };
     let room = usize::from(width).saturating_sub(mode.chars().count() + 1);
     Line::from(vec![
@@ -517,6 +521,37 @@ fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     }
 }
 
+/// The start-up question: the sandbox, or the real files of the current directory.
+fn draw_place(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
+    let Some(picker) = app.place.as_ref() else { return };
+    let mut lines = vec![
+        Line::default(),
+        Line::raw("Where should the agent work?"),
+        Line::from(vec![Span::styled("Directory  ", theme.dim()), Span::raw(safe::line(&app.directory))]),
+        Line::default(),
+    ];
+    for (i, (place, name, detail)) in PLACES.iter().enumerate() {
+        let chosen = i == picker.selected;
+        let marker = if chosen { "›" } else { " " };
+        let style = if chosen { theme.accent() } else { Style::new() };
+        let detail_style = if *place == Place::Here { theme.pending() } else { theme.dim() };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} {}  {name}", i + 1), style.add_modifier(Modifier::BOLD)),
+            Span::styled(format!(" — {detail}"), detail_style),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("Either way, every action asks you first.", theme.dim()));
+    let width = over.width.min(84);
+    let inner_width = usize::from(width.saturating_sub(2)).max(1);
+    let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(inner_width)).sum();
+    let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2).min(over.height);
+    let area = Rect { x: over.x + (over.width - width) / 2, y: over.y + (over.height - height) / 2, width, height };
+    let block = Block::bordered().title(" Start ").border_style(theme.accent());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
+}
+
 /// The status line under a setup form.
 fn state_line(state: &SetupState, idle: &str, checking: &str, theme: Theme) -> Line<'static> {
     match state {
@@ -656,6 +691,22 @@ pub(crate) mod tests {
             source: SourceInfo { id: SourceId::new("vault"), name: "Vault".into(), status: SourceStatus::Missing },
         });
         app
+    }
+
+    #[test]
+    fn the_start_question_shows_both_places_over_the_first_run_setup() {
+        for width in [120, 60] {
+            let mut app = App::new(false);
+            app.directory = "/home/me/project".into();
+            app.open_setup(true);
+            app.ask_place();
+            let screen = screen(&mut app, width, 24);
+            for part in ["Where should the agent work?", "/home/me/project", "1  Sandbox", "2  This directory"] {
+                assert!(screen.contains(part), "{part} missing at width {width}:\n{screen}");
+            }
+            assert!(!screen.contains("How should Nixxa think?"), "setup waits underneath:\n{screen}");
+            assert!(screen.lines().last().unwrap().contains("enter select"), "{screen}");
+        }
     }
 
     #[test]

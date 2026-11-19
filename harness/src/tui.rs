@@ -12,10 +12,11 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::app::{App, Effect};
+use crate::place::Place;
 use crate::ports::UiEvent;
 use crate::settings::Settings;
 use crate::setup::Setup;
-use crate::wiring::{self, Models};
+use crate::wiring::{self, Models, Workplace};
 use crate::{browser, logging, paths, ui};
 use nixxa_accounts::methods::SignInError;
 use nixxa_accounts::methods::openrouter::{OpenRouterConfig, OpenRouterSignIn};
@@ -36,10 +37,11 @@ fn start_session(
     brain: Arc<dyn Brain>,
     account: AccountRef,
     workspace: WorkspaceInfo,
+    workplace: &Workplace,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
 ) -> Session {
     let (commands, rx) = mpsc::channel(32);
-    let mut controller = wiring::controller(brain, account.clone(), workspace, ui_tx.clone());
+    let mut controller = wiring::controller(brain, account.clone(), workspace, workplace, ui_tx.clone());
     let task = tokio::spawn(async move {
         if let Err(err) = controller.start_session().await {
             let message = format!("could not start a session: {err}");
@@ -68,11 +70,29 @@ fn end_session(session: Session) {
     });
 }
 
+/// Where the agent works, in words for the conversation once the start-up question is answered.
+fn place_note(workplace: &Workplace, workspace: &WorkspaceInfo) -> String {
+    match workplace.place {
+        Place::Sandbox => "Working in the sandbox: nothing on this machine is read or changed.".into(),
+        Place::Here => format!(
+            "Working in {}: the agent can read, edit and run commands on your real files there. \
+             Every action still asks first.",
+            workspace.root.display()
+        ),
+    }
+}
+
 /// Runs the TUI until the user quits.
 pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let workspace = wiring::workspace(&std::env::current_dir()?);
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut app = App::new(color);
+    // Asked on every launch; no session starts until it is answered.
+    app.directory = workspace.root.display().to_string();
+    app.ask_place();
+    let mut workplace: Option<Workplace> = None;
+    // A brain and account ready to go, waiting for the answer.
+    let mut waiting: Option<(Arc<dyn Brain>, AccountRef)> = None;
     let log_filter = std::env::var("NIXXA_LOG").ok();
     match logging::init(paths::log_dir(), log_filter.as_deref()) {
         Ok(dir) => tracing::info!(version = env!("CARGO_PKG_VERSION"), logs = %dir.display(), "nixxa starting"),
@@ -87,8 +107,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let mut signed_in_key: Option<Secret> = None;
     if settings.fake {
         tracing::info!(brain = "scripted", "using the fake brain");
-        let (brain, account) = wiring::scripted();
-        session = Some(start_session(brain, account, workspace.clone(), ui_tx.clone()));
+        waiting = Some(wiring::scripted());
     } else {
         match Models::new(&settings) {
             Ok(found) => {
@@ -103,7 +122,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     Some(account) => match found.brain_for(&account).await {
                         Ok(brain) => {
                             tracing::info!(account = %account, "starting with the active account");
-                            session = Some(start_session(brain, account, workspace.clone(), ui_tx.clone()));
+                            waiting = Some((brain, account));
                         }
                         Err(why) => {
                             app.note(why);
@@ -198,7 +217,12 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                                         end_session(old);
                                         app.note(format!("Switched to {account}: a new session started."));
                                     }
-                                    session = Some(start_session(brain, account, workspace.clone(), ui_tx.clone()));
+                                    match &workplace {
+                                        Some(place) => {
+                                            session = Some(start_session(brain, account, workspace.clone(), place, ui_tx.clone()));
+                                        }
+                                        None => waiting = Some((brain, account)),
+                                    }
                                 }
                                 Err(why) => app.note(why),
                             }
@@ -291,6 +315,19 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     }
                     _ => app.account_saved(&Err("The sign-in expired; sign in again.".into())),
                 },
+                Effect::ChoosePlace(choice) => {
+                    let chosen = Workplace::new(choice, &workspace).unwrap_or_else(|why| {
+                        tracing::warn!(%why, "can't work in the current directory");
+                        app.note(format!("{why}. Using the sandbox instead."));
+                        Workplace::new(Place::Sandbox, &workspace).expect("the sandbox needs no directory")
+                    });
+                    tracing::info!(place = ?chosen.place, "workplace chosen");
+                    app.note(place_note(&chosen, &workspace));
+                    if let Some((brain, account)) = waiting.take() {
+                        session = Some(start_session(brain, account, workspace.clone(), &chosen, ui_tx.clone()));
+                    }
+                    workplace = Some(chosen);
+                }
                 Effect::Quit => quit = true,
             }
         }

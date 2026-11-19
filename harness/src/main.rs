@@ -8,6 +8,7 @@ mod app;
 mod browser;
 mod logging;
 mod paths;
+mod place;
 mod ports;
 mod safe;
 mod settings;

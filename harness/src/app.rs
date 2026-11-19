@@ -16,6 +16,7 @@ use nixxa_accounts::methods::openrouter::KEYS_PAGE;
 use nixxa_brain::ModelInfo;
 use nixxa_contracts::{AccountInfo, AuthMethod, Secret};
 
+use crate::place::{Place, PlacePicker};
 use crate::setup::Setup;
 
 /// How long a first ctrl-c waits for a second one to quit.
@@ -110,6 +111,8 @@ pub(crate) enum Effect {
     SaveOpenRouter {
         model: String,
     },
+    /// The user chose where the agent works (the start-up question).
+    ChoosePlace(Place),
 }
 
 /// Everything the TUI shows.
@@ -143,6 +146,11 @@ pub(crate) struct App {
     pub(crate) setup: Option<Setup>,
     /// Whether the setup form can be opened (not with `--fake`).
     pub(crate) setup_available: bool,
+    /// The start-up question (sandbox or this directory), until it is answered. It sits above
+    /// everything else, the setup screen included.
+    pub(crate) place: Option<PlacePicker>,
+    /// The directory Nixxa was started in, shown by the start-up question.
+    pub(crate) directory: String,
 }
 
 impl App {
@@ -171,7 +179,14 @@ impl App {
             last_ctrl_c: None,
             setup: None,
             setup_available: false,
+            place: None,
+            directory: String::new(),
         }
+    }
+
+    /// Asks where the agent should work.
+    pub(crate) fn ask_place(&mut self) {
+        self.place = Some(PlacePicker::default());
     }
 
     /// Opens the setup screen at its first step.
@@ -220,6 +235,9 @@ impl App {
 
     /// Pasted text (bracketed paste): into the setup screen when it is open, else the input.
     pub(crate) fn paste(&mut self, text: &str) {
+        if self.place.is_some() {
+            return;
+        }
         if let Some(setup) = self.setup.as_mut() {
             setup.paste(text);
         } else if self.approvals.is_empty() && self.focus == Focus::Input {
@@ -339,6 +357,13 @@ impl App {
             return self.ctrl_c();
         }
         self.last_ctrl_c = None;
+        if let Some(picker) = self.place.as_mut() {
+            let chosen = picker.key(key);
+            if chosen.is_some() {
+                self.place = None;
+            }
+            return chosen.into_iter().collect();
+        }
         if self.setup.is_some() {
             return self.setup_key(key);
         }
@@ -552,6 +577,29 @@ pub(crate) mod tests {
             app.conversation.last().unwrap().text,
             "Saved the API key (…wxyz) for anthropic:default in the OS keychain."
         );
+    }
+
+    #[test]
+    fn the_place_question_comes_first_and_enter_picks_the_highlighted_choice() {
+        let mut app = App::new(true);
+        app.ask_place();
+        app.open_setup(true);
+        app.paste("pasted");
+        assert_eq!(app.handle_key(key(KeyCode::Char('1'))), vec![Effect::ChoosePlace(Place::Sandbox)]);
+        assert!(app.place.is_none(), "answered");
+        assert!(matches!(app.setup.as_ref().unwrap().step, Step::Choose { .. }), "setup got neither key nor paste");
+
+        app.ask_place();
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty(), "there is no way past it but answering");
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::ChoosePlace(Place::Here)]);
+        app.ask_place();
+        assert_eq!(app.handle_key(key(KeyCode::Char('2'))), vec![Effect::ChoosePlace(Place::Here)]);
+        app.ask_place();
+        assert!(app.handle_key(key(KeyCode::Char('3'))).is_empty());
+        assert_eq!(app.handle_key(ctrl_c()), Vec::new(), "ctrl-c still works: the first warns");
+        assert_eq!(app.handle_key(ctrl_c()), vec![Effect::Quit]);
     }
 
     #[test]
