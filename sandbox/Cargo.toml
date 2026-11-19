@@ -12,6 +12,7 @@ workspace = true
 [dependencies]
 async-trait = { workspace = true }
 nixxa-contracts = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "time"] }
 
 [dev-dependencies]
 nixxa-contracts = { workspace = true, features = ["conformance"] }
