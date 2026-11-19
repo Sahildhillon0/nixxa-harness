@@ -199,6 +199,11 @@ implementation (real or fake) must pass it. The contracts crate's own tests prov
 is satisfiable (in-memory reference implementations pass) and has teeth (deliberately broken
 ones fail).
 
+The sandbox suite checks, besides the basics: unsupported kinds error, ids are echoed, paths
+that escape the workspace never succeed, `reset` keeps the workspace, an isolated backend that
+supports `Exec` really runs `echo`, and dropping an in-flight `execute` doesn't wedge the
+backend (the next call works).
+
 ---
 
 ## 4. The agent loop

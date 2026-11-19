@@ -26,6 +26,9 @@ pub struct SandboxCapabilities {
 ///   [`Observation`]s, not errors;
 /// * a path that escapes the workspace never succeeds;
 /// * the returned observation's `action_id` equals the given `id`;
+/// * an isolated backend that supports `Exec` really runs the command;
+/// * [`reset`](Sandbox::reset) keeps the workspace;
+/// * dropping an in-flight `execute` future cancels the action, and the next call still works;
 /// * the sandbox enforces its own limits regardless of what the controller allowed.
 #[async_trait]
 pub trait Sandbox: Send + Sync {

@@ -23,6 +23,9 @@ pub async fn run<S: Sandbox, F: Fn() -> S>(fresh: F) {
     ids_are_echoed(&fresh()).await;
     write_read_list(&fresh()).await;
     escapes_never_succeed(&fresh()).await;
+    reset_keeps_the_workspace(&fresh()).await;
+    isolated_exec_really_runs(&fresh()).await;
+    dropped_execs_do_not_wedge(&fresh()).await;
 }
 
 async fn describes_itself(sandbox: &dyn Sandbox) {
@@ -97,5 +100,50 @@ async fn escapes_never_succeed(sandbox: &dyn Sandbox) {
                 "{shown} escaped the workspace: {obs:?}"
             ),
         }
+    }
+}
+
+async fn reset_keeps_the_workspace(sandbox: &dyn Sandbox) {
+    let caps = sandbox.capabilities();
+    let has = |k| caps.actions.contains(&k);
+    if !(has(SandboxActionKind::WriteFile) && has(SandboxActionKind::ReadFile)) {
+        return;
+    }
+    let w = sandbox.execute(id(300), sample(SandboxActionKind::WriteFile)).await.expect("write");
+    assert!(matches!(w.outcome, Outcome::Written { .. }), "write: {w:?}");
+    sandbox.reset().await.expect("reset");
+    let r = sandbox.execute(id(301), sample(SandboxActionKind::ReadFile)).await.expect("read after reset");
+    assert_eq!(r.outcome, Outcome::Text { content: "hello nixxa\n".into() }, "reset must keep the workspace");
+}
+
+async fn isolated_exec_really_runs(sandbox: &dyn Sandbox) {
+    let caps = sandbox.capabilities();
+    if !(caps.isolated && caps.actions.contains(&SandboxActionKind::Exec)) {
+        return;
+    }
+    let o = sandbox.execute(id(400), sample(SandboxActionKind::Exec)).await.expect("exec");
+    match o.outcome {
+        Outcome::Exec { exit_code, stdout, .. } => {
+            assert_eq!(exit_code, Some(0), "an isolated sandbox must really run `echo nixxa`");
+            assert_eq!(stdout.trim_end(), "nixxa", "an isolated sandbox must really run `echo nixxa`");
+        }
+        other => panic!("an isolated sandbox must really run `echo nixxa`, got {other:?}"),
+    }
+}
+
+async fn dropped_execs_do_not_wedge(sandbox: &dyn Sandbox) {
+    let caps = sandbox.capabilities();
+    if !caps.actions.contains(&SandboxActionKind::Exec) {
+        return;
+    }
+    sandbox.health().await.expect("health");
+    let slow = SandboxAction::Exec { command: "sleep 30".into(), cwd: None, timeout_ms: Some(60_000) };
+    // Poll once, so the command is in flight, then drop it: the contract says that cancels it.
+    let _ = futures::FutureExt::now_or_never(sandbox.execute(id(500), slow));
+    let want = id(501);
+    let next = sandbox.execute(want.clone(), sample(SandboxActionKind::Exec)).await;
+    match next {
+        Ok(obs) => assert_eq!(obs.action_id, want, "the call after a dropped execute must answer its own id"),
+        Err(err) => panic!("dropping an in-flight execute wedged the sandbox: {err:?}"),
     }
 }
