@@ -12,8 +12,10 @@ Replace one, and the rest never notice.
 > **Status: Stage 3 — Real brain (in progress).** `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
 > tool use, or to a **local model** (LM Studio / Ollama, through their OpenAI-compatible
 > endpoint), or to **OpenRouter** after signing in through the browser, all chosen on the setup
-> screen. Keys stay in the OS keychain, never in a file. The live checks against the Anthropic API haven't been run yet. The sandbox,
-> store and knowledge are still fakes, and the sandbox says so (`NOT ISOLATED`). `--fake` runs the
+> screen. Keys stay in the OS keychain, never in a file. The live checks against the Anthropic API haven't been run yet. Every launch
+> asks where the agent works: the **sandbox** (still an in-memory fake) or **this directory**, where
+> it reads, edits and runs commands on your real files, each action approved first. The store and
+> knowledge are still fakes, and the status bar says the agent isn't isolated (`NOT ISOLATED`). `--fake` runs the
 > scripted Stage 2 agent offline.
 
 ---

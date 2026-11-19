@@ -43,6 +43,14 @@ rewriting them.
 
 ## 4. TUI design
 
+### Start-up question
+
+Every launch opens a **Start** panel before anything else (above the first-run setup screen):
+*Where should the agent work?* with the directory Nixxa was started in and two choices,
+`1 Sandbox` and `2 This directory` (↑/↓ + enter, or the digit). No session starts until it is
+answered; ctrl-c twice still quits. The answer is noted in the conversation, and the status bar
+shows the backend: `fake ○ NOT ISOLATED` or `host ○ NOT ISOLATED` (D-039).
+
 ### Layout
 
 ```
@@ -205,6 +213,8 @@ Both appear in the activity pane as the last lines of the session.
 | D-036 | Nixxa starts with the account set up last; setting up an account switches to it at once in a new session (except rotating the key of the account in use) | Setting up a local model and then still talking to Claude would surprise; the conversation isn't persisted yet (Stage 5), so a new session loses nothing that could be kept. | 3 |
 | D-037 | OpenRouter OAuth (PKCE) moved forward from Stage 8 as the first `SignIn` method; claude.ai or any other subscription login stays excluded, and no other app's tokens are reused | OpenRouter's docs offer the PKCE flow to third-party apps and issue a key the user controls and can revoke, so it's within D-017. It gives a hosted option without pasting keys. A privacy notice is confirmed first, because the conversation (workspace files, notes, memory) leaves the machine and free models may log or train on it. | 3 |
 | D-038 | The harness opens sign-in pages through the OS with the URL as one argument and no shell (`xdg-open`, `open`, `rundll32 url.dll,FileProtocolHandler`), and shows the address to copy if that fails | A shell would read the URL as commands. `start` is a `cmd` built-in, so on Windows it would need a shell. | 3 |
+
+| D-039 | Every launch asks where the agent works: **Sandbox** (the default choice) or **This directory**, the real files of the directory Nixxa started in, through `HostSandbox` (not isolated, shown as `host ○ NOT ISOLATED`). Paths stay inside that directory (no `..`, absolute paths or symlinks out); commands run in the user's shell there without `ANTHROPIC_API_KEY`; every action still goes through the approval prompt | A change of plan: working on a real project is the main use, like other coding harnesses, and it can't wait for Stage 4. It weakens principle 2 only when the user picks it, on every launch, and the TUI never hides it. The sandbox choice stays the in-memory fake until Stage 4 makes it a real isolated one. | 3 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 

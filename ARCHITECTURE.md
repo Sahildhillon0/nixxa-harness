@@ -386,7 +386,9 @@ recorded in the DESIGN.md decision log before it is built.
 - **Network is off by default** inside the sandbox.
 
 ### How the process model evolves
-- **Stages 2–3:** single process. The sandbox is a fake, labelled *not isolated* in the TUI.
+- **Stages 2–3:** single process. The sandbox is a fake, labelled *not isolated* in the TUI. If
+  the user chooses to work in the current directory at start-up, `HostSandbox` acts on the real
+  files there instead (confined to that directory, not isolated, D-039).
 - **Stage 4:** the sandbox moves out of process: a thin client launches `nixxa-sandboxd`
   inside bubblewrap + Landlock + seccomp (Linux) and talks to it over a framed protocol on
   stdio. **The trait does not change.**

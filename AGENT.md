@@ -25,7 +25,10 @@ Linux, macOS and Windows. See
     sign-in method.
 - **Pending:** the Anthropic live checks, which need a key.
 
-The sandbox, store and knowledge are still fakes.
+  - every launch asks where the agent works: the sandbox (`FakeSandbox`) or the current
+    directory (`HostSandbox`, real files, not isolated; D-039).
+
+The sandbox's isolated backend, the store and knowledge are still fakes.
 Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
