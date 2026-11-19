@@ -101,7 +101,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | done (macOS/Windows CI pending) |
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | done |
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** |
-| 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | planned |
+| 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | **started** (daemon + bubblewrap; Landlock, seccomp and wiring next) |
 | 5 | Real memory | SQLite store, session resume, transcript search | planned |
 | 6 | Knowledge I — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
 | 7 | Knowledge II — code & docs | **CodeGraph** + **Context7** | planned |

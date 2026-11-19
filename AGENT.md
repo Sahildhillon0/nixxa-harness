@@ -28,7 +28,11 @@ Linux, macOS and Windows. See
   - every launch asks where the agent works: the sandbox (`FakeSandbox`) or the current
     directory (`HostSandbox`, real files, not isolated; D-039).
 
-The sandbox's isolated backend, the store and knowledge are still fakes.
+**Stage 4 — Real sandbox (Linux) has started:** `BwrapSandbox` and `nixxa-sandboxd`
+(bubblewrap namespaces, rlimits, cgroup scope) exist in `sandbox/` with escape tests, but are not
+wired into the harness and are not yet isolated in the D-008 sense (Landlock and seccomp are next).
+
+The store and knowledge are still fakes.
 Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
