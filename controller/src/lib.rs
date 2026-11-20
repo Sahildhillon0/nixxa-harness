@@ -28,6 +28,15 @@ pub const DEFAULT_MAX_STEPS: u32 = 8;
 const INTERRUPTED: &str = "interrupted by the user";
 /// What an action that never ran is told when the turn stopped before it.
 const NOT_RUN: &str = "not run: the turn stopped before this action";
+/// What an action left without a result in a stored session (Nixxa quit or crashed while it
+/// was waiting for approval or running) is told on resume (D-057).
+const QUIT_MID_ACTION: &str =
+    "not finished: Nixxa quit before this action finished, so it may not have run, or may have run only in part";
+/// What the agent (and the user) are told when a stored session is resumed (D-057). The place
+/// the agent works isn't stored: it is chosen again at every launch.
+const RESUMED: &str = "This session was resumed in a new run of Nixxa. The workspace may have changed since it was \
+     recorded (files edited, a different sandbox or a fresh copy), so check it again before relying on what the \
+     history says about it.";
 
 /// A command the harness sends to the controller's loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -171,8 +180,74 @@ impl Controller {
                 started_at: self.now(),
             })
             .await?;
+        let primer = self.begin(&info.id).await;
+        self.session = Some(Session { id: info.id.clone(), primer, conversation: Vec::new() });
+        Ok(info)
+    }
+
+    /// Continues a stored session: new messages are appended to it (D-057).
+    ///
+    /// * The UI is told the history again: [`Event::Message`] for every shown message,
+    ///   [`Event::ActionProposed`] and [`Event::ActionFinished`] for every past action, with the
+    ///   turn ids the session had. No turn starts.
+    /// * The brain gets the stored conversation back, minus `Done` summaries (D-029).
+    /// * A proposal stored without a result (Nixxa quit mid-approval or mid-action) is closed
+    ///   with [`QUIT_MID_ACTION`] first, because providers reject a tool call with no result.
+    /// * A system message ([`RESUMED`]) tells the agent the workspace may have changed and, when
+    ///   the session was recorded with another account, that it continues with this one.
+    pub async fn resume_session(&mut self, id: &SessionId) -> Result<SessionInfo, ControllerError> {
+        let record = self.store.load_session(id).await?;
+        let primer = self.begin(&record.info.id).await;
+        let mut turns = 0u64;
+        let mut turn = TurnId::new("turn-0");
+        let mut unanswered: Vec<ActionRequest> = Vec::new();
+        let mut conversation = Vec::with_capacity(record.messages.len());
+        for message in record.messages {
+            match &message.content {
+                // Stored for the record, never shown or replayed (D-029).
+                Content::Summary { .. } => continue,
+                Content::Text { .. } => {
+                    if message.role == Role::User {
+                        turn = TurnId::new(format!("turn-{turns}"));
+                        turns += 1;
+                    }
+                    self.emit(Event::Message { turn: turn.clone(), message: message.clone() });
+                }
+                Content::Action { request } => {
+                    unanswered.push(request.clone());
+                    self.emit(Event::ActionProposed { turn: turn.clone(), request: request.clone() });
+                }
+                Content::Observation { observation } => {
+                    unanswered.retain(|request| request.id != observation.action_id);
+                    self.emit(Event::ActionFinished { turn: turn.clone(), observation: observation.clone() });
+                }
+                Content::Reasoning { .. } => {}
+            }
+            conversation.push(message);
+        }
+        self.next_turn = turns;
+        self.session = Some(Session { id: record.info.id.clone(), primer, conversation });
+        for request in unanswered {
+            let observation = Observation::failed(request.id.clone(), QUIT_MID_ACTION);
+            self.finish_action(&turn, request, Verdict::Deny(QUIT_MID_ACTION.into()), observation).await;
+        }
+        let mut notice = RESUMED.to_string();
+        if record.info.account != self.config.account {
+            notice.push_str(&format!(
+                " It was recorded with the account {}; it continues with {}.",
+                record.info.account, self.config.account
+            ));
+        }
+        let message = Message::text(Role::System, notice, self.now());
+        self.record_message(&turn, message, true).await;
+        Ok(record.info)
+    }
+
+    /// Emits the session start events and gathers the primer. A failing primer is reported as
+    /// an [`Event::Error`] and the session starts unprimed.
+    async fn begin(&mut self, session: &SessionId) -> Primer {
         self.emit(Event::SessionStarted {
-            session: info.id.clone(),
+            session: session.clone(),
             account: self.config.account.clone(),
             brain: self.brain.describe(),
         });
@@ -180,15 +255,13 @@ impl Controller {
         for source in self.knowledge.sources().await {
             self.emit(Event::SourceStatus { source });
         }
-        let primer = match self.knowledge.primer(&self.config.workspace).await {
+        match self.knowledge.primer(&self.config.workspace).await {
             Ok(primer) => primer,
             Err(err) => {
                 self.emit(Event::Error { turn: None, message: format!("could not load the session primer: {err}") });
                 Primer::default()
             }
-        };
-        self.session = Some(Session { id: info.id.clone(), primer, conversation: Vec::new() });
-        Ok(info)
+        }
     }
 
     /// The command loop. Returns when the session ends ([`Command::Shutdown`] or the sender is
@@ -319,9 +392,10 @@ impl Controller {
                             pending.push_back(request);
                         }
                         Intent::Done { summary } => {
-                            // Stored, but kept out of what the brain sees: it isn't part of the
-                            // model's own message (D-029).
-                            let message = Message::text(Role::Agent, summary, self.now());
+                            // Stored, marked as a summary, and kept out of what the brain sees: it
+                            // isn't part of the model's own message (D-029).
+                            let content = Content::Summary { text: summary };
+                            let message = Message { role: Role::Agent, content, at: self.now() };
                             self.store_message(turn, &message).await;
                             done = true;
                         }

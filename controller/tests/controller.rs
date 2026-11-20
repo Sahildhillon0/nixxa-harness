@@ -182,6 +182,7 @@ impl Store for MemoryStore {
             workspace: new.workspace,
             account: new.account,
             started_at: new.started_at,
+            first_message: None,
         };
         sessions.push(SessionRecord { info: info.clone(), messages: Vec::new(), actions: Vec::new() });
         Ok(info)
@@ -192,7 +193,13 @@ impl Store for MemoryStore {
     }
 
     async fn append_message(&self, id: &SessionId, message: Message) -> Result<(), StoreError> {
-        self.with(id, |s| s.messages.push(message))
+        self.with(id, |s| {
+            if let (None, Role::User, Content::Text { text }) = (&s.info.first_message, message.role, &message.content)
+            {
+                s.info.first_message = Some(text.clone());
+            }
+            s.messages.push(message)
+        })
     }
 
     async fn append_action(&self, id: &SessionId, record: ActionRecord) -> Result<(), StoreError> {
@@ -366,6 +373,27 @@ impl Rig {
         max_steps: u32,
         store: Arc<MemoryStore>,
     ) -> Self {
+        Self::launch(brain, approvals, sandbox, max_steps, store, None).await
+    }
+
+    /// Resumes the stored session `id` with the scripted account.
+    async fn resume(
+        brain: Arc<ScriptedBrain>,
+        approvals: Arc<ScriptedApprovals>,
+        store: Arc<MemoryStore>,
+        id: &str,
+    ) -> Self {
+        Self::launch(brain, approvals, Arc::new(EchoSandbox), DEFAULT_MAX_STEPS, store, Some(SessionId::new(id))).await
+    }
+
+    async fn launch(
+        brain: Arc<ScriptedBrain>,
+        approvals: Arc<ScriptedApprovals>,
+        sandbox: Arc<dyn Sandbox>,
+        max_steps: u32,
+        store: Arc<MemoryStore>,
+        resume: Option<SessionId>,
+    ) -> Self {
         let sink = Arc::new(RecordingSink::default());
         let mut config = ControllerConfig::new(
             WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir().join("nixxa-controller-test") },
@@ -383,8 +411,11 @@ impl Rig {
             sink.clone(),
             config,
         );
-        let info = controller.start_session().await.expect("start session");
-        assert_eq!(info.id.as_str(), "s1");
+        let info = match &resume {
+            None => controller.start_session().await.expect("start session"),
+            Some(id) => controller.resume_session(id).await.expect("resume session"),
+        };
+        assert_eq!(info.id.as_str(), resume.as_ref().map_or("s1", SessionId::as_str));
         let (tx, rx) = mpsc::channel(8);
         let task = tokio::spawn(async move { controller.run(rx).await });
         Self { brain, approvals, store, sink, tx, task }
@@ -745,8 +776,14 @@ async fn the_done_summary_is_stored_but_never_sent_back_to_the_brain() {
 
     let seen = &rig.brain.contexts()[1].messages;
     assert_eq!(seen[1], text(Role::Agent, "Hello!"), "the model's own last block ends its turn");
-    assert!(!seen.contains(&text(Role::Agent, "done")), "{seen:?}");
-    assert!(rig.store.record("s1").messages.contains(&text(Role::Agent, "done")), "but it is stored");
+    assert!(!seen.iter().any(|m| m.content == summary("done").content), "{seen:?}");
+    let stored = rig.store.record("s1").messages;
+    assert!(stored.contains(&summary("done")), "but it is stored, marked as a summary (D-029): {stored:?}");
+    assert!(!stored.contains(&text(Role::Agent, "done")), "and never as agent text");
+}
+
+fn summary(text: &str) -> Message {
+    Message { role: Role::Agent, content: Content::Summary { text: text.into() }, at: Timestamp(0) }
 }
 
 fn reasoning_message(signature: &str) -> Message {
@@ -962,7 +999,7 @@ async fn done_is_recorded_but_not_announced() {
         })
         .collect();
     assert_eq!(shown, vec![text(Role::User, "hello"), text(Role::Agent, "All set.")]);
-    assert_eq!(rig.store.record("s1").messages.last(), Some(&text(Role::Agent, "internal summary")));
+    assert_eq!(rig.store.record("s1").messages.last(), Some(&summary("internal summary")));
 }
 
 #[tokio::test]
@@ -1033,4 +1070,177 @@ async fn interrupt_during_a_slow_store_write_keeps_the_action_whole() {
     let at = messages.iter().position(|m| m == &proposal).expect("proposal in history");
     assert_eq!(messages[at + 1], observation, "the observation follows its proposal");
     assert_eq!(messages.last(), Some(&text(Role::User, "again")));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resume (Stage 5, D-057)
+// ---------------------------------------------------------------------------------------------
+
+/// The system message a resumed session starts with.
+fn resumed_notice(events: &[Event]) -> String {
+    events
+        .iter()
+        .find_map(|e| match e {
+            Event::Message { message: Message { role: Role::System, content: Content::Text { text }, .. }, .. }
+                if text.contains("resumed") =>
+            {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .expect("a resumed notice")
+}
+
+/// A session with one full turn: an action, a reply and a `Done` summary.
+async fn one_finished_session() -> Arc<MemoryStore> {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: exec_request("act-1", "echo hi") })]),
+        step(vec![
+            intent(Intent::Say { text: "It said hi.".into() }),
+            intent(Intent::Done { summary: "ran it".into() }),
+        ]),
+    ]);
+    let store = Arc::new(MemoryStore::default());
+    let rig =
+        Rig::start_with_store(brain, ScriptedApprovals::allowing(), Arc::new(EchoSandbox), 8, store.clone()).await;
+    rig.turn("hello").await;
+    rig.tx.send(Command::Shutdown).await.unwrap();
+    rig.task.await.unwrap();
+    store
+}
+
+#[tokio::test]
+async fn resume_replays_the_history_to_the_brain_without_summaries() {
+    let store = one_finished_session().await;
+    assert!(store.record("s1").messages.contains(&summary("ran it")), "the summary is stored");
+
+    let brain = ScriptedBrain::new(vec![step(vec![intent(Intent::Say { text: "Back.".into() })]), step(vec![])]);
+    let rig = Rig::resume(brain, ScriptedApprovals::allowing(), store.clone(), "s1").await;
+    let next = rig.turn("again").await;
+    assert_eq!(next[0], Event::TurnStarted { turn: TurnId::new("turn-1") }, "turn numbers carry on");
+
+    let notice = resumed_notice(&rig.sink.all());
+    assert!(notice.contains("workspace may have changed"), "{notice}");
+    assert!(!notice.contains("account"), "same account, nothing to say: {notice}");
+    assert_eq!(
+        rig.brain.contexts()[0].messages,
+        vec![
+            text(Role::User, "hello"),
+            proposal(exec_request("act-1", "echo hi")),
+            observed(exec_observation("act-1", "echo hi")),
+            text(Role::Agent, "It said hi."),
+            text(Role::System, &notice),
+            text(Role::User, "again"),
+        ],
+        "the stored conversation, minus the Done summary, then the notice"
+    );
+
+    // New messages go to the same session.
+    let record = store.record("s1");
+    assert_eq!(store.sessions.lock().unwrap().len(), 1, "no new session");
+    assert_eq!(record.messages.last(), Some(&text(Role::Agent, "Back.")));
+    assert!(record.messages.contains(&text(Role::User, "again")));
+}
+
+#[tokio::test]
+async fn resume_redraws_the_conversation_and_past_actions() {
+    let store = one_finished_session().await;
+    let rig = Rig::resume(ScriptedBrain::new(vec![]), ScriptedApprovals::allowing(), store, "s1").await;
+    rig.sink.wait(1, |e| matches!(e, Event::Message { message, .. } if message.role == Role::System)).await;
+    let events: Vec<_> = rig
+        .sink
+        .all()
+        .into_iter()
+        .filter(|e| !matches!(e, Event::SandboxStatus { .. } | Event::SourceStatus { .. }))
+        .collect();
+    let notice = resumed_notice(&events);
+    assert_eq!(
+        events,
+        vec![
+            Event::SessionStarted {
+                session: SessionId::new("s1"),
+                account: AccountRef::new("scripted", "default"),
+                brain: BrainInfo { provider: ProviderId::new("scripted"), model: "scripted-1".into() },
+            },
+            Event::Message { turn: t0(), message: text(Role::User, "hello") },
+            Event::ActionProposed { turn: t0(), request: exec_request("act-1", "echo hi") },
+            Event::ActionFinished { turn: t0(), observation: exec_observation("act-1", "echo hi") },
+            Event::Message { turn: t0(), message: text(Role::Agent, "It said hi.") },
+            Event::Message { turn: t0(), message: text(Role::System, &notice) },
+        ],
+        "no TurnStarted, no summary, every past action with its result"
+    );
+}
+
+/// Nixxa quit (or crashed) while an action waited for approval: the proposal was stored without
+/// a result. Resuming closes it before the brain sees the history again.
+#[tokio::test]
+async fn resume_closes_a_tool_call_left_without_a_result() {
+    let brain = ScriptedBrain::new(vec![step(vec![
+        intent(Intent::Say { text: "Running it.".into() }),
+        intent(Intent::Act { request: exec_request("act-1", "rm -rf build") }),
+    ])]);
+    let store = Arc::new(MemoryStore::default());
+    let rig = Rig::start_with_store(brain, ScriptedApprovals::hanging(), Arc::new(EchoSandbox), 8, store.clone()).await;
+    rig.say("clean up").await;
+    rig.sink.wait(1, |e| matches!(e, Event::ApprovalNeeded { .. })).await;
+    rig.task.abort(); // the process died: nothing ran after this point
+    let _ = rig.task.await;
+    let stored = store.record("s1");
+    assert_eq!(stored.messages.last(), Some(&proposal(exec_request("act-1", "rm -rf build"))), "dangling");
+
+    let brain = ScriptedBrain::new(vec![step(vec![intent(Intent::Done { summary: "ok".into() })])]);
+    let rig = Rig::resume(brain, ScriptedApprovals::allowing(), store.clone(), "s1").await;
+    rig.turn("what happened?").await;
+
+    let closed = Observation::failed(
+        ActionId::new("act-1"),
+        "not finished: Nixxa quit before this action finished, so it may not have run, or may have run only in part",
+    );
+    let seen = &rig.brain.contexts()[0].messages;
+    let at = seen.iter().position(|m| m == &proposal(exec_request("act-1", "rm -rf build"))).expect("proposal");
+    assert_eq!(seen[at + 1], observed(closed.clone()), "the proposal is answered before anything else");
+    assert!(rig.sink.all().contains(&Event::ActionFinished { turn: t0(), observation: closed.clone() }));
+    let record = store.record("s1");
+    assert_eq!(record.actions.len(), 1, "the closing is recorded as an action record");
+    assert_eq!(record.actions[0].observation, Some(closed));
+    assert!(matches!(record.actions[0].verdict, Verdict::Deny(_)));
+}
+
+#[tokio::test]
+async fn resume_with_another_account_says_so() {
+    let store = Arc::new(MemoryStore::default());
+    let workspace = WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir() };
+    let new = NewSession { workspace, account: AccountRef::new("anthropic", "work"), started_at: Timestamp(0) };
+    store.create_session(new).await.unwrap();
+    store.append_message(&SessionId::new("s1"), text(Role::User, "hi")).await.unwrap();
+
+    let rig = Rig::resume(ScriptedBrain::new(vec![]), ScriptedApprovals::allowing(), store, "s1").await;
+    rig.sink.wait(1, |e| matches!(e, Event::Message { message, .. } if message.role == Role::System)).await;
+    let notice = resumed_notice(&rig.sink.all());
+    assert!(notice.contains("anthropic:work") && notice.contains("scripted:default"), "{notice}");
+    assert!(rig.sink.all().contains(&Event::SessionStarted {
+        session: SessionId::new("s1"),
+        account: AccountRef::new("scripted", "default"),
+        brain: BrainInfo { provider: ProviderId::new("scripted"), model: "scripted-1".into() },
+    }));
+}
+
+#[tokio::test]
+async fn resuming_an_unknown_session_is_an_error() {
+    let mut controller = Controller::new(
+        ScriptedBrain::new(vec![]),
+        Arc::new(EchoSandbox),
+        Arc::new(MemoryStore::default()),
+        Arc::new(FakeKnowledge),
+        ScriptedApprovals::allowing(),
+        Arc::new(RecordingSink::default()),
+        ControllerConfig::new(
+            WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir() },
+            AccountRef::new("scripted", "default"),
+            "",
+        ),
+    );
+    let err = controller.resume_session(&SessionId::new("nope")).await.unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
 }
