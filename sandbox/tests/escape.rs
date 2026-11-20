@@ -290,6 +290,31 @@ async fn the_network_is_unreachable() {
     assert_eq!(ifaces, vec!["lo"], "the sandbox has network interfaces besides lo: {links}");
 }
 
+/// The sandbox's own loopback works (local servers, test suites), over IPv4 and IPv6. It is the
+/// sandbox's `lo`, not the host's: `the_network_is_unreachable` checks the host stays out of reach.
+#[tokio::test]
+async fn the_sandbox_loopback_works() {
+    let scratch = Scratch::new("loopback");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    if sh(&sb, "command -v python3").await.0 != Some(0) {
+        eprintln!("SKIPPED the loopback test: no python3 inside");
+        return;
+    }
+    let script = r#"
+import socket
+for family, host in ((socket.AF_INET, "127.0.0.1"), (socket.AF_INET6, "::1")):
+    server = socket.socket(family, socket.SOCK_STREAM)
+    server.bind((host, 0))
+    server.listen(1)
+    client = socket.create_connection(server.getsockname()[:2], timeout=5)
+    conn, _ = server.accept()
+    client.sendall(b"ping")
+    print(family.name, conn.recv(4).decode())
+"#;
+    let out = sh_out(&sb, &format!("python3 -c '{script}'")).await;
+    assert_eq!(out, "AF_INET ping\nAF_INET6 ping\n", "loopback inside the sandbox: {out}");
+}
+
 #[tokio::test]
 async fn a_fork_bomb_is_contained() {
     fork_bomb(true).await;

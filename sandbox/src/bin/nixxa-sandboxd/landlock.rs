@@ -1,8 +1,7 @@
 //! Landlock rules applied to the daemon at start-up. Every command inherits them.
 
 use landlock::{
-    ABI, Access, AccessFs, AccessNet, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus,
-    path_beneath_rules,
+    ABI, Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr, RulesetError, RulesetStatus, path_beneath_rules,
 };
 
 /// Applies the Landlock policy to the current process. Returns `true` when it is enforced.
@@ -13,14 +12,9 @@ pub(crate) fn apply() -> bool {
 fn apply_inner() -> Result<bool, RulesetError> {
     let abi = ABI::V9;
 
-    let mut ruleset = Ruleset::default().handle_access(AccessFs::from_all(abi))?;
-    // TCP bind/connect are Landlock features from ABI 4 onward.
-    if abi >= ABI::V4 {
-        ruleset = ruleset.handle_access(AccessNet::BindTcp)?;
-        ruleset = ruleset.handle_access(AccessNet::ConnectTcp)?;
-    }
-
-    let mut created = ruleset.create()?;
+    // Filesystem only. TCP is left alone on purpose (D-045): the sandbox's network namespace
+    // has nothing but its own loopback, and commands need it for local servers and tests.
+    let mut created = Ruleset::default().handle_access(AccessFs::from_all(abi))?.create()?;
 
     // Read + execute on the system paths.
     let read_exec = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc", "/proc", "/dev", "/.nixxa"];

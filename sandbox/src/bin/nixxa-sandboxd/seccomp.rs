@@ -123,12 +123,17 @@ pub(crate) fn apply() -> bool {
         }
     }
 
-    // socket for families other than AF_UNIX.
-    if let Ok(cond) = SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, libc::AF_UNIX as u64) {
-        if let Ok(rule) = SeccompRule::new(vec![cond]) {
-            rules.entry(libc::SYS_socket).or_default().push(rule);
-        }
-    }
+    // socket for families other than AF_UNIX, AF_INET and AF_INET6. IP sockets stay allowed so
+    // commands can use the sandbox's own loopback (local servers, test suites); the network
+    // namespace has no other interface, so nothing outside the sandbox is reachable.
+    let allowed = [libc::AF_UNIX, libc::AF_INET, libc::AF_INET6];
+    let conds: Result<Vec<_>, _> = allowed
+        .iter()
+        .map(|&family| SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Ne, family as u64))
+        .collect();
+    let Ok(conds) = conds else { return false };
+    let Ok(rule) = SeccompRule::new(conds) else { return false };
+    rules.entry(libc::SYS_socket).or_default().push(rule);
 
     // Build and install the main filter (EPERM on match).
     let filter = match SeccompFilter::new(rules, SeccompAction::Allow, SeccompAction::Errno(libc::EPERM as u32), arch) {
