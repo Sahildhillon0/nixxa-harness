@@ -131,8 +131,15 @@ async fn reopening_the_file_returns_everything() {
     assert_eq!(store.list_sessions().await.unwrap(), vec![loaded.info]);
 }
 
-fn user_version(path: &Path) -> i64 {
+/// A plain connection, patient with a store thread still closing its own.
+fn raw(path: &Path) -> rusqlite::Connection {
     let conn = rusqlite::Connection::open(path).unwrap();
+    conn.busy_timeout(std::time::Duration::from_secs(5)).unwrap();
+    conn
+}
+
+fn user_version(path: &Path) -> i64 {
+    let conn = raw(path);
     conn.pragma_query_value(None, "user_version", |row| row.get(0)).unwrap()
 }
 
@@ -172,7 +179,7 @@ async fn a_newer_file_is_refused_and_left_alone() {
         store.create_session(new_session(1)).await.unwrap();
     }
     {
-        let conn = rusqlite::Connection::open(scratch.db()).unwrap();
+        let conn = raw(&scratch.db());
         conn.pragma_update(None, "user_version", latest() + 1).unwrap();
     }
     let before = std::fs::read(scratch.db()).unwrap();
