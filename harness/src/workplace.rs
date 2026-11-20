@@ -377,9 +377,9 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn sandboxed_places_say_why_they_are_unavailable() {
-        let blocked = blocked(&std::env::temp_dir(), false);
+        let real = blocked(&std::env::temp_dir(), false);
         for place in [Place::Sandbox, Place::SandboxHere, Place::SandboxCopy] {
-            assert!(blocked.iter().any(|(p, why)| *p == place && why.contains("Linux")), "{place:?}");
+            assert!(real.iter().any(|(p, why)| *p == place && why.contains("Linux")), "{place:?}");
         }
         let fake = blocked(&std::env::temp_dir(), true);
         assert!(!fake.iter().any(|(p, _)| *p == Place::Sandbox), "the demo's sandbox is the fake one");
