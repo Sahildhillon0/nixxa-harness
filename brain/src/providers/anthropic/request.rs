@@ -56,6 +56,9 @@ fn block_for(message: &Message, keep_reasoning: bool) -> Option<(&'static str, V
             ("assistant", data.clone())
         }
         (_, Content::Reasoning { .. }) => return None,
+        // Never part of the model's message (D-029); the controller doesn't send it, and if it
+        // ever did, sending it would edit the history.
+        (_, Content::Summary { .. }) => return None,
     })
 }
 
@@ -155,6 +158,20 @@ mod tests {
 
     fn exec_ok(stdout: &str) -> Outcome {
         Outcome::Exec { exit_code: Some(0), stdout: stdout.into(), stderr: String::new() }
+    }
+
+    #[test]
+    fn a_summary_is_never_sent() {
+        let summary = Message { role: Role::Agent, content: Content::Summary { text: "did it".into() }, at: T };
+        let rendered = messages(&[user("hi"), agent("hello"), summary], true, false);
+        assert_eq!(
+            rendered,
+            vec![
+                json!({ "role": "user", "content": [{ "type": "text", "text": "hi" }] }),
+                json!({ "role": "assistant", "content": [{ "type": "text", "text": "hello" }] }),
+                json!({ "role": "user", "content": [{ "type": "text", "text": "[Continue.]" }] }),
+            ]
+        );
     }
 
     #[test]
