@@ -39,9 +39,10 @@ fn start_session(
     workspace: WorkspaceInfo,
     workplace: &Workplace,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
+    approval_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Session {
     let (commands, rx) = mpsc::channel(32);
-    let mut controller = wiring::controller(brain, account.clone(), workspace, workplace, ui_tx.clone());
+    let mut controller = wiring::controller(brain, account.clone(), workspace, workplace, ui_tx.clone(), approval_mode);
     let task = tokio::spawn(async move {
         if let Err(err) = controller.start_session().await {
             let message = format!("could not start a session: {err}");
@@ -79,6 +80,11 @@ fn place_note(workplace: &Workplace, workspace: &WorkspaceInfo) -> String {
              Every action still asks first.",
             workspace.root.display()
         ),
+        Place::SandboxHere => format!(
+            "Working on your files in the sandbox ({}): changes are real; only localhost works.",
+            workspace.root.display()
+        ),
+        Place::SandboxCopy => "Working on a copy in the sandbox: your real directory is untouched.".into(),
     }
 }
 
@@ -86,7 +92,9 @@ fn place_note(workplace: &Workplace, workspace: &WorkspaceInfo) -> String {
 pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let workspace = wiring::workspace(&std::env::current_dir()?);
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
+    let approval_state = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1));
     let mut app = App::new(color);
+    app.approval_state = approval_state.clone();
     // Asked on every launch; no session starts until it is answered.
     app.directory = workspace.root.display().to_string();
     app.ask_place();
@@ -219,7 +227,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                                     }
                                     match &workplace {
                                         Some(place) => {
-                                            session = Some(start_session(brain, account, workspace.clone(), place, ui_tx.clone()));
+                                            session = Some(start_session(brain, account, workspace.clone(), place, ui_tx.clone(), approval_state.clone()));
                                         }
                                         None => waiting = Some((brain, account)),
                                     }
@@ -316,17 +324,39 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     _ => app.account_saved(&Err("The sign-in expired; sign in again.".into())),
                 },
                 Effect::ChoosePlace(choice) => {
-                    let chosen = Workplace::new(choice, &workspace).unwrap_or_else(|why| {
-                        tracing::warn!(%why, "can't work in the current directory");
-                        app.note(format!("{why}. Using the sandbox instead."));
-                        Workplace::new(Place::Sandbox, &workspace).expect("the sandbox needs no directory")
-                    });
-                    tracing::info!(place = ?chosen.place, "workplace chosen");
-                    app.note(place_note(&chosen, &workspace));
-                    if let Some((brain, account)) = waiting.take() {
-                        session = Some(start_session(brain, account, workspace.clone(), &chosen, ui_tx.clone()));
+                    let ws = workspace.clone();
+                    let chosen = tokio::task::spawn_blocking(move || Workplace::new(choice, &ws))
+                        .await
+                        .unwrap_or_else(|_| Err("could not start the workplace".into()));
+                    match chosen {
+                        Ok(chosen) => {
+                            // Start the daemon up front so the status line is honest.
+                            if matches!(chosen.place, Place::Sandbox | Place::SandboxHere | Place::SandboxCopy) {
+                                let sb = chosen.sandbox.clone();
+                                tokio::spawn(async move {
+                                    let _ = sb.health().await;
+                                });
+                            }
+                            tracing::info!(place = ?chosen.place, "workplace chosen");
+                            app.note(place_note(&chosen, &workspace));
+                            if let Some((brain, account)) = waiting.take() {
+                                session = Some(start_session(
+                                    brain,
+                                    account,
+                                    workspace.clone(),
+                                    &chosen,
+                                    ui_tx.clone(),
+                                    approval_state.clone(),
+                                ));
+                            }
+                            workplace = Some(chosen);
+                        }
+                        Err(why) => {
+                            tracing::warn!(%why, "can't work here");
+                            app.note(why);
+                            app.ask_place();
+                        }
                     }
-                    workplace = Some(chosen);
                 }
                 Effect::Quit => quit = true,
             }

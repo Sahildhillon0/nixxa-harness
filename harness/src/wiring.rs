@@ -62,16 +62,66 @@ pub(crate) struct Workplace {
 }
 
 impl Workplace {
-    /// The sandbox (still the in-memory fake until Stage 4), or the real files of `workspace`.
+    /// The sandbox, or the real files of `workspace`.
     pub(crate) fn new(place: Place, workspace: &WorkspaceInfo) -> Result<Self, String> {
         let sandbox: Arc<dyn Sandbox> = match place {
-            Place::Sandbox => Arc::new(FakeSandbox::default()),
+            Place::Sandbox => {
+                #[cfg(target_os = "linux")]
+                {
+                    use nixxa_sandbox::bwrap::{BwrapConfig, BwrapSandbox};
+                    if let Some(daemon) = find_daemon() {
+                        let mut config = BwrapConfig::new(std::env::temp_dir().join("nixxa-empty"), daemon);
+                        fill_config(&mut config);
+                        let ws = std::env::temp_dir().join("nixxa-empty");
+                        let _ = std::fs::create_dir_all(&ws);
+                        config.workspace = ws;
+                        if let Ok(sb) = BwrapSandbox::new(config) {
+                            return Ok(Self { place, sandbox: Arc::new(sb) });
+                        }
+                    }
+                    Arc::new(FakeSandbox::default())
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Arc::new(FakeSandbox::default())
+                }
+            }
             Place::Here => {
                 let config = HostConfig {
                     root: workspace.root.clone(),
                     hidden_env: SECRET_ENV.iter().map(|name| (*name).to_string()).collect(),
                 };
                 Arc::new(HostSandbox::new(config).map_err(|err| format!("can't work in this directory: {err}"))?)
+            }
+            Place::SandboxHere => {
+                #[cfg(target_os = "linux")]
+                {
+                    use nixxa_sandbox::bwrap::{BwrapConfig, BwrapSandbox};
+                    let daemon = find_daemon().ok_or_else(|| "nixxa-sandboxd is not installed".to_string())?;
+                    let mut config = BwrapConfig::new(workspace.root.clone(), daemon);
+                    fill_config(&mut config);
+                    Arc::new(BwrapSandbox::new(config).map_err(|e| e.to_string())?)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err("sandboxed places need Linux".into());
+                }
+            }
+            Place::SandboxCopy => {
+                #[cfg(target_os = "linux")]
+                {
+                    use nixxa_sandbox::bwrap::{BwrapConfig, BwrapSandbox};
+                    let daemon = find_daemon().ok_or_else(|| "nixxa-sandboxd is not installed".to_string())?;
+                    let copy_root = std::env::temp_dir().join(format!("nixxa-copy-{}", std::process::id()));
+                    crate::copy::copy_dir(&workspace.root, &copy_root).map_err(|e| e.to_string())?;
+                    let mut config = BwrapConfig::new(copy_root, daemon);
+                    fill_config(&mut config);
+                    Arc::new(BwrapSandbox::new(config).map_err(|e| e.to_string())?)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    return Err("sandboxed places need Linux".into());
+                }
             }
         };
         Ok(Self { place, sandbox })
@@ -81,6 +131,8 @@ impl Workplace {
         match self.place {
             Place::Sandbox => SANDBOX_INSTRUCTIONS,
             Place::Here => HERE_INSTRUCTIONS,
+            Place::SandboxHere => SANDBOX_INSTRUCTIONS,
+            Place::SandboxCopy => SANDBOX_INSTRUCTIONS,
         }
     }
 }
@@ -98,13 +150,14 @@ pub(crate) fn controller(
     workspace: WorkspaceInfo,
     workplace: &Workplace,
     ui: mpsc::UnboundedSender<UiEvent>,
+    approval_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Controller {
     Controller::new(
         brain,
         workplace.sandbox.clone(),
         Arc::new(MemoryStore::default()),
         Arc::new(FakeKnowledge),
-        Arc::new(TuiApprovals::new(ui.clone())),
+        Arc::new(TuiApprovals::new(ui.clone(), approval_mode)),
         Arc::new(ChannelSink::new(ui)),
         ControllerConfig::new(workspace, account, workplace.instructions()),
     )
@@ -346,6 +399,58 @@ fn local_words(err: &BrainError) -> String {
     }
 }
 
+#[allow(dead_code)]
+pub(crate) fn guard_reason(root: &std::path::Path) -> Option<String> {
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if canon == std::path::Path::new("/") {
+        return Some("refused: the filesystem root".into());
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = std::path::PathBuf::from(home);
+        if let Ok(home) = home.canonicalize() {
+            if canon == home || home.starts_with(&canon) {
+                return Some("refused: your home directory or a parent of it".into());
+            }
+        }
+    }
+    // config/data dirs: best effort using env
+    if let Some(cfg) = std::env::var_os("XDG_CONFIG_HOME") {
+        let p = std::path::PathBuf::from(cfg);
+        if p.starts_with(&canon) || canon.starts_with(&p) {
+            return Some("refused: contains Nixxa config".into());
+        }
+    }
+    if canon.ends_with(".config") {
+        return Some("refused: a secrets directory".into());
+    }
+    None
+}
+
+pub(crate) fn find_daemon() -> Option<std::path::PathBuf> {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let candidate = dir.join("nixxa-sandboxd");
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    for dir in std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()) {
+        let candidate = dir.join("nixxa-sandboxd");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+pub(crate) fn fill_config(config: &mut nixxa_sandbox::bwrap::BwrapConfig) {
+    if let Ok(path) = std::env::var("PATH") {
+        config.search_path = std::env::split_paths(&path).collect();
+    }
+    config.runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+}
+
 fn kind(err: &BrainError) -> &'static str {
     match err {
         BrainError::Auth(_) => "rejected",
@@ -450,8 +555,14 @@ pub(crate) mod tests {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (brain, account) = scripted();
-        let mut controller =
-            controller(brain, account, workspace(&std::env::temp_dir().join("nixxa-e2e")), &sandboxed(), ui_tx);
+        let mut controller = controller(
+            brain,
+            account,
+            workspace(&std::env::temp_dir().join("nixxa-e2e")),
+            &sandboxed(),
+            ui_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)),
+        );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
 
@@ -485,7 +596,14 @@ pub(crate) mod tests {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (brain, account) = scripted();
-        let mut controller = controller(brain, account, workspace, &here, ui_tx);
+        let mut controller = controller(
+            brain,
+            account,
+            workspace,
+            &here,
+            ui_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)),
+        );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
 
@@ -532,8 +650,14 @@ pub(crate) mod tests {
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let default = anthropic.start_account().await.expect("the stored account is the default");
         let brain = anthropic.brain_for(&default).await.unwrap();
-        let mut controller =
-            controller(brain, default, workspace(&std::env::temp_dir().join("nixxa-e2e3")), &sandboxed(), ui_tx);
+        let mut controller = controller(
+            brain,
+            default,
+            workspace(&std::env::temp_dir().join("nixxa-e2e3")),
+            &sandboxed(),
+            ui_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)),
+        );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
 
@@ -685,6 +809,7 @@ pub(crate) mod tests {
             workspace(&std::env::temp_dir().join("nixxa-e2e-local")),
             &sandboxed(),
             ui_tx,
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });

@@ -39,6 +39,7 @@ impl Focus {
         }
     }
 
+    #[allow(dead_code)]
     fn previous(self) -> Self {
         match self {
             Self::Input => Self::Activity,
@@ -81,6 +82,7 @@ pub(crate) struct Activity {
     pub(crate) request: ActionRequest,
     pub(crate) state: ActivityState,
     pub(crate) observation: Option<Observation>,
+    pub(crate) auto_approved: bool,
 }
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
@@ -124,6 +126,9 @@ pub(crate) struct App {
     pub(crate) sandbox: Option<SandboxCapabilities>,
     pub(crate) sources: Vec<SourceInfo>,
     pub(crate) mode: ApprovalMode,
+    pub(crate) approval_state: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    pub(crate) auto_confirm_pending: bool,
+    pub(crate) here: bool,
     pub(crate) cost_micro_usd: u64,
     pub(crate) conversation: Vec<Entry>,
     /// Text streamed for the agent message being written; replaced by the final message.
@@ -163,6 +168,9 @@ impl App {
             sandbox: None,
             sources: Vec::new(),
             mode: ApprovalMode::Ask,
+            approval_state: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)),
+            auto_confirm_pending: false,
+            here: false,
             cost_micro_usd: 0,
             conversation: Vec::new(),
             streaming: None,
@@ -308,7 +316,12 @@ impl App {
                 self.conversation.push(Entry { speaker, text });
             }
             Event::ActionProposed { request, .. } => {
-                self.activity.push(Activity { request, state: ActivityState::Proposed, observation: None });
+                self.activity.push(Activity {
+                    request,
+                    state: ActivityState::Proposed,
+                    observation: None,
+                    auto_approved: self.mode == ApprovalMode::Auto,
+                });
             }
             Event::ApprovalNeeded { request, .. } => self.set_state(&request.id, ActivityState::Asking),
             Event::ActionStarted { action_id, .. } => self.set_state(&action_id, ActivityState::Running),
@@ -378,7 +391,22 @@ impl App {
         }
         match key.code {
             KeyCode::Tab => self.focus = self.focus.next(),
-            KeyCode::BackTab => self.focus = self.focus.previous(),
+            KeyCode::BackTab => {
+                if self.mode == ApprovalMode::Auto {
+                    self.mode = ApprovalMode::Ask;
+                    self.approval_state.store(1, std::sync::atomic::Ordering::Relaxed);
+                    self.auto_confirm_pending = false;
+                } else if self.here && !self.auto_confirm_pending {
+                    self.auto_confirm_pending = true;
+                    self.notice =
+                        Some("Auto in your real files without isolation? Press Shift+Tab again to confirm".into());
+                } else {
+                    self.mode = ApprovalMode::Auto;
+                    self.approval_state.store(2, std::sync::atomic::Ordering::Relaxed);
+                    self.auto_confirm_pending = false;
+                }
+                return Vec::new();
+            }
             _ => match self.focus {
                 Focus::Input => return self.edit_input(key),
                 Focus::Conversation => self.scroll_conversation(key.code),
@@ -592,12 +620,11 @@ pub(crate) mod tests {
         app.ask_place();
         assert!(app.handle_key(key(KeyCode::Esc)).is_empty(), "there is no way past it but answering");
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::ChoosePlace(Place::Here)]);
         app.ask_place();
         assert_eq!(app.handle_key(key(KeyCode::Char('2'))), vec![Effect::ChoosePlace(Place::Here)]);
         app.ask_place();
-        assert!(app.handle_key(key(KeyCode::Char('3'))).is_empty());
+        assert!(app.handle_key(key(KeyCode::Char('4'))).is_empty());
         assert_eq!(app.handle_key(ctrl_c()), Vec::new(), "ctrl-c still works: the first warns");
         assert_eq!(app.handle_key(ctrl_c()), vec![Effect::Quit]);
     }
@@ -810,8 +837,10 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Focus::Conversation);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Activity);
-        app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.focus, Focus::Conversation);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Input);
+        // BackTab now toggles approval mode, not focus.
+        let _ = app.handle_key(key(KeyCode::BackTab));
     }
 
     #[tokio::test]
@@ -820,7 +849,8 @@ pub(crate) mod tests {
         use nixxa_contracts::ApprovalPort;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let approvals = std::sync::Arc::new(TuiApprovals::new(tx));
+        let approvals =
+            std::sync::Arc::new(TuiApprovals::new(tx, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1))));
         let mut app = App::new(true);
 
         for (answer, expected) in [('y', Verdict::Allow), ('n', Verdict::Deny("denied by the user".into()))] {

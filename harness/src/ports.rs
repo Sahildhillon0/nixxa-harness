@@ -70,17 +70,23 @@ impl EventSink for ChannelSink {
 /// Asks the human through the TUI's approval prompt.
 pub(crate) struct TuiApprovals {
     tx: mpsc::UnboundedSender<UiEvent>,
+    mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
 }
 
 impl TuiApprovals {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<UiEvent>) -> Self {
-        Self { tx }
+    pub(crate) fn new(tx: mpsc::UnboundedSender<UiEvent>, mode: std::sync::Arc<std::sync::atomic::AtomicU8>) -> Self {
+        Self { tx, mode }
     }
 }
 
 #[async_trait]
 impl ApprovalPort for TuiApprovals {
     async fn ask(&self, request: &ActionRequest, reason: &str) -> Verdict {
+        // Auto mode: approve without prompting.
+        if self.mode.load(std::sync::atomic::Ordering::Relaxed) == 2 {
+            crate::logging::approval(&request.id, &Verdict::Allow);
+            return Verdict::Allow;
+        }
         let (reply, answer) = oneshot::channel();
         let prompt = PendingApproval { request: request.clone(), reason: reason.to_string(), reply };
         if self.tx.send(UiEvent::Approval(prompt)).is_err() {
@@ -109,7 +115,7 @@ mod tests {
     #[tokio::test]
     async fn approvals_round_trip_through_the_ui_channel() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let approvals = TuiApprovals::new(tx);
+        let approvals = TuiApprovals::new(tx, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)));
         let ui = tokio::spawn(async move {
             let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("expected a prompt") };
             assert_eq!(prompt.reason, "why");
@@ -123,14 +129,16 @@ mod tests {
     async fn a_closed_ui_denies() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let verdict = TuiApprovals::new(tx).ask(&request(), "why").await;
+        let verdict = TuiApprovals::new(tx, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)))
+            .ask(&request(), "why")
+            .await;
         assert_eq!(verdict, Verdict::Deny("the approval prompt is closed".into()));
     }
 
     #[tokio::test]
     async fn a_prompt_knows_when_the_controller_stopped_waiting() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let approvals = TuiApprovals::new(tx);
+        let approvals = TuiApprovals::new(tx, std::sync::Arc::new(std::sync::atomic::AtomicU8::new(1)));
         let asking = tokio::spawn(async move { approvals.ask(&request(), "why").await });
         let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("expected a prompt") };
         assert!(!prompt.is_abandoned());

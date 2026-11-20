@@ -6,6 +6,7 @@
 
 mod app;
 mod browser;
+mod copy;
 mod logging;
 mod paths;
 mod place;

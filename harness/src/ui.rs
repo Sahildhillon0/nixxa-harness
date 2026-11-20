@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
-use crate::place::{PLACES, Place};
+// place module used via app.place
 use crate::safe;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 
@@ -530,18 +530,20 @@ fn draw_place(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
         Line::from(vec![Span::styled("Directory  ", theme.dim()), Span::raw(safe::line(&app.directory))]),
         Line::default(),
     ];
-    for (i, (place, name, detail)) in PLACES.iter().enumerate() {
+    for (i, (_place, name, detail)) in picker.choices().iter().enumerate() {
         let chosen = i == picker.selected;
         let marker = if chosen { "›" } else { " " };
         let style = if chosen { theme.accent() } else { Style::new() };
-        let detail_style = if *place == Place::Here { theme.pending() } else { theme.dim() };
+        let disabled = picker.is_disabled(i);
+        let detail_style = if disabled { theme.bad() } else { theme.dim() };
+        let detail = if disabled { picker.reason(i).unwrap_or(detail) } else { detail };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} {}  {name}", i + 1), style.add_modifier(Modifier::BOLD)),
             Span::styled(format!(" — {detail}"), detail_style),
         ]));
     }
     lines.push(Line::default());
-    lines.push(Line::styled("Either way, every action asks you first.", theme.dim()));
+    lines.push(Line::styled("Approval mode starts as Ask; Shift+Tab toggles it.", theme.dim()));
     let width = over.width.min(84);
     let inner_width = usize::from(width.saturating_sub(2)).max(1);
     let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(inner_width)).sum();
