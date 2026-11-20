@@ -1,5 +1,9 @@
 //! `nixxa-db` — persists Nixxa's own sessions, transcripts and action logs.
 //!
-//! Stage 1: the contract lives in `nixxa-contracts`. The SQLite store arrives in Stage 5.
+//! [`SqliteStore`] is the real store (Stage 5); [`memory::MemoryStore`] keeps everything in
+//! memory (`--fake`, and when the database can't be opened).
 
 pub mod memory;
+mod sqlite;
+
+pub use sqlite::SqliteStore;
