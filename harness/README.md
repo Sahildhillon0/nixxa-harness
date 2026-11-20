@@ -12,6 +12,31 @@ The `nixxa` binary: the ratatui TUI and the composition root that picks concrete
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
+## Stage 5 status
+
+- **History (`wiring::store`):** real runs keep sessions in `SqliteStore` at
+  `<data dir>/nixxa/nixxa.db` (`paths::db_path`). `--fake` uses `MemoryStore`, so the demo never
+  touches the user's history. If there is no data directory or the database can't be opened
+  (damaged, from a newer Nixxa), the conversation says why and that history is off, and Nixxa
+  carries on with `MemoryStore`: the one fallback, and always visible (D-058).
+- **Session list (`sessions.rs`, `ctrl-s`):** an overlay of every stored session, newest first,
+  this directory's first ("This directory", then "Elsewhere"). Each row: how long ago it started,
+  the workspace, the account and the first user message (first line, through `safe::line`); the
+  open session is marked. Typing filters by those fields and searches transcripts with
+  `Store::search`, whose snippets show under the matching rows. `enter` resumes, `esc` closes.
+  Resuming ends the running session first (it is saved as it goes) and runs the resumed one in
+  the place chosen at this launch (D-059).
+- **`--continue`** (`-c`): the first session to start is the latest one for this directory, after
+  the start-up question; if there is none, a new one starts and the conversation says so.
+- **Late events:** each controller's `ChannelSink` belongs to a `Generation`; starting another
+  session advances it, so a replaced session's last events (its interrupt notice) never land in
+  the new conversation.
+- **Tests:** the list's ordering, grouping, filtering, search and keys (`sessions.rs`, `app.rs`),
+  its drawing (`ui.rs`), `--continue` parsing, and end to end (`wiring.rs`): quit mid-turn with
+  ctrl-c twice, reopen the same file with a new store, resume, and check the conversation, the
+  activity pane and the brain's history (`stage_five_quit_mid_turn_relaunch_and_resume_…`); a
+  crash mid-approval closed on resume; an unopenable database turning history off visibly.
+
 ## Stage 3 status (in progress)
 
 `cargo run -p nixxa-harness` opens the TUI on the current directory.
@@ -22,7 +47,7 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
     account setting `model.<account>`.
 
   `wiring::Models` picks the brain from the account's provider. `--fake` uses the scripted Stage 2
-  brain. The store and knowledge are still the Stage 2 fakes.
+  brain. Knowledge is still the Stage 2 fake; the store is real since Stage 5.
 - **Where the agent works (`place.rs`, `workplace.rs`, `copy.rs`):** asked at every launch: an
   empty sandbox, this directory (`HostSandbox`, not isolated), or this directory in the sandbox,
   as the real files or a copy (`BwrapSandbox`). `workplace::blocked` lists the choices that can't
@@ -80,6 +105,7 @@ its fake (scripted brain, fake sandbox, in-memory store, fake knowledge).
 | `src/wiring.rs` | Composition root; holds the Stage 2 end-to-end test |
 | `src/place.rs` | The start-up question: the three choices, the second question, blocked choices |
 | `src/workplace.rs` | Builds the chosen place's sandbox and instructions; the workspace guard; finding the daemon |
+| `src/sessions.rs` | The session list (`ctrl-s`): rows, grouping, filtering, keys |
 | `src/copy.rs` | Scratch folders and the copy for "Work on a copy" (Linux) |
 | `src/safe.rs` | Makes untrusted text safe to draw (control, C1 and bidi characters made visible) and scrubs each frame |
 | `src/logging.rs` | `tracing` to daily files, metadata only |
@@ -98,7 +124,7 @@ running is shown dimmed as "(queued)" until its turn starts.
 can be found, logging is off and the conversation says so.
 
 Keys: `enter` send · `alt-enter` / `shift-enter` newline · `tab` focus · `shift-tab` Ask/Auto ·
-`j` `k` / arrows move · `end` back to newest · `ctrl-c` interrupt (twice: quit).
+`j` `k` / arrows move · `end` back to newest · `ctrl-s` sessions · `ctrl-c` interrupt (twice: quit).
 
 Not yet: LOCKED and `m` (Stage 9), "allow all" / edit in the prompt (Stage 9),
-session list (Stage 5), knowledge panel (Stage 6), accounts screen (Stage 3/8), help overlay.
+knowledge panel (Stage 6), accounts screen (Stage 3/8), help overlay.

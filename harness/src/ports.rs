@@ -3,7 +3,7 @@
 //! controller.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
 use nixxa_contracts::{ActionId, ActionRequest, ApprovalPort, Event, EventSink, Verdict};
@@ -26,6 +26,41 @@ pub(crate) enum UiEvent {
     SignedIn(Result<nixxa_contracts::Secret, String>),
     /// Auto mode approved this action without asking (D-052).
     AutoApproved(ActionId),
+    /// The stored sessions for the session list (newest first), or why not.
+    SessionsListed(Result<Vec<nixxa_contracts::SessionInfo>, String>),
+    /// Transcript matches for the session list's query, or why not.
+    SessionsFound { query: String, result: Result<Vec<nixxa_contracts::SearchHit>, String> },
+}
+
+/// Which session the UI shows. Each controller's sink is tied to the generation it was made in;
+/// starting another session moves on, so events a replaced session sends while it shuts down
+/// (its interrupt notice, its last `TurnDone`) never land in the new one's conversation.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Generation(Arc<AtomicU64>);
+
+impl Generation {
+    fn current(&self) -> u64 {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    /// Stops showing events from every sink made so far.
+    pub(crate) fn advance(&self) {
+        self.0.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// What a controller needs to reach the UI.
+#[derive(Debug, Clone)]
+pub(crate) struct UiLink {
+    pub(crate) tx: mpsc::UnboundedSender<UiEvent>,
+    pub(crate) auto: AutoApprove,
+    pub(crate) generation: Generation,
+}
+
+impl UiLink {
+    pub(crate) fn new(tx: mpsc::UnboundedSender<UiEvent>, auto: AutoApprove) -> Self {
+        Self { tx, auto, generation: Generation::default() }
+    }
 }
 
 /// Whether actions are approved without asking (Auto mode, D-052). Shared by the TUI, which
@@ -69,19 +104,26 @@ impl PendingApproval {
     }
 }
 
-/// Forwards controller events to the UI loop.
+/// Forwards controller events to the UI loop while its session is the one shown.
 pub(crate) struct ChannelSink {
     tx: mpsc::UnboundedSender<UiEvent>,
+    generation: Generation,
+    mine: u64,
 }
 
 impl ChannelSink {
-    pub(crate) fn new(tx: mpsc::UnboundedSender<UiEvent>) -> Self {
-        Self { tx }
+    pub(crate) fn new(tx: mpsc::UnboundedSender<UiEvent>, generation: Generation) -> Self {
+        let mine = generation.current();
+        Self { tx, generation, mine }
     }
 }
 
 impl EventSink for ChannelSink {
     fn emit(&self, event: Event) {
+        if self.generation.current() != self.mine {
+            // A replaced session winding down: its events belong to a conversation no longer shown.
+            return;
+        }
         // The UI has gone away (quitting): there is nobody left to show it to.
         let _ = self.tx.send(UiEvent::Controller(event));
     }
@@ -182,5 +224,22 @@ mod tests {
         asking.abort();
         let _ = asking.await;
         assert!(prompt.is_abandoned());
+    }
+
+    #[test]
+    fn a_replaced_sessions_events_are_dropped() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let generation = Generation::default();
+        let old = ChannelSink::new(tx.clone(), generation.clone());
+        old.emit(Event::Error { turn: None, message: "shown".into() });
+        generation.advance();
+        let new = ChannelSink::new(tx, generation);
+        old.emit(Event::Error { turn: None, message: "dropped".into() });
+        new.emit(Event::Error { turn: None, message: "shown too".into() });
+        let mut seen = Vec::new();
+        while let Ok(UiEvent::Controller(Event::Error { message, .. })) = rx.try_recv() {
+            seen.push(message);
+        }
+        assert_eq!(seen, vec!["shown", "shown too"]);
     }
 }

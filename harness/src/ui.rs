@@ -1,6 +1,8 @@
 //! Draws [`App`] with ratatui. Layout and visual language follow DESIGN.md §4.
 
-use nixxa_contracts::{Action, ActionRequest, ApprovalMode, KnowledgeAction, Outcome, SandboxAction, SourceStatus};
+use nixxa_contracts::{
+    Action, ActionRequest, ApprovalMode, KnowledgeAction, Outcome, SandboxAction, SourceStatus, Timestamp,
+};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -9,6 +11,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
 use crate::safe;
+use crate::sessions::ago;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
@@ -77,6 +80,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     frame.render_widget(Paragraph::new(hint_line(app, theme, hints.width)), hints);
     draw_approval(frame, app, theme, if side.area() > 0 { side } else { body });
     draw_setup(frame, app, theme, body);
+    draw_sessions(frame, app, theme, body);
     draw_place(frame, app, theme, body);
     safe::scrub(frame.buffer_mut());
 }
@@ -330,6 +334,8 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         format!("↑/↓ choose · enter select · 1-{} pick{back} · ctrl-c twice quit", picker.rows().len())
     } else if let Some(keys) = setup_keys {
         keys
+    } else if app.sessions.is_some() {
+        "type to search · ↑/↓ choose · enter resume · ctrl-u clear · esc close".to_string()
     } else if app.approval().is_some() {
         match &app.notice {
             Some(notice) if app.confirming_auto(std::time::Instant::now()) => safe::line(notice),
@@ -340,12 +346,16 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     } else {
         let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
         format!(
-            "enter send · alt-enter newline · tab focus · shift-tab ask/auto · j/k move{key} · ctrl-c interrupt (twice: quit)"
+            "enter send · alt-enter newline · tab focus · shift-tab ask/auto · j/k move · ctrl-s sessions{key} · ctrl-c interrupt (twice: quit)"
         )
     };
     let auto = app.mode == ApprovalMode::Auto;
     let mode = if auto { "mode: AUTO ".to_string() } else { "mode: ask ".to_string() };
-    let urgent = app.place.is_some() || app.setup.is_some() || app.approval().is_some() || app.notice.is_some();
+    let urgent = app.place.is_some()
+        || app.setup.is_some()
+        || app.sessions.is_some()
+        || app.approval().is_some()
+        || app.notice.is_some();
     let style = if urgent { theme.pending() } else { theme.dim() };
     let room = usize::from(width).saturating_sub(mode.chars().count() + 1);
     Line::from(vec![
@@ -573,6 +583,85 @@ fn draw_place(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
 }
 
+/// The session list (`ctrl-s`), over the panes: this directory's sessions, then the others.
+fn draw_sessions(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
+    let Some(list) = app.sessions.as_ref() else { return };
+    let width = over.width.min(110);
+    let inner = usize::from(width.saturating_sub(2));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| Timestamp(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)))
+        .unwrap_or(Timestamp(0));
+    let mut head = vec![
+        Line::from(vec![
+            Span::styled("Search  ", theme.dim()),
+            Span::styled(format!("{}▌", safe::line(&list.query)), theme.accent()),
+        ]),
+        Line::default(),
+    ];
+    if list.loading() {
+        head.push(Line::styled("Loading…", theme.dim()));
+    }
+    if let Some(why) = list.list_error() {
+        head.push(Line::styled(format!("✗ {}", truncate(&safe::line(why), inner.saturating_sub(2))), theme.bad()));
+    }
+    if let Some(why) = &list.search_error {
+        let why = truncate(&safe::line(why), inner.saturating_sub(18));
+        head.push(Line::styled(format!("✗ search failed: {why}"), theme.bad()));
+    }
+    let rows = list.rows();
+    if rows.is_empty() && !list.loading() && list.list_error().is_none() {
+        let empty = if list.query.trim().is_empty() { "No sessions yet." } else { "Nothing matches." };
+        head.push(Line::styled(empty, theme.dim()));
+    }
+
+    // Each row is a line, plus its snippet; a header starts each group.
+    let mut body: Vec<Line> = Vec::new();
+    let mut selected_line = 0;
+    let mut group = None;
+    for (i, row) in rows.iter().enumerate() {
+        if group != Some(row.here) {
+            group = Some(row.here);
+            let title = if row.here { "This directory" } else { "Elsewhere" };
+            body.push(Line::styled(title, theme.dim().add_modifier(Modifier::BOLD)));
+        }
+        let chosen = i == list.selected;
+        if chosen {
+            selected_line = body.len();
+        }
+        let workspace =
+            if row.here { row.info.workspace.name.clone() } else { row.info.workspace.root.display().to_string() };
+        let first = row.info.first_message.as_deref().and_then(|t| t.lines().next()).unwrap_or("(no message)");
+        let style = if chosen { theme.accent().add_modifier(Modifier::BOLD) } else { Style::new() };
+        let mut spans = vec![
+            Span::styled(if chosen { "› " } else { "  " }, style),
+            Span::styled(format!("{:<11}", ago(now, row.info.started_at)), theme.dim()),
+            Span::styled(truncate(&safe::line(&workspace), 24), style),
+            Span::styled(format!("  {}  ", truncate(&safe::line(&row.info.account.to_string()), 24)), theme.dim()),
+        ];
+        if row.open {
+            spans.push(Span::styled("(open) ", theme.ok()));
+        }
+        let used: usize = spans.iter().map(Span::width).sum();
+        spans.push(Span::styled(truncate(&safe::line(first), inner.saturating_sub(used)), style));
+        body.push(Line::from(spans));
+        if let Some(snippet) = row.snippet {
+            let snippet = truncate(&safe::line(snippet), inner.saturating_sub(15));
+            body.push(Line::styled(format!("             {snippet}"), theme.dim()));
+        }
+    }
+
+    let height = over.height;
+    let room = usize::from(height.saturating_sub(2)).saturating_sub(head.len()).max(1);
+    // Keep the selected row (and its snippet) in view.
+    let skip = (selected_line + 2).saturating_sub(room);
+    let lines: Vec<Line> = head.into_iter().chain(body.into_iter().skip(skip).take(room)).collect();
+    let area = Rect { x: over.x + (over.width - width) / 2, y: over.y, width, height };
+    let block = Block::bordered().title(" Sessions ").border_style(theme.accent());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 /// The status line under a setup form.
 fn state_line(state: &SetupState, idle: &str, checking: &str, theme: Theme) -> Line<'static> {
     match state {
@@ -691,6 +780,38 @@ pub(crate) mod tests {
             .map(|y| (0..width).map(|x| buffer[(x, y)].symbol().to_string()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn the_session_list_groups_rows_and_shows_snippets_safely() {
+        let mut app = started();
+        app.root = std::env::temp_dir().join("proj");
+        app.handle_key(crossterm::event::KeyEvent::new(KeyCode::Char('s'), crossterm::event::KeyModifiers::CONTROL));
+        let info = |id: &str, root: std::path::PathBuf, first: &str| nixxa_contracts::SessionInfo {
+            id: SessionId::new(id),
+            workspace: nixxa_contracts::WorkspaceInfo { name: "proj".into(), root },
+            account: AccountRef::new("anthropic", "work"),
+            started_at: Timestamp(0),
+            first_message: Some(first.into()),
+        };
+        app.sessions_listed(Ok(vec![
+            info("s1", app.root.clone(), "fix \u{1b}[31mthe build\nsecond line"),
+            info("s0", std::env::temp_dir().join("elsewhere"), "write docs"),
+        ]));
+        for c in "build".chars() {
+            app.handle_key(key(KeyCode::Char(c)));
+        }
+        let hit = nixxa_contracts::SearchHit { session: SessionId::new("s0"), snippet: "the build log said".into() };
+        app.sessions_found("build", Ok(vec![hit]));
+        let text = screen(&mut app, 120, 20);
+        assert!(text.contains(" Sessions ") && text.contains("Search  build"), "{text}");
+        let here = text.find("This directory").expect("group header");
+        let away = text.find("Elsewhere").expect("group header");
+        assert!(here < away, "this directory first:\n{text}");
+        assert!(text.contains("(open)") && text.contains("fix ^[[31mthe build"), "escaped, first line only:\n{text}");
+        assert!(!text.contains("second line"));
+        assert!(text.contains("the build log said"), "snippet shown:\n{text}");
+        assert!(text.contains("enter resume"), "hints:\n{text}");
     }
 
     fn started() -> App {

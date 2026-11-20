@@ -2,10 +2,11 @@
 //!
 //! The brain is Claude ([`AnthropicBrain`]) with keys in the OS keychain
 //! ([`KeychainCredentials`]), a local or OpenRouter model, or the Stage 2 scripted brain with
-//! `--fake`. The sandbox comes from the start-up choice ([`Workplace`]); the store and knowledge
-//! are still the Stage 2 fakes.
+//! `--fake`. The sandbox comes from the start-up choice ([`Workplace`]); the store is
+//! [`SqliteStore`] (or [`MemoryStore`] with `--fake`, or when the database can't be opened);
+//! knowledge is still the Stage 2 fake.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nixxa_accounts::{EnvKey, KeychainConfig, KeychainCredentials};
@@ -13,14 +14,14 @@ use nixxa_brain::fake::ScriptedBrain;
 use nixxa_brain::{AnthropicBrain, AnthropicConfig, ModelInfo, OpenAiCompatBrain, OpenAiCompatConfig};
 use nixxa_contracts::{
     AccountInfo, AccountRef, Brain, BrainError, Credential, Credentials, CredentialsError, ProviderId, Secret,
-    WorkspaceInfo,
+    SessionId, Store, StoreError, WorkspaceInfo,
 };
 use nixxa_controller::{Controller, ControllerConfig};
+use nixxa_db::SqliteStore;
 use nixxa_db::memory::MemoryStore;
 use nixxa_knowledge::fake::FakeKnowledge;
-use tokio::sync::mpsc;
 
-use crate::ports::{AutoApprove, ChannelSink, TuiApprovals, UiEvent};
+use crate::ports::{ChannelSink, TuiApprovals, UiLink};
 use crate::settings::Settings;
 use crate::workplace::Workplace;
 
@@ -40,23 +41,58 @@ pub(crate) fn scripted() -> (Arc<dyn Brain>, AccountRef) {
     (Arc::new(ScriptedBrain), AccountRef::new("scripted", "default"))
 }
 
-/// A controller for `brain` and `account` working in `workplace`, with the Stage 2 store and
-/// knowledge, reporting to the UI through `ui`.
+/// The store sessions are kept in, and a note for the conversation when history is off.
+///
+/// * `--fake`: [`MemoryStore`], so the demo never writes the user's history.
+/// * Otherwise [`SqliteStore`] at `path` (`<data dir>/nixxa/nixxa.db`). If there is no data
+///   directory or the database can't be opened, [`MemoryStore`] with a note saying why and that
+///   history is off. This is the one fallback Nixxa makes (D-058): losing history must not stop
+///   the user from working, and the note keeps it visible.
+pub(crate) async fn store(fake: bool, path: Option<PathBuf>) -> (Arc<dyn Store>, Option<String>) {
+    if fake {
+        return (Arc::new(MemoryStore::default()), None);
+    }
+    let Some(path) = path else {
+        tracing::warn!("no data directory: history is off");
+        let note = "History is off: no data directory was found, so this session won't be saved.";
+        return (Arc::new(MemoryStore::default()), Some(note.into()));
+    };
+    match SqliteStore::open(&path).await {
+        Ok(store) => {
+            tracing::info!(path = %path.display(), "history database open");
+            (Arc::new(store), None)
+        }
+        Err(err) => {
+            tracing::warn!("the history database can't be opened: history is off");
+            let note = format!("History is off: {err}. This session won't be saved.");
+            (Arc::new(MemoryStore::default()), Some(note))
+        }
+    }
+}
+
+/// The newest session started in `root`, if any (`--continue`).
+pub(crate) async fn latest_session(store: &dyn Store, root: &Path) -> Result<Option<SessionId>, StoreError> {
+    let sessions = store.list_sessions().await?;
+    Ok(sessions.into_iter().find(|s| s.workspace.root == root).map(|s| s.id))
+}
+
+/// A controller for `brain` and `account` working in `workplace`, recording to `store`, with the
+/// Stage 2 knowledge, reporting to the UI through `ui`.
 pub(crate) fn controller(
     brain: Arc<dyn Brain>,
     account: AccountRef,
     workspace: WorkspaceInfo,
     workplace: &Workplace,
-    ui: mpsc::UnboundedSender<UiEvent>,
-    auto: AutoApprove,
+    store: Arc<dyn Store>,
+    ui: &UiLink,
 ) -> Controller {
     Controller::new(
         brain,
         workplace.sandbox.clone(),
-        Arc::new(MemoryStore::default()),
+        store,
         Arc::new(FakeKnowledge),
-        Arc::new(TuiApprovals::new(ui.clone(), auto)),
-        Arc::new(ChannelSink::new(ui)),
+        Arc::new(TuiApprovals::new(ui.tx.clone(), ui.auto.clone())),
+        Arc::new(ChannelSink::new(ui.tx.clone(), ui.generation.clone())),
         ControllerConfig::new(workspace, account, workplace.instructions()),
     )
 }
@@ -327,6 +363,8 @@ pub(crate) mod tests {
     use crate::app::tests::key;
     use crate::app::{ActivityState, App, Effect, Speaker};
     use crate::place::Place;
+    use crate::ports::{AutoApprove, UiEvent};
+    use tokio::sync::mpsc;
 
     /// The sandbox workplace (the in-memory fake).
     fn sandboxed() -> Workplace {
@@ -384,7 +422,9 @@ pub(crate) mod tests {
                 UiEvent::AccountSaved(_)
                 | UiEvent::ModelsListed(_)
                 | UiEvent::SignInStarted(_)
-                | UiEvent::SignedIn(_) => panic!("no setup in this test"),
+                | UiEvent::SignedIn(_)
+                | UiEvent::SessionsListed(_)
+                | UiEvent::SessionsFound { .. } => panic!("no setup or session list in this test"),
             }
         }
     }
@@ -408,8 +448,8 @@ pub(crate) mod tests {
             account,
             workspace(&std::env::temp_dir().join("nixxa-e2e")),
             &sandboxed(),
-            ui_tx,
-            AutoApprove::default(),
+            Arc::new(MemoryStore::default()),
+            &UiLink::new(ui_tx, AutoApprove::default()),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
@@ -433,6 +473,296 @@ pub(crate) mod tests {
         task.await.unwrap();
     }
 
+    /// The scripted brain, remembering every context it is given.
+    #[derive(Default)]
+    struct Recording {
+        contexts: std::sync::Mutex<Vec<nixxa_contracts::Context>>,
+    }
+
+    impl Recording {
+        fn seen(&self) -> Vec<nixxa_contracts::Context> {
+            self.contexts.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Brain for Recording {
+        fn describe(&self) -> nixxa_contracts::BrainInfo {
+            ScriptedBrain.describe()
+        }
+
+        async fn think(&self, context: nixxa_contracts::Context) -> Result<nixxa_contracts::BrainStream, BrainError> {
+            self.contexts.lock().unwrap().push(context.clone());
+            ScriptedBrain.think(context).await
+        }
+    }
+
+    /// A folder for one test's database and project, removed when dropped.
+    struct Scratch(PathBuf);
+
+    impl Scratch {
+        fn new(name: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("nixxa-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(dir.join("project")).unwrap();
+            Self(dir)
+        }
+
+        fn db(&self) -> PathBuf {
+            self.0.join("data").join("nixxa").join("nixxa.db")
+        }
+
+        fn workspace(&self) -> WorkspaceInfo {
+            workspace(&self.0.join("project"))
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// One run of Nixxa against `store`: a controller (new or resumed) and a fresh screen.
+    struct Run {
+        app: App,
+        ui: mpsc::UnboundedReceiver<UiEvent>,
+        commands: mpsc::Sender<Command>,
+        task: tokio::task::JoinHandle<()>,
+        brain: Arc<Recording>,
+    }
+
+    impl Run {
+        async fn start(store: Arc<dyn Store>, workspace: WorkspaceInfo, resume: Option<&SessionId>) -> Self {
+            let (ui_tx, ui) = mpsc::unbounded_channel();
+            let brain = Arc::new(Recording::default());
+            let link = UiLink::new(ui_tx, AutoApprove::default());
+            let (_, account) = scripted();
+            let mut controller = controller(brain.clone(), account, workspace, &sandboxed(), store, &link);
+            match resume {
+                Some(id) => controller.resume_session(id).await.expect("resumes"),
+                None => controller.start_session().await.expect("starts"),
+            };
+            let (commands, rx) = mpsc::channel(8);
+            let task = tokio::spawn(async move { controller.run(rx).await });
+            Self { app: App::new(false), ui, commands, task, brain }
+        }
+
+        /// Applies events until `stop` matches one (approval prompts are queued, not answered).
+        async fn until(&mut self, stop: impl Fn(&UiEvent) -> bool) {
+            loop {
+                let event = timeout(Duration::from_secs(5), self.ui.recv()).await.expect("no stall").expect("open");
+                let done = stop(&event);
+                match event {
+                    UiEvent::Controller(event) => self.app.apply(event),
+                    UiEvent::Approval(prompt) => self.app.ask(prompt),
+                    _ => {}
+                }
+                if done {
+                    return;
+                }
+            }
+        }
+
+        /// Presses a key and does what the TUI loop does with its effects.
+        async fn press(&mut self, key: crossterm::event::KeyEvent) {
+            for effect in self.app.handle_key(key) {
+                match effect {
+                    Effect::Send(command) => self.commands.send(command).await.unwrap(),
+                    Effect::Quit => {
+                        self.commands.send(Command::Shutdown).await.unwrap();
+                        timeout(Duration::from_secs(5), &mut self.task).await.expect("ends in time").unwrap();
+                        // What the session said while it wound down (the screen is gone in the
+                        // real app, but it is all in the database).
+                        while let Ok(UiEvent::Controller(event)) = self.ui.try_recv() {
+                            self.app.apply(event);
+                        }
+                    }
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
+        }
+
+        fn said(&self) -> Vec<(Speaker, String)> {
+            self.app.conversation.iter().map(|e| (e.speaker, e.text.clone())).collect()
+        }
+
+        fn activity(&self) -> Vec<(ActivityState, &'static str)> {
+            self.app.activity.iter().map(|a| (a.state, ui_kind(a))).collect()
+        }
+    }
+
+    fn ctrl_c() -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char('c'), crossterm::event::KeyModifiers::CONTROL)
+    }
+
+    fn is_resumed_notice(event: &UiEvent) -> bool {
+        matches!(event, UiEvent::Controller(nixxa_contracts::Event::Message { message, .. })
+            if message.role == nixxa_contracts::Role::System
+                && matches!(&message.content, nixxa_contracts::Content::Text { text } if text.contains("resumed")))
+    }
+
+    /// Stage 5 exit criterion: quit mid-session (ctrl-c twice during a turn), relaunch on the
+    /// same database file, resume, and everything is back: the conversation, the activity pane
+    /// and the brain's history. New messages go to the same session.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_five_quit_mid_turn_relaunch_and_resume_where_you_left_off() {
+        let scratch = Scratch::new("e2e5");
+        let (store_one, history_off) = store(false, Some(scratch.db())).await;
+        assert!(history_off.is_none(), "{history_off:?}");
+        let mut first = Run::start(store_one.clone(), scratch.workspace(), None).await;
+        let commands = first.commands.clone();
+        drive(&mut first.app, &mut first.ui, &commands, "hello").await;
+        for c in "list it again".chars() {
+            first.press(key(KeyCode::Char(c))).await;
+        }
+        first.press(key(KeyCode::Enter)).await;
+        first.until(|e| matches!(e, UiEvent::Approval(_))).await;
+        first.press(ctrl_c()).await; // interrupts the turn
+        first.press(ctrl_c()).await; // and quits
+        let before = (first.said(), first.activity());
+        drop(first);
+        drop(store_one);
+
+        // Relaunch: a new store on the same file.
+        let (store_two, _) = store(false, Some(scratch.db())).await;
+        let id = latest_session(&*store_two, &scratch.workspace().root).await.unwrap().expect("a session to continue");
+        let mut second = Run::start(store_two.clone(), scratch.workspace(), Some(&id)).await;
+        second.until(is_resumed_notice).await;
+
+        let mut said = second.said();
+        let notice = said.pop().expect("the resumed notice");
+        assert_eq!(notice.0, Speaker::System);
+        assert!(notice.1.contains("workspace may have changed"), "{notice:?}");
+        assert_eq!(said, before.0, "the conversation is back as it was");
+        assert_eq!(
+            said.iter().map(|(who, text)| (*who, text.as_str())).collect::<Vec<_>>(),
+            vec![
+                (Speaker::User, "hello"),
+                (Speaker::Agent, "I looked into that."),
+                (Speaker::Agent, "The command finished."),
+                (Speaker::User, "list it again"),
+                (Speaker::System, "interrupted by the user"),
+            ]
+        );
+        assert_eq!(second.activity(), before.1, "the activity pane is back as it was");
+        assert_eq!(
+            second.activity(),
+            vec![(ActivityState::Done, "notes"), (ActivityState::Done, "exec"), (ActivityState::Denied, "notes")]
+        );
+        assert!(!second.app.busy, "no turn runs on resume");
+
+        // The next message continues the same session, with the whole history behind it.
+        let commands = second.commands.clone();
+        let prompts = drive(&mut second.app, &mut second.ui, &commands, "and now?").await;
+        assert_eq!(prompts, 2);
+        let history = &second.brain.seen()[0].messages;
+        let texts: Vec<_> = history
+            .iter()
+            .filter_map(|m| match &m.content {
+                nixxa_contracts::Content::Text { text } => Some((m.role, text.as_str())),
+                _ => None,
+            })
+            .collect();
+        use nixxa_contracts::Role;
+        assert_eq!(
+            texts,
+            vec![
+                (Role::User, "hello"),
+                (Role::Agent, "I looked into that."),
+                (Role::Agent, "The command finished."),
+                (Role::User, "list it again"),
+                (Role::System, "interrupted by the user"),
+                (Role::System, notice.1.as_str()),
+                (Role::User, "and now?"),
+            ],
+            "the brain gets the history back"
+        );
+        assert!(
+            !history.iter().any(|m| matches!(m.content, nixxa_contracts::Content::Summary { .. })),
+            "never a Done summary (D-029)"
+        );
+        let sessions = store_two.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1, "no new session");
+        assert_eq!(sessions[0].first_message.as_deref(), Some("hello"));
+        let stored = store_two.load_session(&id).await.unwrap();
+        let appended = stored.messages.iter().any(|m| {
+            m.role == Role::User && matches!(&m.content, nixxa_contracts::Content::Text { text } if text == "and now?")
+        });
+        assert!(appended, "appended to the same session");
+        assert_eq!(stored.actions.len(), 5, "three before the quit, two after");
+        second.commands.send(Command::Shutdown).await.unwrap();
+        second.task.await.unwrap();
+    }
+
+    /// Nixxa crashed while an approval was open: the action has no result in the file. Resuming
+    /// closes it, the activity pane shows it failed, and the brain gets a result for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_mid_approval_is_closed_on_resume() {
+        let scratch = Scratch::new("e2e5-crash");
+        let (store_one, _) = store(false, Some(scratch.db())).await;
+        let mut first = Run::start(store_one.clone(), scratch.workspace(), None).await;
+        for c in "hello".chars() {
+            first.press(key(KeyCode::Char(c))).await;
+        }
+        first.press(key(KeyCode::Enter)).await;
+        first.until(|e| matches!(e, UiEvent::Approval(_))).await;
+        first.task.abort(); // the process died
+        let _ = (&mut first.task).await;
+        drop(first);
+        drop(store_one);
+
+        let (store_two, _) = store(false, Some(scratch.db())).await;
+        let id = latest_session(&*store_two, &scratch.workspace().root).await.unwrap().unwrap();
+        let mut second = Run::start(store_two, scratch.workspace(), Some(&id)).await;
+        second.until(is_resumed_notice).await;
+        assert_eq!(second.activity(), vec![(ActivityState::Failed, "notes")]);
+        let failed = second.app.activity[0].observation.clone().unwrap();
+        assert!(
+            matches!(&failed.outcome, nixxa_contracts::Outcome::Failed { message } if message.contains("Nixxa quit")),
+            "{failed:?}"
+        );
+        let commands = second.commands.clone();
+        drive(&mut second.app, &mut second.ui, &commands, "again").await;
+        let history = &second.brain.seen()[0].messages;
+        let proposal =
+            history.iter().position(|m| matches!(m.content, nixxa_contracts::Content::Action { .. })).unwrap();
+        assert!(
+            matches!(&history[proposal + 1].content, nixxa_contracts::Content::Observation { observation } if observation.outcome == failed.outcome),
+            "the dangling call is answered right after it"
+        );
+        second.commands.send(Command::Shutdown).await.unwrap();
+        second.task.await.unwrap();
+    }
+
+    /// A database that can't be opened turns history off, says why, and Nixxa carries on.
+    #[tokio::test]
+    async fn an_unopenable_database_turns_history_off_visibly() {
+        let scratch = Scratch::new("e2e5-corrupt");
+        std::fs::create_dir_all(scratch.db().parent().unwrap()).unwrap();
+        std::fs::write(scratch.db(), vec![7u8; 4096]).unwrap();
+        let (store, note) = store(false, Some(scratch.db())).await;
+        let note = note.expect("a note");
+        assert!(note.starts_with("History is off:") && note.contains("nixxa.db"), "{note}");
+        assert!(
+            store
+                .create_session(nixxa_contracts::NewSession {
+                    workspace: scratch.workspace(),
+                    account: scripted().1,
+                    started_at: nixxa_contracts::Timestamp(0),
+                })
+                .await
+                .is_ok(),
+            "the in-memory store works"
+        );
+        let (_, none) = super::store(false, None).await;
+        assert!(none.unwrap().contains("no data directory"));
+        let (fake, quiet) = super::store(true, Some(scratch.db())).await;
+        assert!(quiet.is_none());
+        assert!(fake.list_sessions().await.unwrap().is_empty(), "--fake never reads the history");
+        assert_eq!(std::fs::read(scratch.db()).unwrap(), vec![7u8; 4096], "the file is left alone");
+    }
+
     /// Working in this directory: the same scripted turn runs its command in a real shell in the
     /// workspace, and the status says it isn't isolated.
     #[tokio::test]
@@ -444,7 +774,14 @@ pub(crate) mod tests {
         let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
         let (cmd_tx, cmd_rx) = mpsc::channel(8);
         let (brain, account) = scripted();
-        let mut controller = controller(brain, account, workspace, &here, ui_tx, AutoApprove::default());
+        let mut controller = controller(
+            brain,
+            account,
+            workspace,
+            &here,
+            Arc::new(MemoryStore::default()),
+            &UiLink::new(ui_tx, AutoApprove::default()),
+        );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
 
@@ -482,8 +819,8 @@ pub(crate) mod tests {
             default,
             workspace(&std::env::temp_dir().join("nixxa-e2e3")),
             &sandboxed(),
-            ui_tx,
-            AutoApprove::default(),
+            Arc::new(MemoryStore::default()),
+            &UiLink::new(ui_tx, AutoApprove::default()),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
@@ -635,8 +972,8 @@ pub(crate) mod tests {
             account.clone(),
             workspace(&std::env::temp_dir().join("nixxa-e2e-local")),
             &sandboxed(),
-            ui_tx,
-            AutoApprove::default(),
+            Arc::new(MemoryStore::default()),
+            &UiLink::new(ui_tx, AutoApprove::default()),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
