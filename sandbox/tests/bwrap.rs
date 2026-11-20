@@ -16,6 +16,7 @@ use nixxa_sandbox::bwrap::{BwrapConfig, BwrapSandbox};
 async fn it_describes_itself_as_isolated() {
     let scratch = Scratch::new("caps");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    sb.health().await.unwrap();
     let caps = sb.capabilities();
     eprintln!("backend: {} (cgroup scope: {})", caps.backend, sb.has_cgroup());
     assert!(caps.backend.starts_with("bubblewrap"), "{}", caps.backend);

@@ -199,8 +199,8 @@ impl BwrapSandbox {
                 config,
                 conn: Mutex::new(None),
                 in_flight: StdMutex::new(None),
-                landlock: AtomicBool::new(true),
-                seccomp: AtomicBool::new(true),
+                landlock: AtomicBool::new(false),
+                seccomp: AtomicBool::new(false),
             }),
         })
     }
@@ -307,8 +307,7 @@ impl Inner {
             args.extend(["--ro-bind-try".into(), path.clone(), path]);
         }
         args.extend(
-            ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/landlock-probe", "--bind"]
-                .map(str::to_owned),
+            ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind"].map(str::to_owned),
         );
         args.extend([host_str(&self.workspace), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
         args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into(), DAEMON_INSIDE.into()]);
@@ -523,6 +522,9 @@ impl Sandbox for BwrapSandbox {
         };
         if !landlock {
             backend.push_str(" (no Landlock)");
+        }
+        if !seccomp {
+            backend.push_str(" (no seccomp)");
         }
         SandboxCapabilities {
             backend,

@@ -30,8 +30,8 @@ fn apply_inner() -> Result<bool, RulesetError> {
     let rw_files = ["/dev/null", "/dev/zero", "/dev/urandom", "/dev/tty"];
     created = created.add_rules(path_beneath_rules(&rw_files, AccessFs::from_all(abi)))?;
 
-    // Full access to the workspace and /tmp.
-    let full = ["/workspace", "/tmp"];
+    // Full access to the workspace, /tmp and /dev/shm.
+    let full = ["/workspace", "/tmp", "/dev/shm"];
     created = created.add_rules(path_beneath_rules(&full, AccessFs::from_all(abi)))?;
 
     let status = created.restrict_self()?;

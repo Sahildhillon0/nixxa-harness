@@ -110,9 +110,9 @@ mod daemon {
         };
         // Apply the isolation layers before answering the handshake, so every
         // command inherits them. no_new_privs first.
-        let _ = rustix::thread::set_no_new_privs(true);
+        let nnp_ok = rustix::thread::set_no_new_privs(true).is_ok();
         let landlock_ok = crate::landlock::apply();
-        let seccomp_ok = crate::seccomp::apply();
+        let seccomp_ok = nnp_ok && crate::seccomp::apply();
         log(format_args!("layers: landlock={landlock_ok} seccomp={seccomp_ok}"));
         let layers = crate::protocol::ActiveLayers { landlock: landlock_ok, seccomp: seccomp_ok };
         if write_frame(&mut out, &FromDaemon::Hello { version: VERSION, layers }).await.is_err() {

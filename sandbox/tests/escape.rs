@@ -430,8 +430,9 @@ async fn ptrace_is_blocked() {
 async fn keyctl_is_blocked() {
     let scratch = Scratch::new("keyctl");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
-    let (code, _, _) = sh(&sb, "keyctl add user nixxa test @u").await;
-    assert_ne!(code, Some(0), "keyctl succeeded inside the sandbox");
+    // SYS_add_key on x86_64 = 248.
+    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall(248, 0, b\"user\", b\"nixxa\", b\"test\", 4), ctypes.get_errno())'").await;
+    assert!(out.trim_end().ends_with(" 1"), "keyctl got through: {out}");
 }
 
 #[tokio::test]
@@ -442,6 +443,8 @@ async fn unshare_is_blocked() {
         let (code, _, _) = sh(&sb, cmd).await;
         assert_ne!(code, Some(0), "{cmd} succeeded inside the sandbox");
     }
+    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall(272, 0x10000000), ctypes.get_errno())'").await;
+    assert!(out.trim_end().ends_with(" 1"), "unshare syscall got through: {out}");
 }
 
 #[tokio::test]
@@ -456,8 +459,8 @@ async fn mount_is_blocked() {
 async fn tiocsti_is_blocked() {
     let scratch = Scratch::new("tiocsti");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
-    let (code, _, _) = sh(&sb, "python3 -c 'import fcntl; f=open(\"/dev/tty\"); fcntl.ioctl(f, 0x5412, b\"x\")'").await;
-    assert_ne!(code, Some(0), "TIOCSTI succeeded inside the sandbox");
+    let out = sh_out(&sb, "python3 -c 'import ctypes, os; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.ioctl(1, 0x5412, b\"x\"), ctypes.get_errno())'").await;
+    assert!(out.trim_end().ends_with(" 1"), "TIOCSTI got through: {out}");
 }
 
 #[tokio::test]
@@ -488,6 +491,6 @@ async fn personality_is_blocked() {
 async fn landlock_denies_writes_to_read_only_paths() {
     let scratch = Scratch::new("landlock");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
-    let (code, _, _) = sh(&sb, "echo x > /landlock-probe/landlock-test").await;
+    let (code, _, _) = sh(&sb, "echo x > /dev/probe").await;
     assert_ne!(code, Some(0), "writing under /usr succeeded (Landlock inactive?)");
 }
