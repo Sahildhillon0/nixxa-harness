@@ -34,9 +34,9 @@ const QUIT_MID_ACTION: &str =
     "not finished: Nixxa quit before this action finished, so it may not have run, or may have run only in part";
 /// What the agent (and the user) are told when a stored session is resumed (D-057). The place
 /// the agent works isn't stored: it is chosen again at every launch.
-const RESUMED: &str = "This session was resumed in a new run of Nixxa. The workspace may have changed since it was \
-     recorded (files edited, a different sandbox or a fresh copy), so check it again before relying on what the \
-     history says about it.";
+const RESUMED: &str = "This session was resumed. The workspace may have changed since it was recorded (files \
+     edited, another place to work in, or a fresh copy), so check it again before relying on what the history says \
+     about it.";
 
 /// A command the harness sends to the controller's loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
