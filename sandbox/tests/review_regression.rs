@@ -1,3 +1,5 @@
+#![cfg(target_os = "linux")]
+
 mod common;
 use common::*;
 use nixxa_contracts::{Outcome, Sandbox, SandboxAction};
