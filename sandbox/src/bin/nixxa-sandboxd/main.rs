@@ -33,7 +33,10 @@ fn main() {
     }
     // Keep the daemon's /proc entry out of reach of the commands it runs: they share a user and
     // a PID namespace, so without this any command could open /proc/2/fd/{0,1} and forge frames.
-    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
+    if rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).is_err() {
+        eprintln!("nixxa-sandboxd: cannot set the dumpable flag");
+        std::process::exit(1);
+    }
     let code = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt.block_on(daemon::serve()),
         Err(err) => {

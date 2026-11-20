@@ -75,8 +75,8 @@ pub struct BwrapConfig {
     /// The largest file `ReadFile` returns, and the largest content `WriteFile` accepts.
     ///
     /// This must stay comfortably below `MAX_FRAME` (8 MiB): the file content is JSON-encoded
-    /// and wrapped in a frame, so worst-case escaping can roughly double it. The default of
-    /// 1 MiB leaves ample headroom.
+    /// and wrapped in a frame, and worst-case escaping can expand it by up to about 6×, so the
+    /// safe ceiling is roughly 1.3 MiB. The default of 1 MiB leaves ample headroom.
     pub file_cap: u64,
     /// `MemoryMax` of the scope (the whole sandbox), in bytes.
     pub memory_max: u64,
@@ -364,7 +364,8 @@ impl Inner {
     /// The live connection, started (or restarted) if needed.
     async fn connect<'a>(&self, slot: &'a mut Option<Conn>) -> Result<&'a mut Conn, SandboxError> {
         if let Some(conn) = slot {
-            if !matches!(conn.child.try_wait(), Ok(None)) {
+            // A connection that is mid-write, or whose child has exited, can't be reused.
+            if conn.sending || !matches!(conn.child.try_wait(), Ok(None)) {
                 *slot = None;
             }
         }
