@@ -53,7 +53,13 @@ pub(crate) fn read(root: &OwnedFd, path: &str, cap: u64) -> Outcome {
         Ok(rel) => rel,
         Err(why) => return failed(why),
     };
-    let fd = match rustix::fs::openat2(root, rel.as_str(), OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty(), BENEATH) {
+    let fd = match rustix::fs::openat2(
+        root,
+        rel.as_str(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+        Mode::empty(),
+        BENEATH,
+    ) {
         Ok(fd) => fd,
         Err(err) => return failed(errno_words(err)),
     };

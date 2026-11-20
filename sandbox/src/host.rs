@@ -310,6 +310,7 @@ mod tests {
         sandbox.execute(ActionId::new("t"), action).await.expect("execute").outcome
     }
 
+    #[cfg(unix)]
     fn exec(command: &str) -> SandboxAction {
         SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(10_000) }
     }

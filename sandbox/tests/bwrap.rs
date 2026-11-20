@@ -139,7 +139,7 @@ async fn rlimits_apply_to_commands() {
     let config = common::config(&scratch.workspace());
     let (pids, files) = (config.pids_max, config.open_files_max);
     let Some(sb) = common::sandbox_with(config) else { return };
-    let out = sh_out(&sb, "ulimit -u; ulimit -n").await;
+    let out = sh_out(&sb, "bash -c 'ulimit -u; ulimit -n'").await;
     assert_eq!(out, format!("{pids}\n{files}\n"));
     let (code, _, _) = sh(&sb, &format!("ulimit -n {}", files + 1)).await;
     assert_ne!(code, Some(0), "a command must not raise its own limits");
