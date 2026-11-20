@@ -505,7 +505,7 @@ Every stage ends with something that runs and a checklist that must be true befo
   reports the active layers (VERSION 2) and `BwrapSandbox::capabilities().isolated` is true only
   when namespaces, Landlock and seccomp are all active (D-044–D-046). Escape tests now cover
   ptrace, keyctl, unshare, mount, TIOCSTI, io_uring, AF_NETLINK and a Landlock read-only path.
-- **PR C (next):** wire `BwrapSandbox` into the harness and add the workspace guard.
+- **PR C (done):** `BwrapSandbox` is wired into the start-up choice, the workspace guard and Ask/Auto approval mode are in place, and Stage 4 exit criteria are met.
 - `nixxa-sandboxd` out of process, bubblewrap + Landlock + seccomp, network off, workspace
   mounted read-write, resource limits. Built-in actions: exec, read, write, list.
 - **Exit:** the agent runs real commands that provably cannot touch the host outside the
