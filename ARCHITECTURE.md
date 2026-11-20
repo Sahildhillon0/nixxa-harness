@@ -498,10 +498,14 @@ Every stage ends with something that runs and a checklist that must be true befo
   survives a restart without ever being written to a plain-text file.
 
 ### Stage 4 — Real sandbox (Linux) *(in progress)*
-- **PR A (this step):** the daemon, its framed protocol and the `BwrapSandbox` client with
+- **PR A (done):** the daemon, its framed protocol and the `BwrapSandbox` client with
   namespace isolation, rlimits and a cgroup scope (D-040–D-043), plus escape tests that try to
-  get out. Not wired into the harness, and `isolated: false` until Landlock and seccomp land
-  (PR B). The harness wiring and workspace guard follow (PR C).
+  get out. Not wired into the harness. `isolated: false` until Landlock and seccomp landed.
+- **PR B (done):** Landlock and seccomp are applied by the daemon at start-up; the protocol
+  reports the active layers (VERSION 2) and `BwrapSandbox::capabilities().isolated` is true only
+  when namespaces, Landlock and seccomp are all active (D-044–D-046). Escape tests now cover
+  ptrace, keyctl, unshare, mount, TIOCSTI, io_uring, AF_NETLINK and a Landlock read-only path.
+- **PR C (next):** wire `BwrapSandbox` into the harness and add the workspace guard.
 - `nixxa-sandboxd` out of process, bubblewrap + Landlock + seccomp, network off, workspace
   mounted read-write, resource limits. Built-in actions: exec, read, write, list.
 - **Exit:** the agent runs real commands that provably cannot touch the host outside the
