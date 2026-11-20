@@ -5,9 +5,13 @@ use nixxa_brain::Effort;
 use nixxa_contracts::Secret;
 
 pub(crate) const USAGE: &str = "\
-Usage: nixxa [--fake]
+Usage: nixxa [--continue] [--fake]
 
-  --fake       Use the scripted Stage 2 brain: no API key, no network.
+  --continue   Resume the latest conversation started in this directory (a new one if there
+               is none).
+               ctrl-s lists every session.
+  --fake       Use the scripted Stage 2 brain: no API key, no network. Nothing is saved to
+               your history.
   -h, --help   Show this help.
   -V, --version
 
@@ -23,6 +27,8 @@ Environment:
 pub(crate) struct Settings {
     /// Use the scripted brain instead of a real model.
     pub(crate) fake: bool,
+    /// Resume the latest session for the current directory (`--continue`).
+    pub(crate) resume_latest: bool,
     /// Model override.
     pub(crate) model: Option<String>,
     /// Effort override.
@@ -48,6 +54,7 @@ pub(crate) fn parse(
     for arg in args {
         match arg.as_str() {
             "--fake" => settings.fake = true,
+            "--continue" | "-c" => settings.resume_latest = true,
             "-h" | "--help" => return Ok(Parsed::Help),
             "-V" | "--version" => return Ok(Parsed::Version),
             other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
@@ -87,6 +94,7 @@ mod tests {
     #[test]
     fn defaults_are_the_real_brain_with_no_overrides() {
         let settings = run(&[], &[]).unwrap();
+        assert!(!settings.resume_latest);
         assert!(!settings.fake && settings.model.is_none() && settings.effort.is_none() && settings.env_key.is_none());
     }
 
@@ -96,6 +104,14 @@ mod tests {
         assert!(settings.fake);
         assert_eq!(settings.env_key.unwrap().expose(), "sk-ant-abc-1234");
         assert!(settings.model.is_none());
+    }
+
+    #[test]
+    fn continue_asks_to_resume_the_latest_session() {
+        assert!(run(&["--continue"], &[]).unwrap().resume_latest);
+        let both = run(&["-c", "--fake"], &[]).unwrap();
+        assert!(both.resume_latest && both.fake);
+        assert!(USAGE.contains("--continue"), "--help lists it");
     }
 
     #[test]

@@ -59,7 +59,8 @@ pub(crate) fn messages(system: &str, conversation: &[Message], trimmed: bool) ->
                 let content = if is_error { format!("Error: {content}") } else { content };
                 turns.push(Turn::Tool { id: observation.action_id.as_str().to_string(), content });
             }
-            (_, Content::Reasoning { .. }) => {}
+            // Never part of the model's message (D-029).
+            (_, Content::Reasoning { .. } | Content::Summary { .. }) => {}
         }
     }
     let mut out = vec![json!({ "role": "system", "content": system })];
@@ -158,6 +159,14 @@ mod tests {
             reason: None,
         };
         Message { role: Role::Agent, content: Content::Action { request }, at: T }
+    }
+
+    #[test]
+    fn a_summary_is_never_sent() {
+        let summary = Message { role: Role::Agent, content: Content::Summary { text: "did it".into() }, at: T };
+        let with = messages("sys", &[user_msg("hi"), agent("hello"), summary], false);
+        assert_eq!(with, messages("sys", &[user_msg("hi"), agent("hello")], false));
+        assert!(!serde_json::to_string(&with).unwrap().contains("did it"));
     }
 
     fn observation(id: &str, outcome: Outcome) -> Message {

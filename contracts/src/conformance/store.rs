@@ -17,6 +17,8 @@ pub async fn run<S: Store, F: Fn() -> S>(fresh: F) {
     unknown_session_is_not_found(&fresh()).await;
     list_is_newest_first(&fresh()).await;
     search_finds_text(&fresh()).await;
+    summaries_keep_their_marker(&fresh()).await;
+    first_message_is_the_first_user_text(&fresh()).await;
 }
 
 async fn create_then_load(store: &dyn Store) {
@@ -24,6 +26,7 @@ async fn create_then_load(store: &dyn Store) {
     assert_eq!(info.workspace, workspace());
     assert_eq!(info.account, account());
     assert_eq!(info.started_at, T0);
+    assert_eq!(info.first_message, None, "no user message yet");
     let record = store.load_session(&info.id).await.expect("load_session");
     assert_eq!(record.info, info);
     assert!(record.messages.is_empty() && record.actions.is_empty());
@@ -72,4 +75,30 @@ async fn search_finds_text(store: &dyn Store) {
     let hits = store.search("needle").await.unwrap();
     assert!(hits.iter().any(|h| h.session == s), "case-insensitive search must find the message");
     assert!(store.search("zz-absent-term-zz").await.unwrap().is_empty());
+}
+
+/// D-029: a `Done` summary must come back as a summary, never as agent text, so a resumed
+/// session can keep it away from the brain.
+async fn summaries_keep_their_marker(store: &dyn Store) {
+    let s = store.create_session(new_session(T0)).await.unwrap().id;
+    let said = Message::text(Role::Agent, "all done", Timestamp(1));
+    let summary =
+        Message { role: Role::Agent, content: Content::Summary { text: "ran the tests".into() }, at: Timestamp(2) };
+    store.append_message(&s, said.clone()).await.unwrap();
+    store.append_message(&s, summary.clone()).await.unwrap();
+    let loaded = store.load_session(&s).await.unwrap();
+    assert_eq!(loaded.messages, vec![said, summary], "a summary must keep its marker (D-029)");
+}
+
+/// `first_message` is the first user text, whatever comes before or after it.
+async fn first_message_is_the_first_user_text(store: &dyn Store) {
+    let s = store.create_session(new_session(T0)).await.unwrap().id;
+    store.append_message(&s, Message::text(Role::System, "a note", Timestamp(1))).await.unwrap();
+    store.append_message(&s, Message::text(Role::Agent, "hello", Timestamp(2))).await.unwrap();
+    store.append_message(&s, Message::text(Role::User, "fix the build", Timestamp(3))).await.unwrap();
+    store.append_message(&s, Message::text(Role::User, "and the tests", Timestamp(4))).await.unwrap();
+    let first = Some("fix the build".to_string());
+    assert_eq!(store.load_session(&s).await.unwrap().info.first_message, first, "first user text");
+    let listed = store.list_sessions().await.unwrap().into_iter().find(|i| i.id == s).expect("listed");
+    assert_eq!(listed.first_message, first, "list_sessions carries the first user text");
 }

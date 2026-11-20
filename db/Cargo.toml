@@ -11,8 +11,11 @@ workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 nixxa-contracts = { workspace = true }
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 nixxa-contracts = { workspace = true, features = ["conformance"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

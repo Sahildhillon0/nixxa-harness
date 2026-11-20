@@ -1,8 +1,8 @@
 //! # nixxa
 //!
-//! The harness: the TUI and the composition root. Stage 3 runs Claude with keys in the OS
-//! keychain (or `--fake` for the scripted Stage 2 brain); the sandbox, store and knowledge are
-//! still fakes. See ARCHITECTURE.md § Stages.
+//! The harness: the TUI and the composition root. Claude, local or OpenRouter models with keys
+//! in the OS keychain (or `--fake` for the scripted Stage 2 brain), the sandbox chosen at start-up,
+//! and sessions kept in SQLite; knowledge is still a fake. See ARCHITECTURE.md § Stages.
 
 mod app;
 mod browser;
@@ -13,6 +13,7 @@ mod paths;
 mod place;
 mod ports;
 mod safe;
+mod sessions;
 mod settings;
 mod setup;
 mod tui;

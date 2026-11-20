@@ -30,6 +30,11 @@ pub(crate) fn log_dir() -> Option<PathBuf> {
     data_dir(Platform::current(), &|name| std::env::var_os(name)).map(|dir| dir.join("nixxa").join("logs"))
 }
 
+/// Where Nixxa's history lives: `<data dir>/nixxa/nixxa.db` (D-053).
+pub(crate) fn db_path() -> Option<PathBuf> {
+    data_dir(Platform::current(), &|name| std::env::var_os(name)).map(|dir| dir.join("nixxa").join("nixxa.db"))
+}
+
 /// The per-user data directory:
 /// * Linux: `$XDG_DATA_HOME`, else `~/.local/share`;
 /// * macOS: `~/Library/Application Support`;
@@ -90,6 +95,13 @@ mod tests {
         let env = env(&[]);
         for os in [Platform::Linux, Platform::Mac, Platform::Windows] {
             assert_eq!(data_dir(os, &env), None);
+        }
+    }
+
+    #[test]
+    fn the_history_lives_under_nixxa() {
+        if let Some(path) = db_path() {
+            assert!(path.ends_with(Path::new("nixxa").join("nixxa.db")));
         }
     }
 

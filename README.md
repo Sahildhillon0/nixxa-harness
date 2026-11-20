@@ -19,7 +19,11 @@ Replace one, and the rest never notice.
 > sandbox**, either your real files or a copy. The sandbox is bubblewrap + Landlock + seccomp:
 > commands can't reach anything outside the workspace, and only the sandbox's own localhost
 > works. Every action asks first; `shift-tab` switches to **Auto**, where the agent works without
-> asking. The store and knowledge are still fakes. `--fake` runs the scripted Stage 2 agent offline.
+> asking. `--fake` runs the scripted Stage 2 agent offline.
+>
+> **Stage 5 — Real memory: done.** Sessions are saved as you go, in SQLite. `nixxa --continue`
+> picks up the latest session for this directory; `ctrl-s` lists every session and searches
+> their transcripts. Knowledge is still a fake.
 
 ---
 
@@ -105,7 +109,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | done |
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
-| 5 | Real memory | SQLite store, session resume, transcript search | planned |
+| 5 | Real memory | SQLite store, session resume, transcript search | done |
 | 6 | Knowledge I — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
 | 7 | Knowledge II — code & docs | **CodeGraph** + **Context7** | planned |
 | 8 | Accounts & providers | All major providers, multiple accounts per provider, cloud accounts, sign-in where permitted, account switcher, per-account usage | planned |
@@ -118,7 +122,8 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 ```sh
 cargo build --workspace                 # also builds the sandbox daemon, nixxa-sandboxd
 cargo run -p nixxa-harness              # the TUI with Claude (asks for an API key the first time)
-cargo run -p nixxa-harness -- --fake    # the scripted Stage 2 agent: no key, no network
+cargo run -p nixxa-harness -- --continue  # resume the latest session for this directory
+cargo run -p nixxa-harness -- --fake    # the scripted Stage 2 agent: no key, no network, no history
 cargo test --workspace --all-features   # includes the conformance suites
 ./scripts/check-deps.sh                 # the dependency rule (needs jq)
 ```
@@ -167,6 +172,27 @@ another one switches to it right away, in a new session.
 Other settings: `NIXXA_MODEL` (the Claude model; default `claude-sonnet-5-5`), `NIXXA_EFFORT`
 (`low`…`max`, Claude), `NIXXA_LOG` (log level), `NO_COLOR`. See `nixxa --help`. Logs go to
 `<data dir>/nixxa/logs/` and contain metadata only, never your key or messages.
+
+## Your history
+
+Every session is saved as it goes (messages, actions and their results; never keys) in one
+SQLite file, readable only by you on Linux and macOS:
+
+| OS | File |
+|---|---|
+| Linux | `$XDG_DATA_HOME/nixxa/nixxa.db`, else `~/.local/share/nixxa/nixxa.db` |
+| macOS | `~/Library/Application Support/nixxa/nixxa.db` |
+| Windows | `%LOCALAPPDATA%\nixxa\nixxa.db` |
+
+- `nixxa --continue` resumes the latest conversation started in the current directory (sessions
+  where nothing was said are skipped).
+- `ctrl-s` lists every session (this directory's first); type to search, `enter` to resume.
+- A resumed session runs in the place you choose at that launch; the agent is told the
+  workspace may have changed.
+- `--fake` never reads or writes your history. If the file can't be opened, Nixxa says why,
+  runs without history, and leaves the file alone.
+- **To delete your history,** quit Nixxa and delete `nixxa.db` and, if present, `nixxa.db-wal`
+  and `nixxa.db-shm` next to it. A new, empty history starts on the next launch.
 
 ## Documents
 

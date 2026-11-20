@@ -21,6 +21,7 @@ impl Store for MemoryStore {
             workspace: new.workspace,
             account: new.account,
             started_at: new.started_at,
+            first_message: None,
         };
         all.push(SessionRecord { info: info.clone(), messages: vec![], actions: vec![] });
         Ok(info)
@@ -34,6 +35,11 @@ impl Store for MemoryStore {
     async fn append_message(&self, id: &nixxa_contracts::SessionId, message: Message) -> Result<(), StoreError> {
         let mut all = self.sessions.lock().unwrap();
         let session = all.iter_mut().find(|s| &s.info.id == id).ok_or_else(|| StoreError::NotFound(id.clone()))?;
+        if let (None, nixxa_contracts::Role::User, nixxa_contracts::Content::Text { text }) =
+            (&session.info.first_message, message.role, &message.content)
+        {
+            session.info.first_message = Some(text.clone());
+        }
         session.messages.push(message);
         Ok(())
     }

@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream};
 use futures::StreamExt;
-use nixxa_contracts::{AccountRef, Brain, WorkspaceInfo};
+use nixxa_contracts::{AccountRef, Brain, SessionId, Store, WorkspaceInfo};
 use nixxa_controller::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::app::{App, Effect};
 use crate::place::Place;
-use crate::ports::{AutoApprove, UiEvent};
+use crate::ports::{UiEvent, UiLink};
 use crate::settings::Settings;
 use crate::setup::Setup;
 use crate::wiring::{self, Models};
@@ -32,29 +32,65 @@ const SANDBOX_START: Duration = Duration::from_secs(30);
 struct Session {
     commands: mpsc::Sender<Command>,
     task: JoinHandle<()>,
+    brain: Arc<dyn Brain>,
     account: AccountRef,
 }
 
-/// Starts a controller for `account` and runs its loop in the background.
+/// Starts a controller for `account` and runs its loop in the background: a new session, or
+/// the stored session `resume` (D-057).
 fn start_session(
     brain: Arc<dyn Brain>,
     account: AccountRef,
     workspace: WorkspaceInfo,
     workplace: &Workplace,
-    ui_tx: mpsc::UnboundedSender<UiEvent>,
-    auto: AutoApprove,
+    store: Arc<dyn Store>,
+    ui: &UiLink,
+    resume: Option<SessionId>,
 ) -> Session {
     let (commands, rx) = mpsc::channel(32);
-    let mut controller = wiring::controller(brain, account.clone(), workspace, workplace, ui_tx.clone(), auto);
+    let mut controller = wiring::controller(brain.clone(), account.clone(), workspace, workplace, store, ui);
+    let ui_tx = ui.tx.clone();
     let task = tokio::spawn(async move {
-        if let Err(err) = controller.start_session().await {
-            let message = format!("could not start a session: {err}");
+        let started = match &resume {
+            Some(id) => {
+                controller.resume_session(id).await.map_err(|err| format!("could not resume the session: {err}"))
+            }
+            None => controller.start_session().await.map_err(|err| format!("could not start a session: {err}")),
+        };
+        if let Err(message) = started {
             let _ = ui_tx.send(UiEvent::Controller(nixxa_contracts::Event::Error { turn: None, message }));
             return;
         }
         controller.run(rx).await;
     });
-    Session { commands, task, account }
+    Session { commands, task, brain, account }
+}
+
+/// With `--continue`, the first session to start is the latest one for this directory. Asked
+/// once; says so when there is nothing to continue.
+async fn continue_target(
+    pending: &mut bool,
+    store: &dyn Store,
+    workspace: &WorkspaceInfo,
+    app: &mut App,
+) -> Option<SessionId> {
+    if !std::mem::take(pending) {
+        return None;
+    }
+    match wiring::latest_session(store, &workspace.root).await {
+        Ok(Some(id)) => {
+            tracing::info!("continuing the latest session for this directory");
+            Some(id)
+        }
+        Ok(None) => {
+            app.note("There is no earlier session in this directory to continue: starting a new one.");
+            None
+        }
+        Err(err) => {
+            app.note(format!("Couldn't look for an earlier session ({err}): starting a new one."));
+            None
+        }
+    }
 }
 
 /// A sign-in problem, in words for the setup screen.
@@ -130,6 +166,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let mut app = App::new(color);
     // Asked on every launch; no session starts until it is answered.
     app.directory = workspace.root.display().to_string();
+    app.root = workspace.root.clone();
     workplace::remove_old_scratch();
     let mut blocked = workplace::blocked(&workspace.root, settings.fake);
     app.ask_place(blocked.clone());
@@ -142,7 +179,14 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
         Err(why) => app.note(format!("logging is off: {why}")),
     }
 
+    let (store, history_off) = wiring::store(settings.fake, paths::db_path()).await;
+    if let Some(note) = history_off {
+        app.note(note);
+    }
+    let mut continue_latest = settings.resume_latest;
+
     let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+    let link = UiLink::new(ui_tx.clone(), app.auto.clone());
     let mut session: Option<Session> = None;
     let mut models: Option<Arc<Models>> = None;
     // The running OpenRouter sign-in, and the key it produced until a model is chosen.
@@ -257,12 +301,14 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                             match found.brain_for(&account).await {
                                 Ok(brain) => {
                                     if let Some(old) = session.take() {
+                                        link.generation.advance();
                                         end_session(old);
                                         app.note(format!("Switched to {account}: a new session started."));
                                     }
                                     match &workplace {
                                         Some(place) => {
-                                            session = Some(start_session(brain, account, workspace.clone(), place, ui_tx.clone(), app.auto.clone()));
+                                            let resume = continue_target(&mut continue_latest, &*store, &workspace, &mut app).await;
+                                            session = Some(start_session(brain, account, workspace.clone(), place, store.clone(), &link, resume));
                                         }
                                         None => waiting = Some((brain, account)),
                                     }
@@ -375,14 +421,15 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                             app.here = chosen.place == Place::Here;
                             app.note(place_note(&chosen, &workspace));
                             if let Some((brain, account)) = waiting.take() {
-                                let auto = app.auto.clone();
+                                let resume = continue_target(&mut continue_latest, &*store, &workspace, &mut app).await;
                                 session = Some(start_session(
                                     brain,
                                     account,
                                     workspace.clone(),
                                     &chosen,
-                                    ui_tx.clone(),
-                                    auto,
+                                    store.clone(),
+                                    &link,
+                                    resume,
                                 ));
                             }
                             workplace = Some(chosen);
@@ -396,6 +443,48 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                             blocked.push((choice, why));
                             app.ask_place(blocked.clone());
                         }
+                    }
+                }
+                Effect::ListSessions => {
+                    let (store, ui_tx) = (store.clone(), ui_tx.clone());
+                    tokio::spawn(async move {
+                        let result = store.list_sessions().await.map_err(|err| err.to_string());
+                        let _ = ui_tx.send(UiEvent::SessionsListed(result));
+                    });
+                }
+                Effect::SearchSessions(query) => {
+                    let (store, ui_tx) = (store.clone(), ui_tx.clone());
+                    tokio::spawn(async move {
+                        let result = store.search(&query).await.map_err(|err| err.to_string());
+                        let _ = ui_tx.send(UiEvent::SessionsFound { query, result });
+                    });
+                }
+                Effect::Resume(id) => {
+                    // The running session is saved as it goes: ending it loses nothing.
+                    let ready =
+                        session.as_ref().map(|s| (s.brain.clone(), s.account.clone())).or_else(|| waiting.clone());
+                    match (ready, &workplace) {
+                        (Some((brain, account)), Some(place)) => {
+                            tracing::info!("resuming a stored session");
+                            link.generation.advance();
+                            if let Some(old) = session.take() {
+                                end_session(old);
+                            }
+                            waiting = None;
+                            continue_latest = false;
+                            app.start_over();
+                            app.note(place_note(place, &workspace));
+                            session = Some(start_session(
+                                brain,
+                                account,
+                                workspace.clone(),
+                                place,
+                                store.clone(),
+                                &link,
+                                Some(id),
+                            ));
+                        }
+                        _ => app.note("Set up a model first (ctrl-a); then the session can be resumed."),
                     }
                 }
                 Effect::Quit => quit = true,
@@ -440,6 +529,8 @@ fn receive(app: &mut App, event: UiEvent) {
         UiEvent::AutoApproved(id) => app.auto_approved(&id),
         UiEvent::AccountSaved(result) => app.account_saved(&result),
         UiEvent::ModelsListed(result) => app.models_listed(result),
+        UiEvent::SessionsListed(result) => app.sessions_listed(result),
+        UiEvent::SessionsFound { query, result } => app.sessions_found(&query, result),
         // Handled in the loop, which holds the sign-in state.
         UiEvent::SignInStarted(_) | UiEvent::SignedIn(_) => {}
     }

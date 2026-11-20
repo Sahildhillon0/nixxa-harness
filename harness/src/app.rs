@@ -2,6 +2,7 @@
 //! unit-testable; `ui` draws it and `tui` drives it.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,6 +18,7 @@ use nixxa_brain::ModelInfo;
 use nixxa_contracts::{AccountInfo, AuthMethod, Secret};
 
 use crate::place::{Place, PlacePicker};
+use crate::sessions::{ListKey, SessionList};
 use crate::setup::Setup;
 
 /// How long a first ctrl-c waits for a second one to quit.
@@ -109,6 +111,12 @@ pub(crate) enum Effect {
     },
     /// The user chose where the agent works (the start-up question).
     ChoosePlace(Place),
+    /// Read the stored sessions for the session list.
+    ListSessions,
+    /// Search stored transcripts for the session list.
+    SearchSessions(String),
+    /// End the running session (it is already saved) and continue this stored one.
+    Resume(SessionId),
 }
 
 /// Everything the TUI shows.
@@ -154,6 +162,10 @@ pub(crate) struct App {
     pub(crate) place: Option<PlacePicker>,
     /// The directory Nixxa was started in, shown by the start-up question.
     pub(crate) directory: String,
+    /// The same directory, to tell its sessions from the others in the session list.
+    pub(crate) root: PathBuf,
+    /// The session list (`ctrl-s`), when open.
+    pub(crate) sessions: Option<SessionList>,
 }
 
 impl App {
@@ -187,6 +199,8 @@ impl App {
             setup_available: false,
             place: None,
             directory: String::new(),
+            root: PathBuf::new(),
+            sessions: None,
         }
     }
 
@@ -296,6 +310,35 @@ impl App {
     pub(crate) fn approval(&mut self) -> Option<&PendingApproval> {
         self.approvals.retain(|prompt| !prompt.is_abandoned());
         self.approvals.front()
+    }
+
+    /// The stored sessions arrived for the session list.
+    pub(crate) fn sessions_listed(&mut self, result: Result<Vec<nixxa_contracts::SessionInfo>, String>) {
+        if let Some(list) = self.sessions.as_mut() {
+            list.listed(result);
+        }
+    }
+
+    /// Transcript matches arrived for the session list.
+    pub(crate) fn sessions_found(&mut self, query: &str, result: Result<Vec<nixxa_contracts::SearchHit>, String>) {
+        if let Some(list) = self.sessions.as_mut() {
+            list.found(query, result);
+        }
+    }
+
+    /// Another session is about to be shown: forget everything about the one on screen. Notes
+    /// from the harness go too; the resumed session's own history replaces them.
+    pub(crate) fn start_over(&mut self) {
+        self.session = None;
+        self.conversation.clear();
+        self.streaming = None;
+        self.queued.clear();
+        self.activity.clear();
+        self.selected = None;
+        self.scroll_back = 0;
+        self.approvals.clear();
+        self.busy = false;
+        self.ended = false;
     }
 
     /// Adds a note from the harness itself to the conversation.
@@ -422,6 +465,9 @@ impl App {
         if self.setup.is_some() {
             return self.setup_key(key);
         }
+        if self.sessions.is_some() {
+            return self.sessions_key(key);
+        }
         if self.approval().is_some() {
             if key.code == KeyCode::BackTab {
                 self.toggle_mode(Instant::now());
@@ -434,6 +480,10 @@ impl App {
         if self.setup_available && key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('a') {
             self.open_setup(false);
             return Vec::new();
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('s') {
+            self.sessions = Some(SessionList::new(&self.root, self.session.clone()));
+            return vec![Effect::ListSessions];
         }
         match key.code {
             KeyCode::Tab => self.focus = self.focus.next(),
@@ -454,6 +504,27 @@ impl App {
             self.setup = None;
         }
         outcome.effects
+    }
+
+    fn sessions_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(list) = self.sessions.as_mut() else { return Vec::new() };
+        match list.key(key) {
+            ListKey::Nothing => Vec::new(),
+            ListKey::Close => {
+                self.sessions = None;
+                Vec::new()
+            }
+            ListKey::AlreadyOpen => {
+                self.sessions = None;
+                self.notice = Some("That session is the one open.".into());
+                Vec::new()
+            }
+            ListKey::Search(query) => vec![Effect::SearchSessions(query)],
+            ListKey::Resume(id) => {
+                self.sessions = None;
+                vec![Effect::Resume(id)]
+            }
+        }
     }
 
     fn ctrl_c(&mut self) -> Vec<Effect> {
@@ -694,6 +765,57 @@ pub(crate) mod tests {
         app.paste(&format!("  {KEY}\n"));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::SaveKey(Secret::new(KEY))]);
         assert!(app.input.is_empty());
+    }
+
+    fn stored(id: &str, root: PathBuf) -> nixxa_contracts::SessionInfo {
+        nixxa_contracts::SessionInfo {
+            id: SessionId::new(id),
+            workspace: nixxa_contracts::WorkspaceInfo { name: "w".into(), root },
+            account: AccountRef::new("anthropic", "default"),
+            started_at: Timestamp(0),
+            first_message: Some(format!("start of {id}")),
+        }
+    }
+
+    #[test]
+    fn ctrl_s_lists_sessions_enter_resumes_and_esc_closes() {
+        let mut app = App::new(false);
+        app.root = std::env::temp_dir().join("here");
+        app.session = Some(SessionId::new("now"));
+        assert_eq!(app.handle_key(ctrl('s')), vec![Effect::ListSessions]);
+        app.sessions_listed(Ok(vec![
+            stored("now", app.root.clone()),
+            stored("old", app.root.clone()),
+            stored("away", std::env::temp_dir().join("there")),
+        ]));
+        type_text(&mut app, "start");
+        assert!(app.input.is_empty(), "typing goes to the list, not the input");
+        assert_eq!(app.handle_key(key(KeyCode::Char('x'))), vec![Effect::SearchSessions("startx".into())]);
+        app.sessions_found(
+            "startx",
+            Ok(vec![nixxa_contracts::SearchHit { session: SessionId::new("away"), snippet: "…startx…".into() }]),
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::Resume(SessionId::new("away"))]);
+        assert!(app.sessions.is_none(), "closed once chosen");
+
+        app.handle_key(ctrl('s'));
+        app.sessions_listed(Ok(vec![stored("now", app.root.clone())]));
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "the open session isn't resumed again");
+        assert!(app.sessions.is_none() && app.notice.is_some());
+
+        app.handle_key(ctrl('s'));
+        assert!(app.handle_key(key(KeyCode::Esc)).is_empty());
+        assert!(app.sessions.is_none());
+    }
+
+    #[test]
+    fn starting_over_forgets_the_session_on_screen() {
+        let mut app = App::new(false);
+        app.apply(Event::Message { turn: turn(), message: Message::text(Role::User, "hi", Timestamp(0)) });
+        app.apply(Event::ActionProposed { turn: turn(), request: request("a") });
+        app.apply(Event::TurnStarted { turn: turn() });
+        app.start_over();
+        assert!(app.conversation.is_empty() && app.activity.is_empty() && !app.busy && app.session.is_none());
     }
 
     #[test]
