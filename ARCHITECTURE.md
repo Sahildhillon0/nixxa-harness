@@ -497,7 +497,7 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **Exit:** a real model chats and proposes real actions (still executed by fakes); the key
   survives a restart without ever being written to a plain-text file.
 
-### Stage 4 — Real sandbox (Linux) *(in progress)*
+### Stage 4 — Real sandbox (Linux) *(done)*
 - **PR A (done):** the daemon, its framed protocol and the `BwrapSandbox` client with
   namespace isolation, rlimits and a cgroup scope (D-040–D-043), plus escape tests that try to
   get out. Not wired into the harness. `isolated: false` until Landlock and seccomp landed.
@@ -505,9 +505,14 @@ Every stage ends with something that runs and a checklist that must be true befo
   reports the active layers (VERSION 2) and `BwrapSandbox::capabilities().isolated` is true only
   when namespaces, Landlock and seccomp are all active (D-044–D-046). Escape tests now cover
   ptrace, keyctl, unshare, mount, TIOCSTI, io_uring, AF_NETLINK and a Landlock read-only path.
-- **PR C (next):** wire `BwrapSandbox` into the harness and add the workspace guard.
-- `nixxa-sandboxd` out of process, bubblewrap + Landlock + seccomp, network off, workspace
-  mounted read-write, resource limits. Built-in actions: exec, read, write, list.
+- **PR C (done):** the start-up question offers an empty sandbox, this directory (not
+  isolated), or this directory in the sandbox (the real files, or a copy), backed by
+  `BwrapSandbox` (D-047, D-048); the workspace guard (D-049); the daemon is found beside the
+  harness or on `PATH` (D-050) and started before the session, with no fallback (D-051); Ask/Auto
+  approval modes on `shift-tab` (D-052). Escape tests now also cover `open_tree` and `clone` with
+  namespace flags, each shown to fail without seccomp.
+- `nixxa-sandboxd` out of process, bubblewrap + Landlock + seccomp, no network but the
+  sandbox's own loopback, workspace mounted read-write, resource limits. Built-in actions: exec, read, write, list.
 - **Exit:** the agent runs real commands that provably cannot touch the host outside the
   workspace or reach the network (with tests that try).
 

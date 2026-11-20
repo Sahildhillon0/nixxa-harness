@@ -46,10 +46,24 @@ rewriting them.
 ### Start-up question
 
 Every launch opens a **Start** panel before anything else (above the first-run setup screen):
-*Where should the agent work?* with the directory Nixxa was started in and two choices,
-`1 Sandbox` and `2 This directory` (↑/↓ + enter, or the digit). No session starts until it is
-answered; ctrl-c twice still quits. The answer is noted in the conversation, and the status bar
-shows the backend: `fake ○ NOT ISOLATED` or `host ○ NOT ISOLATED` (D-039).
+*Where should the agent work?*, with the directory Nixxa was started in and three choices
+(↑/↓ + enter, or the digit):
+
+1. **Sandbox (empty)**: the real, isolated sandbox on an empty scratch folder. Your files aren't
+   visible to the agent.
+2. **This directory**: your real files through `HostSandbox`, with no isolation.
+3. **Sandbox with this directory**: opens a second question (`esc` goes back):
+   1. **Work on my files**: the directory is mounted at `/workspace` inside the sandbox. Changes
+      are real, but nothing else on the machine is reachable.
+   2. **Work on a copy**: a copy of the directory is mounted instead. The agent can build and test
+      freely; your real directory never changes, and Nixxa says where the copy is when it quits.
+
+A choice that can't be used here is shown with the reason instead of its description and can't be
+picked: not Linux yet, `bwrap` or `nixxa-sandboxd` missing, the workspace guard, or the sandbox
+failing to start. Nixxa never falls back to something less isolated (D-008, D-051). No session
+starts until the question is answered; ctrl-c twice still quits. The answer is noted in the
+conversation, and the status bar shows the backend, e.g. `bubblewrap ● isolated` or
+`host ○ NOT ISOLATED` (D-039, D-047).
 
 ### Layout
 
@@ -110,15 +124,22 @@ When the controller returns `Ask`, a modal appears over the activity pane:
 
 The mode is always shown in the hint bar and changeable with one key.
 
+**Since Stage 4 (D-052):** **Ask** and **Auto** exist, switched with `shift-tab` at any time
+(including on an open prompt, which it approves). Every launch starts in Ask. Auto is shown as
+`mode: AUTO` and each action it approves is marked `auto` in the activity pane. In **This
+directory** (no isolation), switching to Auto takes a second `shift-tab` within 5 seconds. Today
+Ask prompts for every action; the finer Ask rules, LOCKED and budgets come with Stage 9.
+
 ### Keybindings (initial)
 
 | Key | Action |
 |---|---|
 | `enter` / `shift-enter` (or `alt-enter`) | send / newline — many terminals can't tell `shift-enter` from `enter`, so `alt-enter` works too |
-| `tab` / `shift-tab` | cycle pane focus |
+| `tab` | cycle pane focus |
+| `shift-tab` | switch approval mode: Ask ↔ Auto (D-052) |
 | `j` `k` / arrows | move within focused pane |
 | `ctrl-c` | interrupt the agent (twice: quit) |
-| `m` | cycle approval mode |
+| `m` | cycle approval mode, LOCKED included (Stage 9) |
 | `y` / `n` | approve / deny in a prompt |
 | `ctrl-s` | session list |
 | `ctrl-k` | knowledge panel: source status, paths found, enable/disable per source |
@@ -214,7 +235,7 @@ Both appear in the activity pane as the last lines of the session.
 | D-037 | OpenRouter OAuth (PKCE) moved forward from Stage 8 as the first `SignIn` method; claude.ai or any other subscription login stays excluded, and no other app's tokens are reused | OpenRouter's docs offer the PKCE flow to third-party apps and issue a key the user controls and can revoke, so it's within D-017. It gives a hosted option without pasting keys. A privacy notice is confirmed first, because the conversation (workspace files, notes, memory) leaves the machine and free models may log or train on it. | 3 |
 | D-038 | The harness opens sign-in pages through the OS with the URL as one argument and no shell (`xdg-open`, `open`, `rundll32 url.dll,FileProtocolHandler`), and shows the address to copy if that fails | A shell would read the URL as commands. `start` is a `cmd` built-in, so on Windows it would need a shell. | 3 |
 
-| D-039 | Every launch asks where the agent works: **Sandbox** (the default choice) or **This directory**, the real files of the directory Nixxa started in, through `HostSandbox` (not isolated, shown as `host ○ NOT ISOLATED`). Paths stay inside that directory (no `..`, absolute paths or symlinks out); commands run in the user's shell there without `ANTHROPIC_API_KEY`; every action still goes through the approval prompt | A change of plan: working on a real project is the main use, like other coding harnesses, and it can't wait for Stage 4. It weakens principle 2 only when the user picks it, on every launch, and the TUI never hides it. The sandbox choice stays the in-memory fake until Stage 4 makes it a real isolated one. | 3 |
+| D-039 | Every launch asks where the agent works: **Sandbox** (the default choice) or **This directory**, the real files of the directory Nixxa started in, through `HostSandbox` (not isolated, shown as `host ○ NOT ISOLATED`). Paths stay inside that directory (no `..`, absolute paths or symlinks out); commands run in the user's shell there without `ANTHROPIC_API_KEY`; every action still goes through the approval prompt | A change of plan: working on a real project is the main use, like other coding harnesses, and it can't wait for Stage 4. It weakens principle 2 only when the user picks it, on every launch, and the TUI never hides it. The sandbox choice stays the in-memory fake until Stage 4 makes it a real isolated one. *Amended by D-047: three choices, and the sandbox choices use the real sandbox.* | 3 |
 | D-040 | The Linux sandbox is `nixxa-sandboxd`, a daemon inside bubblewrap that the `BwrapSandbox` client drives over length-prefixed JSON frames on stdio (versioned handshake, 8 MiB frame cap, request ids, cancel frames). The daemon does reads, writes and listings itself with `openat2(RESOLVE_BENEATH \| RESOLVE_NO_MAGICLINKS)` from a descriptor for `/workspace`, so the kernel refuses any path that leaves it | Commands and file actions both happen inside the namespaces, never on the host. Doing file actions in the daemon (not with `cat`/`tee`) keeps them exact and lets the kernel, not string checks, enforce "beneath the workspace". A tiny framed protocol is easy to fuzz and can't desync on a bad frame. | 4 |
 | D-041 | Bubblewrap gets `--unshare-all --unshare-user --disable-userns --die-with-parent --new-session --cap-drop ALL --clearenv` with only PATH, HOME=/tmp, LANG and TERM=dumb set; read-only `/usr` (plus the `/bin`, `/lib`… symlinks), a few `/etc` files (`passwd`, `group`, `nsswitch.conf`, `ld.so.*`, `localtime`, `alternatives`), private `/proc`, `/dev` and `/tmp`, and the workspace at `/workspace`. Nothing else: no home, `/run/user`, D-Bus, keyring, X11/Wayland sockets, `/sys` or host `/tmp`. The client also clears the environment of the `bwrap` process itself | Least privilege: everything a command needs and nothing it doesn't. `--new-session` blocks TIOCSTI injection; `--disable-userns` stops nested user namespaces. `passwd`/`group` reveal host user names but make `id`, `ls -l` and `git` behave; nothing secret is in them. | 4 |
 | D-042 | Limits: when the user's systemd can create scopes (cgroup v2 delegation), the whole sandbox runs under `systemd-run --user --scope` with `MemoryMax` (2 GiB), `MemorySwapMax=0`, `TasksMax` (512) and `OOMPolicy=continue`; every command also gets rlimits (NPROC, FSIZE, NOFILE, CPU, DATA). Without a scope the rlimits alone apply and the backend is named `bubblewrap (rlimits only, no cgroup)`. `RLIMIT_DATA` is used instead of `RLIMIT_AS` | `systemd-run` needs no cgroupfs write access of our own and is cleaned up by systemd; the scope covers the daemon and everything it starts. `OOMPolicy=continue` makes the OOM killer take the hog, not the whole sandbox. NPROC is counted per user namespace, so it caps the sandbox alone. AS breaks runtimes that reserve large address ranges (V8, Go); DATA doesn't count those reservations. | 4 |
@@ -222,6 +243,13 @@ Both appear in the activity pane as the last lines of the session.
 | D-044 | Landlock is applied by the daemon to itself at start-up, after opening `/workspace` and before the Hello reply, using best-effort ABI negotiation (ABI 9). Allow: read + execute on `/usr`, `/bin`, `/sbin`, `/lib*`, `/etc`, `/proc`, `/dev`, `/.nixxa`; read + write on `/dev/null`, `/dev/zero`, `/dev/urandom`, `/dev/tty`; full access to `/workspace`, `/tmp` and `/dev/shm` (POSIX shared memory); everything else denied. TCP is not restricted by Landlock (see D-045). | Landlock is the filesystem layer of D-008. Best-effort compat keeps it working across kernel versions; the deny-by-default posture means a missing rule can only remove access, never grant it. `/proc` stays readable because `kill_all` walks it. | 4 |
 | D-045 | seccomp is a deny-list returning EPERM (not kill), applied after Landlock: ptrace and process_vm_readv/writev; keyctl/add_key/request_key; bpf, perf_event_open, userfaultfd; mount, umount2, pivot_root, move_mount, open_tree, fsopen, fsmount, fsconfig; unshare, setns; clone/clone3 with namespace flags (clone3 always ENOSYS so libc falls back to clone); kexec_*, init_module, finit_module, delete_module; ioctl TIOCSTI and TIOCLINUX; io_uring_setup/enter/register; personality with anything but the default; socket for families other than AF_UNIX, AF_INET and AF_INET6. `no_new_privs` is set before either layer. | A deny-list keeps ordinary tools working (an allow-list would break shells, git, python); EPERM lets programs detect and degrade instead of dying. clone3 → ENOSYS forces the libc fallback to clone, which the namespace-flag rule then filters. x86_64 and aarch64 are both supported; x32 syscalls (`nr & 0x40000000`) are refused by a small first filter. IP sockets stay allowed so commands can use the sandbox's own loopback (local dev servers, test suites): the network namespace has only `lo`, so neither the host nor the internet is reachable, which `the_network_is_unreachable` checks. | 4 |
 | D-046 | When Landlock is unavailable (old kernel or LSM disabled) the daemon runs degraded rather than refusing to start: namespaces and seccomp still apply, the Hello reply reports `landlock: false`, the backend name says so, and `isolated` stays false. | Refusing would disable all sandbox actions on such kernels even though partial isolation remains; reporting the missing layer (and keeping `isolated` false) preserves D-008's rule that an incompletely isolated backend is never labelled isolated. | 4 |
+
+| D-047 | The start-up question has three choices: **Sandbox (empty)** (`BwrapSandbox` on a fresh scratch folder), **This directory** (`HostSandbox`, unchanged from D-039) and **Sandbox with this directory**, which asks **Work on my files** (the launch directory mounted read-write at `/workspace`) or **Work on a copy** (D-048). Each sandboxed place gives the agent its own instructions: paths under `/workspace`, no internet, only localhost, and whether changes are real. `FakeSandbox` is used only with `--fake` (as the demo's empty sandbox) and in tests | The user's request: real, isolated commands on a real project is the main use, and "isolated but on my files" and "isolated on a throwaway copy" are different promises. Telling the agent which one it has keeps it from claiming changes it can't make, or making ones the user didn't expect. | 4 |
+| D-048 | "Work on a copy" and "Sandbox (empty)" use scratch folders under `<data dir>/nixxa/scratch`, one per session; ones older than 3 days are removed at start-up. The copy keeps symlinks as symlinks (never followed), keeps `.git`, skips sockets, FIFOs and device nodes, and is refused up front past 2 GiB of regular files. When Nixxa quits it prints where the copy is | Symlinks copied as links can't pull in files from outside, and the sandbox refuses to follow them out anyway. Opening a FIFO would hang the copy. The cap keeps a stray `node_modules` or build tree from filling the disk silently. The copy outlives the session so the user can look at it; turning it into a patch is an open question. | 4 |
+| D-049 | The workspace guard refuses **This directory**, **Work on my files** and **Work on a copy** when the launch directory is the filesystem root, the home directory or a parent of it, or contains Nixxa's config or data folder, `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.config`, `~/.claude-mem`, `~/.kube` or `~/.docker` (paths canonicalised). The refused choices show why; **Sandbox (empty)** is always allowed | Rules 5 and 8: keys, other tools' memory and Nixxa's own data must never be reachable by the agent, isolated or not, and starting Nixxa in `~` by accident is easy. A refusal with a reason is clearer than a mount that quietly hides parts of the tree. Obsidian vaults join the list when Stage 6 knows where they are. | 4 |
+| D-050 | The harness looks for `nixxa-sandboxd` next to its own executable, then on `PATH`. `cargo run -p nixxa-harness` doesn't build it (it belongs to `nixxa-sandbox`), so the disabled reason says to run `cargo build -p nixxa-sandbox --bin nixxa-sandboxd`. The harness fills `BwrapConfig` with `PATH` and `XDG_RUNTIME_DIR` | Beside the executable is where packaging will put it (Stage 11) and where cargo builds it; `PATH` covers installs. Cargo's artifact dependencies are unstable, so no build trick. | 4 |
+| D-051 | After a sandboxed choice the harness sets the place up on a blocking thread (the copy, the systemd probe), then starts the daemon and waits for its answer (30 s) before the session starts, so the status bar shows the real backend from the first frame. If that fails, the question is asked again with that choice disabled and the reason shown | D-008: never quietly run less isolated than chosen. Starting up front turns a broken sandbox into a clear message at the start instead of a failed first action, and makes `isolated` reflect the daemon's handshake (D-046). | 4 |
+| D-052 | Approval modes arrive early, in the harness only: **Ask** (the default at every launch, every action prompts) and **Auto** (the TUI's `ApprovalPort` approves at once and reports it, so the action is still shown, marked `auto`). `shift-tab` switches at any time; on an open prompt it approves that prompt. In **This directory** a second `shift-tab` within 5 s confirms. The mode is never saved; the controller's limits and the interrupt key still apply in Auto. `shift-tab` no longer moves focus backwards | The user asked for a quick way to let the agent work without prompts. Keeping it in the approval port needs no contract or controller change, and Stage 9 can still move modes into policy. Auto in an isolated sandbox can only change the workspace; in This directory it can change anything the user can, hence the confirmation. | 4 |
 
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
@@ -239,7 +267,10 @@ New decisions get the next ID. A reversed decision is struck through, not delete
   (D-029). The db can't tell them apart from agent text yet. Mark them (e.g. a role or a
   record), or skip them on resume?
 - User-added external tools (Stage 11): MCP only, or also a native plugin trait?
-- Sandbox network policy: off / allow-list / proxy-with-log?
+- Sandbox network policy: off / allow-list / proxy-with-log? (Today: only the sandbox's own
+  loopback, D-045.)
+- "Work on a copy" (D-048): offer the agent's changes back as a patch or a diff to apply, and
+  clean the copy up then?
 - Windows sandbox backend: AppContainer, WSL2, or container-only?
 - claude-mem write-back: how should Nixxa sessions be identified so they read naturally next to
   Claude Code sessions?

@@ -19,6 +19,31 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use common::{Scratch, exec, is_failed, run, sh, sh_out};
+
+/// Syscall numbers for the calls the seccomp tests make directly. The older calls differ by
+/// architecture; numbers from 424 on (io_uring_setup, open_tree) are the same everywhere.
+#[cfg(target_arch = "x86_64")]
+mod nr {
+    pub const ADD_KEY: u32 = 248;
+    pub const UNSHARE: u32 = 272;
+    pub const CLONE: u32 = 56;
+}
+#[cfg(target_arch = "aarch64")]
+mod nr {
+    pub const ADD_KEY: u32 = 217;
+    pub const UNSHARE: u32 = 97;
+    pub const CLONE: u32 = 220;
+}
+const IO_URING_SETUP: u32 = 425;
+const OPEN_TREE: u32 = 428;
+
+/// Runs `libc.syscall(<args>)` in python inside the sandbox and returns `"<result> <errno>"`.
+async fn syscall(sb: &nixxa_sandbox::bwrap::BwrapSandbox, args: &str) -> String {
+    let script = format!(
+        "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall({args}), ctypes.get_errno())'"
+    );
+    sh_out(sb, &script).await
+}
 use nixxa_contracts::{Outcome, SandboxAction, SandboxError};
 
 const SECRET: &str = "nixxa-canary-7f3a9c1e";
@@ -456,7 +481,7 @@ async fn keyctl_is_blocked() {
     let scratch = Scratch::new("keyctl");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
     // SYS_add_key on x86_64 = 248.
-    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall(248, 0, b\"user\", b\"nixxa\", b\"test\", 4), ctypes.get_errno())'").await;
+    let out = syscall(&sb, &format!("{}, b\"user\", b\"nixxa\", b\"test\", 4, -3", nr::ADD_KEY)).await;
     assert!(out.trim_end().ends_with(" 1"), "keyctl got through: {out}");
 }
 
@@ -468,16 +493,32 @@ async fn unshare_is_blocked() {
         let (code, _, _) = sh(&sb, cmd).await;
         assert_ne!(code, Some(0), "{cmd} succeeded inside the sandbox");
     }
-    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall(272, 0x10000000), ctypes.get_errno())'").await;
+    let out = syscall(&sb, &format!("{}, 0x10000000", nr::UNSHARE)).await;
     assert!(out.trim_end().ends_with(" 1"), "unshare syscall got through: {out}");
 }
 
+/// The mount family. `mount` and `fsopen` need capabilities the sandbox doesn't have, so they
+/// fail with EPERM even without seccomp; `open_tree` without `OPEN_TREE_CLONE` needs none, so
+/// only the seccomp rule stops it.
 #[tokio::test]
-async fn mount_is_blocked() {
+async fn mount_calls_are_blocked() {
     let scratch = Scratch::new("mount");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let out = syscall(&sb, &format!("{OPEN_TREE}, -100, b\"/tmp\", 0")).await;
+    assert!(out.trim_end().ends_with(" 1"), "open_tree got through: {out}");
     let (code, _, _) = sh(&sb, "mkdir -p /tmp/mnt && mount -t tmpfs tmpfs /tmp/mnt").await;
     assert_ne!(code, Some(0), "mount succeeded inside the sandbox");
+}
+
+/// `clone` with a namespace flag. Without seccomp, a new user namespace fails with ENOSPC
+/// (bubblewrap's `--disable-userns`); the seccomp rule makes it EPERM.
+#[tokio::test]
+async fn clone_with_namespace_flags_is_blocked() {
+    let scratch = Scratch::new("clone");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    // CLONE_NEWUSER | SIGCHLD
+    let out = syscall(&sb, &format!("{}, 0x10000011, 0, 0, 0, 0", nr::CLONE)).await;
+    assert!(out.trim_end().ends_with(" 1"), "clone(CLONE_NEWUSER) got through or failed for another reason: {out}");
 }
 
 #[tokio::test]
@@ -492,7 +533,7 @@ async fn tiocsti_is_blocked() {
 async fn io_uring_is_blocked() {
     let scratch = Scratch::new("io_uring");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
-    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall(425, 1, 0), ctypes.get_errno())'").await;
+    let out = syscall(&sb, &format!("{IO_URING_SETUP}, 1, 0")).await;
     assert!(out.trim_end().ends_with(" 1"), "io_uring_setup got through: {out}");
 }
 

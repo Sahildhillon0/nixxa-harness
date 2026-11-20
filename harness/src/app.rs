@@ -11,7 +11,7 @@ use nixxa_contracts::{
 };
 use nixxa_controller::Command;
 
-use crate::ports::PendingApproval;
+use crate::ports::{AutoApprove, PendingApproval};
 use nixxa_accounts::methods::openrouter::KEYS_PAGE;
 use nixxa_brain::ModelInfo;
 use nixxa_contracts::{AccountInfo, AuthMethod, Secret};
@@ -21,6 +21,8 @@ use crate::setup::Setup;
 
 /// How long a first ctrl-c waits for a second one to quit.
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
+/// How long switching to Auto in This directory waits for the confirming second shift-tab.
+pub(crate) const CONFIRM_AUTO_WINDOW: Duration = Duration::from_secs(5);
 
 /// Which pane keys go to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,14 +38,6 @@ impl Focus {
             Self::Input => Self::Conversation,
             Self::Conversation => Self::Activity,
             Self::Activity => Self::Input,
-        }
-    }
-
-    fn previous(self) -> Self {
-        match self {
-            Self::Input => Self::Activity,
-            Self::Conversation => Self::Input,
-            Self::Activity => Self::Conversation,
         }
     }
 }
@@ -81,6 +75,8 @@ pub(crate) struct Activity {
     pub(crate) request: ActionRequest,
     pub(crate) state: ActivityState,
     pub(crate) observation: Option<Observation>,
+    /// Approved by Auto mode rather than by the user.
+    pub(crate) auto_approved: bool,
 }
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
@@ -123,7 +119,14 @@ pub(crate) struct App {
     pub(crate) brain: Option<BrainInfo>,
     pub(crate) sandbox: Option<SandboxCapabilities>,
     pub(crate) sources: Vec<SourceInfo>,
+    /// Ask or Auto (D-052); shift-tab switches.
     pub(crate) mode: ApprovalMode,
+    /// Shared with the approval port, which approves by itself while it is on.
+    pub(crate) auto: AutoApprove,
+    /// Until when a second shift-tab confirms Auto in This directory.
+    confirm_auto_until: Option<Instant>,
+    /// Whether the agent works in This directory (not isolated): Auto needs a confirmation.
+    pub(crate) here: bool,
     pub(crate) cost_micro_usd: u64,
     pub(crate) conversation: Vec<Entry>,
     /// Text streamed for the agent message being written; replaced by the final message.
@@ -163,6 +166,9 @@ impl App {
             sandbox: None,
             sources: Vec::new(),
             mode: ApprovalMode::Ask,
+            auto: AutoApprove::default(),
+            confirm_auto_until: None,
+            here: false,
             cost_micro_usd: 0,
             conversation: Vec::new(),
             streaming: None,
@@ -184,9 +190,50 @@ impl App {
         }
     }
 
-    /// Asks where the agent should work.
-    pub(crate) fn ask_place(&mut self) {
-        self.place = Some(PlacePicker::default());
+    /// Asks where the agent should work. The places in `blocked` are shown with the reason and
+    /// can't be picked.
+    pub(crate) fn ask_place(&mut self, blocked: Vec<(Place, String)>) {
+        self.place = Some(PlacePicker::new(blocked));
+    }
+
+    /// Whether a second shift-tab now would switch to Auto in This directory.
+    pub(crate) fn confirming_auto(&self, now: Instant) -> bool {
+        self.confirm_auto_until.is_some_and(|until| now < until)
+    }
+
+    /// Shift-tab: Ask ↔ Auto. In This directory, switching to Auto takes a second press within
+    /// [`CONFIRM_AUTO_WINDOW`]. Switching to Auto also approves any prompt already open.
+    pub(crate) fn toggle_mode(&mut self, now: Instant) {
+        if self.mode == ApprovalMode::Auto {
+            self.set_auto(false);
+            self.notice = Some("Ask mode: every action asks first.".into());
+            return;
+        }
+        if self.here && !self.confirming_auto(now) {
+            self.confirm_auto_until = Some(now + CONFIRM_AUTO_WINDOW);
+            self.notice = Some("Auto in your real files, without isolation? Press shift-tab again to confirm.".into());
+            return;
+        }
+        self.set_auto(true);
+        self.notice = Some("Auto mode: actions run without asking. shift-tab goes back to Ask.".into());
+        while let Some(prompt) = self.approvals.pop_front() {
+            let id = prompt.request.id.clone();
+            prompt.answer(Verdict::Allow);
+            self.auto_approved(&id);
+        }
+    }
+
+    fn set_auto(&mut self, on: bool) {
+        self.mode = if on { ApprovalMode::Auto } else { ApprovalMode::Ask };
+        self.auto.set(on);
+        self.confirm_auto_until = None;
+    }
+
+    /// Marks an action as approved by Auto mode.
+    pub(crate) fn auto_approved(&mut self, id: &nixxa_contracts::ActionId) {
+        if let Some(line) = self.activity.iter_mut().rev().find(|a| &a.request.id == id) {
+            line.auto_approved = true;
+        }
     }
 
     /// Opens the setup screen at its first step.
@@ -308,7 +355,12 @@ impl App {
                 self.conversation.push(Entry { speaker, text });
             }
             Event::ActionProposed { request, .. } => {
-                self.activity.push(Activity { request, state: ActivityState::Proposed, observation: None });
+                self.activity.push(Activity {
+                    request,
+                    state: ActivityState::Proposed,
+                    observation: None,
+                    auto_approved: false,
+                });
             }
             Event::ApprovalNeeded { request, .. } => self.set_state(&request.id, ActivityState::Asking),
             Event::ActionStarted { action_id, .. } => self.set_state(&action_id, ActivityState::Running),
@@ -357,6 +409,9 @@ impl App {
             return self.ctrl_c();
         }
         self.last_ctrl_c = None;
+        if key.code != KeyCode::BackTab {
+            self.confirm_auto_until = None;
+        }
         if let Some(picker) = self.place.as_mut() {
             let chosen = picker.key(key);
             if chosen.is_some() {
@@ -368,7 +423,11 @@ impl App {
             return self.setup_key(key);
         }
         if self.approval().is_some() {
-            self.answer_approval(key.code);
+            if key.code == KeyCode::BackTab {
+                self.toggle_mode(Instant::now());
+            } else {
+                self.answer_approval(key.code);
+            }
             return Vec::new();
         }
         self.notice = None;
@@ -378,7 +437,7 @@ impl App {
         }
         match key.code {
             KeyCode::Tab => self.focus = self.focus.next(),
-            KeyCode::BackTab => self.focus = self.focus.previous(),
+            KeyCode::BackTab => self.toggle_mode(Instant::now()),
             _ => match self.focus {
                 Focus::Input => return self.edit_input(key),
                 Focus::Conversation => self.scroll_conversation(key.code),
@@ -582,22 +641,26 @@ pub(crate) mod tests {
     #[test]
     fn the_place_question_comes_first_and_enter_picks_the_highlighted_choice() {
         let mut app = App::new(true);
-        app.ask_place();
+        app.ask_place(Vec::new());
         app.open_setup(true);
         app.paste("pasted");
         assert_eq!(app.handle_key(key(KeyCode::Char('1'))), vec![Effect::ChoosePlace(Place::Sandbox)]);
         assert!(app.place.is_none(), "answered");
         assert!(matches!(app.setup.as_ref().unwrap().step, Step::Choose { .. }), "setup got neither key nor paste");
 
-        app.ask_place();
+        app.ask_place(Vec::new());
         assert!(app.handle_key(key(KeyCode::Esc)).is_empty(), "there is no way past it but answering");
         app.handle_key(key(KeyCode::Down));
-        app.handle_key(key(KeyCode::Down));
         assert_eq!(app.handle_key(key(KeyCode::Enter)), vec![Effect::ChoosePlace(Place::Here)]);
-        app.ask_place();
+        app.ask_place(Vec::new());
         assert_eq!(app.handle_key(key(KeyCode::Char('2'))), vec![Effect::ChoosePlace(Place::Here)]);
-        app.ask_place();
-        assert!(app.handle_key(key(KeyCode::Char('3'))).is_empty());
+        app.ask_place(Vec::new());
+        assert!(app.handle_key(key(KeyCode::Char('3'))).is_empty(), "opens the second question");
+        assert_eq!(app.handle_key(key(KeyCode::Char('2'))), vec![Effect::ChoosePlace(Place::SandboxCopy)]);
+        app.ask_place(vec![(Place::Here, "refused: your home directory".into())]);
+        assert!(app.handle_key(key(KeyCode::Char('2'))).is_empty(), "a blocked place can't be picked");
+        assert!(app.place.is_some());
+        assert!(app.handle_key(key(KeyCode::Char('4'))).is_empty());
         assert_eq!(app.handle_key(ctrl_c()), Vec::new(), "ctrl-c still works: the first warns");
         assert_eq!(app.handle_key(ctrl_c()), vec![Effect::Quit]);
     }
@@ -810,8 +873,74 @@ pub(crate) mod tests {
         assert_eq!(app.focus, Focus::Conversation);
         app.handle_key(key(KeyCode::Tab));
         assert_eq!(app.focus, Focus::Activity);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.focus, Focus::Input);
+    }
+
+    #[test]
+    fn shift_tab_switches_between_ask_and_auto() {
+        let mut app = App::new(true);
+        assert_eq!(app.mode, ApprovalMode::Ask, "every launch starts in Ask");
+        assert!(!app.auto.is_on());
         app.handle_key(key(KeyCode::BackTab));
-        assert_eq!(app.focus, Focus::Conversation);
+        assert_eq!(app.mode, ApprovalMode::Auto);
+        assert!(app.auto.is_on(), "the approval port sees it");
+        assert_eq!(app.focus, Focus::Input, "shift-tab no longer moves focus");
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.mode, ApprovalMode::Ask);
+        assert!(!app.auto.is_on());
+    }
+
+    #[test]
+    fn auto_in_this_directory_needs_a_second_press_in_time() {
+        let mut app = App::new(true);
+        app.here = true;
+        let now = Instant::now();
+        app.toggle_mode(now);
+        assert_eq!(app.mode, ApprovalMode::Ask, "the first press only asks");
+        assert!(app.notice.as_deref().unwrap().contains("confirm"));
+        app.toggle_mode(now + CONFIRM_AUTO_WINDOW + Duration::from_millis(1));
+        assert_eq!(app.mode, ApprovalMode::Ask, "too late: that press asks again");
+        app.toggle_mode(now + CONFIRM_AUTO_WINDOW + Duration::from_secs(1));
+        assert_eq!(app.mode, ApprovalMode::Auto, "confirmed in time");
+        assert!(app.auto.is_on());
+
+        // Another key in between cancels the confirmation.
+        app.toggle_mode(now);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.mode, ApprovalMode::Ask);
+        app.handle_key(key(KeyCode::Char('x')));
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(app.mode, ApprovalMode::Ask, "the confirmation was cancelled by the other key");
+    }
+
+    #[tokio::test]
+    async fn shift_tab_on_an_open_prompt_approves_it_and_switches_to_auto() {
+        use crate::ports::{TuiApprovals, UiEvent};
+        use nixxa_contracts::ApprovalPort;
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(true);
+        let approvals = std::sync::Arc::new(TuiApprovals::new(tx, app.auto.clone()));
+        app.apply(Event::ActionProposed { turn: turn(), request: request("a1") });
+        let asking = {
+            let approvals = approvals.clone();
+            tokio::spawn(async move { approvals.ask(&request("a1"), "why").await })
+        };
+        let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("expected a prompt") };
+        app.ask(prompt);
+        app.handle_key(key(KeyCode::BackTab));
+        assert_eq!(asking.await.unwrap(), Verdict::Allow);
+        assert!(app.approval().is_none());
+        assert_eq!(app.mode, ApprovalMode::Auto);
+        assert!(app.activity[0].auto_approved, "shown as auto-approved");
+
+        // The next action doesn't prompt at all.
+        app.apply(Event::ActionProposed { turn: turn(), request: request("a2") });
+        assert_eq!(approvals.ask(&request("a2"), "why").await, Verdict::Allow);
+        let Some(UiEvent::AutoApproved(id)) = rx.recv().await else { panic!("expected an auto-approval") };
+        app.auto_approved(&id);
+        assert!(app.activity[1].auto_approved);
     }
 
     #[tokio::test]
@@ -820,7 +949,7 @@ pub(crate) mod tests {
         use nixxa_contracts::ApprovalPort;
 
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let approvals = std::sync::Arc::new(TuiApprovals::new(tx));
+        let approvals = std::sync::Arc::new(TuiApprovals::new(tx, crate::ports::AutoApprove::default()));
         let mut app = App::new(true);
 
         for (answer, expected) in [('y', Verdict::Allow), ('n', Verdict::Deny("denied by the user".into()))] {

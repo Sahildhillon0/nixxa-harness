@@ -13,10 +13,11 @@ use tokio::task::JoinHandle;
 
 use crate::app::{App, Effect};
 use crate::place::Place;
-use crate::ports::UiEvent;
+use crate::ports::{AutoApprove, UiEvent};
 use crate::settings::Settings;
 use crate::setup::Setup;
-use crate::wiring::{self, Models, Workplace};
+use crate::wiring::{self, Models};
+use crate::workplace::{self, Workplace};
 use crate::{browser, logging, paths, ui};
 use nixxa_accounts::methods::SignInError;
 use nixxa_accounts::methods::openrouter::{OpenRouterConfig, OpenRouterSignIn};
@@ -24,6 +25,8 @@ use nixxa_contracts::{Credential, Secret};
 
 /// How long quitting waits for the controller to end the session.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
+/// How long the sandbox gets to start and answer once a sandboxed place is chosen.
+const SANDBOX_START: Duration = Duration::from_secs(30);
 
 /// A running session.
 struct Session {
@@ -39,9 +42,10 @@ fn start_session(
     workspace: WorkspaceInfo,
     workplace: &Workplace,
     ui_tx: mpsc::UnboundedSender<UiEvent>,
+    auto: AutoApprove,
 ) -> Session {
     let (commands, rx) = mpsc::channel(32);
-    let mut controller = wiring::controller(brain, account.clone(), workspace, workplace, ui_tx.clone());
+    let mut controller = wiring::controller(brain, account.clone(), workspace, workplace, ui_tx.clone(), auto);
     let task = tokio::spawn(async move {
         if let Err(err) = controller.start_session().await {
             let message = format!("could not start a session: {err}");
@@ -72,14 +76,51 @@ fn end_session(session: Session) {
 
 /// Where the agent works, in words for the conversation once the start-up question is answered.
 fn place_note(workplace: &Workplace, workspace: &WorkspaceInfo) -> String {
+    let root = workspace.root.display();
+    let modes = "Every action asks first; shift-tab switches between Ask and Auto.";
     match workplace.place {
-        Place::Sandbox => "Working in the sandbox: nothing on this machine is read or changed.".into(),
-        Place::Here => format!(
-            "Working in {}: the agent can read, edit and run commands on your real files there. \
-             Every action still asks first.",
-            workspace.root.display()
+        _ if workplace.is_fake() => {
+            format!("Working in the demo's in-memory sandbox: nothing on this machine is read or changed. {modes}")
+        }
+        Place::Sandbox => format!(
+            "Working in an empty sandbox: your files aren't visible to the agent, and there is no internet. {modes}"
         ),
+        Place::Here => format!(
+            "Working in {root}, without isolation: the agent can read, edit and run commands on your real files there. {modes}"
+        ),
+        Place::SandboxHere => format!(
+            "Working on {root} inside the sandbox: changes to it are real, but nothing else on this machine is reachable. {modes}"
+        ),
+        Place::SandboxCopy => {
+            let copy = workplace.copy.as_deref().map(|c| c.display().to_string()).unwrap_or_default();
+            format!(
+                "Working on a copy of {root}, at {copy}: your real directory is not changed, and the copy stays there after you quit. {modes}"
+            )
+        }
     }
+}
+
+/// Sets up the chosen place and, for the sandboxed ones, starts the sandbox and waits for its
+/// answer, so the status line shows the real backend before the first action and a start
+/// failure is reported here. The setup itself (a copy, probing systemd) runs on a blocking thread.
+async fn prepare(place: Place, workspace: WorkspaceInfo) -> Result<Workplace, String> {
+    let chosen = tokio::task::spawn_blocking(move || Workplace::new(place, &workspace))
+        .await
+        .map_err(|_| "setting up the workplace failed".to_string())??;
+    if place.sandboxed() {
+        let started = match tokio::time::timeout(SANDBOX_START, chosen.sandbox.health()).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(err)) => Err(format!("the sandbox did not start: {err}")),
+            Err(_) => Err("the sandbox did not answer in time".to_string()),
+        };
+        if let Err(why) = started {
+            if let Some(copy) = &chosen.copy {
+                let _ = std::fs::remove_dir_all(copy);
+            }
+            return Err(why);
+        }
+    }
+    Ok(chosen)
 }
 
 /// Runs the TUI until the user quits.
@@ -89,7 +130,9 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let mut app = App::new(color);
     // Asked on every launch; no session starts until it is answered.
     app.directory = workspace.root.display().to_string();
-    app.ask_place();
+    workplace::remove_old_scratch();
+    let mut blocked = workplace::blocked(&workspace.root, settings.fake);
+    app.ask_place(blocked.clone());
     let mut workplace: Option<Workplace> = None;
     // A brain and account ready to go, waiting for the answer.
     let mut waiting: Option<(Arc<dyn Brain>, AccountRef)> = None;
@@ -219,7 +262,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                                     }
                                     match &workplace {
                                         Some(place) => {
-                                            session = Some(start_session(brain, account, workspace.clone(), place, ui_tx.clone()));
+                                            session = Some(start_session(brain, account, workspace.clone(), place, ui_tx.clone(), app.auto.clone()));
                                         }
                                         None => waiting = Some((brain, account)),
                                     }
@@ -316,17 +359,44 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     _ => app.account_saved(&Err("The sign-in expired; sign in again.".into())),
                 },
                 Effect::ChoosePlace(choice) => {
-                    let chosen = Workplace::new(choice, &workspace).unwrap_or_else(|why| {
-                        tracing::warn!(%why, "can't work in the current directory");
-                        app.note(format!("{why}. Using the sandbox instead."));
-                        Workplace::new(Place::Sandbox, &workspace).expect("the sandbox needs no directory")
-                    });
-                    tracing::info!(place = ?chosen.place, "workplace chosen");
-                    app.note(place_note(&chosen, &workspace));
-                    if let Some((brain, account)) = waiting.take() {
-                        session = Some(start_session(brain, account, workspace.clone(), &chosen, ui_tx.clone()));
+                    let demo = settings.fake && choice == Place::Sandbox;
+                    if choice.sandboxed() && !demo {
+                        app.note(if choice == Place::SandboxCopy {
+                            "Copying this directory and starting the sandbox…"
+                        } else {
+                            "Starting the sandbox…"
+                        });
+                        let _ = terminal.draw(|frame| ui::draw(frame, &mut app));
                     }
-                    workplace = Some(chosen);
+                    let ready = if demo { Ok(Workplace::fake()) } else { prepare(choice, workspace.clone()).await };
+                    match ready {
+                        Ok(chosen) => {
+                            tracing::info!(place = ?chosen.place, "workplace chosen");
+                            app.here = chosen.place == Place::Here;
+                            app.note(place_note(&chosen, &workspace));
+                            if let Some((brain, account)) = waiting.take() {
+                                let auto = app.auto.clone();
+                                session = Some(start_session(
+                                    brain,
+                                    account,
+                                    workspace.clone(),
+                                    &chosen,
+                                    ui_tx.clone(),
+                                    auto,
+                                ));
+                            }
+                            workplace = Some(chosen);
+                        }
+                        Err(why) => {
+                            // Never fall back to something less isolated (D-008): ask again, with
+                            // this place shown as unavailable and why.
+                            tracing::warn!(place = ?choice, "the chosen place can't be used");
+                            app.note(format!("{why}. Choose again."));
+                            blocked.retain(|(place, _)| *place != choice);
+                            blocked.push((choice, why));
+                            app.ask_place(blocked.clone());
+                        }
+                    }
                 }
                 Effect::Quit => quit = true,
             }
@@ -350,6 +420,9 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     }
     let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
     ratatui::restore();
+    if let Some(copy) = workplace.as_ref().and_then(|w| w.copy.as_ref()) {
+        println!("nixxa: the copy the agent worked on is at {}", copy.display());
+    }
     match &result {
         Ok(()) => tracing::info!("nixxa quit"),
         Err(err) => tracing::error!(%err, "terminal error"),
@@ -364,6 +437,7 @@ fn receive(app: &mut App, event: UiEvent) {
             app.apply(event);
         }
         UiEvent::Approval(prompt) => app.ask(prompt),
+        UiEvent::AutoApproved(id) => app.auto_approved(&id),
         UiEvent::AccountSaved(result) => app.account_saved(&result),
         UiEvent::ModelsListed(result) => app.models_listed(result),
         // Handled in the loop, which holds the sign-in state.
