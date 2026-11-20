@@ -155,11 +155,7 @@ pub(crate) fn apply() -> bool {
         Ok(b) => b,
         Err(_) => return false,
     };
-    if apply_filter(&bpf3).is_err() {
-        return false;
-    }
-
-    true
+    apply_filter(&bpf3).is_ok()
 }
 
 fn deny(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, sys: i64) {
