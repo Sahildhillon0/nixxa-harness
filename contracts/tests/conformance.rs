@@ -90,6 +90,39 @@ fn store_suite_catches_wrong_order() {
 struct MemSandbox {
     files: Mutex<HashMap<String, String>>,
     no_confinement: bool, // bug switch
+    wipe_on_reset: bool,  // bug switch
+    echo_exec: bool,      // bug switch: claims isolation but "runs" Exec by echoing the command
+    wedge_on_drop: bool,  // bug switch: a dropped Exec leaves the sandbox stuck
+    wedged: std::sync::atomic::AtomicBool,
+}
+
+/// Pending on its first poll (waking itself), ready on the second; flags `wedged` if dropped
+/// before it finishes.
+struct WedgingExec<'a> {
+    polled: bool,
+    done: bool,
+    wedged: &'a std::sync::atomic::AtomicBool,
+}
+
+impl std::future::Future for WedgingExec<'_> {
+    type Output = ();
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+        if self.polled {
+            self.done = true;
+            return std::task::Poll::Ready(());
+        }
+        self.polled = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
+}
+
+impl Drop for WedgingExec<'_> {
+    fn drop(&mut self) {
+        if !self.done {
+            self.wedged.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 }
 
 impl MemSandbox {
@@ -111,11 +144,26 @@ impl Sandbox for MemSandbox {
             backend: "memory".into(),
             isolated: true,
             network: false,
-            actions: vec![SandboxActionKind::ReadFile, SandboxActionKind::WriteFile, SandboxActionKind::ListDir],
+            actions: if self.echo_exec || self.wedge_on_drop {
+                SandboxActionKind::ALL.to_vec()
+            } else {
+                vec![SandboxActionKind::ReadFile, SandboxActionKind::WriteFile, SandboxActionKind::ListDir]
+            },
         }
     }
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
+        if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SandboxError::Unavailable("wedged".into()));
+        }
         let path = match &action {
+            SandboxAction::Exec { command, .. } if self.echo_exec || self.wedge_on_drop => {
+                if self.wedge_on_drop {
+                    WedgingExec { polled: false, done: false, wedged: &self.wedged }.await;
+                }
+                let (exit_code, stdout) =
+                    if self.echo_exec { (Some(0), command.clone()) } else { (Some(0), "nixxa\n".into()) };
+                return Ok(Observation::new(id, Outcome::Exec { exit_code, stdout, stderr: String::new() }));
+            }
             SandboxAction::Exec { .. } => return Err(SandboxError::Unsupported("exec".into())),
             SandboxAction::ReadFile { path }
             | SandboxAction::WriteFile { path, .. }
@@ -160,6 +208,9 @@ impl Sandbox for MemSandbox {
         Ok(())
     }
     async fn reset(&self) -> Result<(), SandboxError> {
+        if self.wipe_on_reset {
+            self.files.lock().unwrap().clear();
+        }
         Ok(())
     }
 }
@@ -173,6 +224,24 @@ fn sandbox_reference_passes() {
 #[should_panic(expected = "escaped the workspace")]
 fn sandbox_suite_catches_escape() {
     block_on(conformance::sandbox::run(|| MemSandbox { no_confinement: true, ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "reset must keep the workspace")]
+fn sandbox_suite_catches_reset_wiping_the_workspace() {
+    block_on(conformance::sandbox::run(|| MemSandbox { wipe_on_reset: true, ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "must really run `echo nixxa`")]
+fn sandbox_suite_catches_an_isolated_exec_that_does_not_run() {
+    block_on(conformance::sandbox::run(|| MemSandbox { echo_exec: true, ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "wedged the sandbox")]
+fn sandbox_suite_catches_a_dropped_exec_wedging() {
+    block_on(conformance::sandbox::run(|| MemSandbox { wedge_on_drop: true, ..Default::default() }));
 }
 
 // ---------- Knowledge ----------

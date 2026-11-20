@@ -199,6 +199,11 @@ implementation (real or fake) must pass it. The contracts crate's own tests prov
 is satisfiable (in-memory reference implementations pass) and has teeth (deliberately broken
 ones fail).
 
+The sandbox suite checks, besides the basics: unsupported kinds error, ids are echoed, paths
+that escape the workspace never succeed, `reset` keeps the workspace, an isolated backend that
+supports `Exec` really runs `echo`, and dropping an in-flight `execute` doesn't wedge the
+backend (the next call works).
+
 ---
 
 ## 4. The agent loop
@@ -492,7 +497,11 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **Exit:** a real model chats and proposes real actions (still executed by fakes); the key
   survives a restart without ever being written to a plain-text file.
 
-### Stage 4 — Real sandbox (Linux)
+### Stage 4 — Real sandbox (Linux) *(in progress)*
+- **PR A (this step):** the daemon, its framed protocol and the `BwrapSandbox` client with
+  namespace isolation, rlimits and a cgroup scope (D-040–D-043), plus escape tests that try to
+  get out. Not wired into the harness, and `isolated: false` until Landlock and seccomp land
+  (PR B). The harness wiring and workspace guard follow (PR C).
 - `nixxa-sandboxd` out of process, bubblewrap + Landlock + seccomp, network off, workspace
   mounted read-write, resource limits. Built-in actions: exec, read, write, list.
 - **Exit:** the agent runs real commands that provably cannot touch the host outside the

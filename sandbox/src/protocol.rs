@@ -1,0 +1,301 @@
+//! The wire protocol between [`BwrapSandbox`](crate::bwrap::BwrapSandbox) and `nixxa-sandboxd`.
+//!
+//! Frames go over the daemon's stdin (client → daemon) and stdout (daemon → client): a 4-byte
+//! big-endian length, then that many bytes of JSON. A frame larger than [`MAX_FRAME`] is refused
+//! before its body is read. The daemon's stderr carries its logs only (metadata, never output or
+//! command text), which the client forwards to `tracing`.
+//!
+//! The session starts with a handshake: the client sends [`ToDaemon::Hello`] with the protocol
+//! version and the limits to enforce, and the daemon answers [`FromDaemon::Hello`] with its own
+//! version, or exits. After that the client sends [`ToDaemon::Request`]s, each with an id, and
+//! the daemon answers each with a [`FromDaemon::Reply`] carrying the same id. While an `Exec` is
+//! running the client may send [`ToDaemon::Cancel`] for it (or a `Reset`); the daemon kills the
+//! command and still replies to it.
+//!
+//! This file is compiled into both the library and the daemon binary.
+
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+use nixxa_contracts::{Outcome, SandboxAction};
+
+/// The protocol version both ends must agree on.
+pub(crate) const VERSION: u32 = 1;
+
+/// The largest frame either end sends or accepts, in bytes (the JSON body, without the prefix).
+pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
+
+/// Resource limits the daemon enforces on every command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Limits {
+    /// Time limit when an `Exec` asks for none, in milliseconds.
+    pub default_timeout_ms: u64,
+    /// The most time any one `Exec` gets, in milliseconds.
+    pub max_timeout_ms: u64,
+    /// Bytes kept from each of stdout and stderr; past this the command is killed.
+    pub output_cap: u64,
+    /// The largest file `ReadFile` returns, in bytes.
+    pub read_cap: u64,
+    /// The largest content `WriteFile` accepts, in bytes.
+    pub write_cap: u64,
+    /// Per-process rlimits applied to every command.
+    pub rlimits: Rlimits,
+}
+
+/// Per-process resource limits (`setrlimit`, soft = hard, so a command can't raise them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Rlimits {
+    /// `RLIMIT_NPROC`: processes in the sandbox's user namespace.
+    pub nproc: u64,
+    /// `RLIMIT_FSIZE`: the largest file a command can write, in bytes.
+    pub fsize: u64,
+    /// `RLIMIT_NOFILE`: open file descriptors per process.
+    pub nofile: u64,
+    /// `RLIMIT_CPU`: CPU seconds per process.
+    pub cpu_secs: u64,
+    /// `RLIMIT_DATA`: data segment + private writable mappings per process, in bytes.
+    pub data: u64,
+}
+
+/// Client → daemon.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum ToDaemon {
+    /// The first frame: the client's version and the limits to enforce.
+    Hello { version: u32, limits: Limits },
+    /// Do something; answered by a [`FromDaemon::Reply`] with the same id.
+    Request { id: u64, op: Op },
+    /// Stop the request with this id if it is still running. It is still answered.
+    Cancel { id: u64 },
+}
+
+/// What a [`ToDaemon::Request`] asks for.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub(crate) enum Op {
+    /// Run a sandbox action.
+    Action { action: SandboxAction },
+    /// Kill everything running; the workspace is kept.
+    Reset,
+    /// Check the daemon is responsive.
+    Ping,
+}
+
+/// Daemon → client.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum FromDaemon {
+    /// The answer to [`ToDaemon::Hello`].
+    Hello { version: u32 },
+    /// The answer to the request with this id.
+    Reply { id: u64, reply: Reply },
+}
+
+/// The result of one request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "reply", rename_all = "snake_case")]
+pub(crate) enum Reply {
+    /// The action ran (successfully or not).
+    Outcome { outcome: Outcome, truncated: bool },
+    /// The command hit its time limit and was killed.
+    Timeout,
+    /// The request was cancelled and its command killed.
+    Cancelled,
+    /// A `Reset` or `Ping` succeeded.
+    Done,
+    /// The daemon could not handle the request.
+    Error { message: String },
+}
+
+/// Why a frame could not be read or written.
+#[derive(Debug)]
+pub(crate) enum FrameError {
+    /// The stream ended cleanly between frames.
+    Eof,
+    /// The frame is larger than [`MAX_FRAME`]. The stream can't be resynchronised after this.
+    TooLarge(usize),
+    /// The frame's body is not a valid message.
+    Malformed(String),
+    /// The stream failed (including ending mid-frame).
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for FrameError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Eof => f.write_str("the stream ended"),
+            Self::TooLarge(n) => write!(f, "a {n}-byte frame is over the {MAX_FRAME}-byte limit"),
+            Self::Malformed(why) => write!(f, "malformed frame: {why}"),
+            Self::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+/// Serialises `msg` into one frame, prefix included.
+pub(crate) fn encode<T: Serialize>(msg: &T) -> Result<Vec<u8>, FrameError> {
+    let body = serde_json::to_vec(msg).map_err(|err| FrameError::Malformed(err.to_string()))?;
+    if body.len() > MAX_FRAME {
+        return Err(FrameError::TooLarge(body.len()));
+    }
+    let len = u32::try_from(body.len()).map_err(|_| FrameError::TooLarge(body.len()))?;
+    let mut frame = Vec::with_capacity(4 + body.len());
+    frame.extend_from_slice(&len.to_be_bytes());
+    frame.extend_from_slice(&body);
+    Ok(frame)
+}
+
+/// Parses one frame's body.
+pub(crate) fn decode<T: DeserializeOwned>(body: &[u8]) -> Result<T, FrameError> {
+    serde_json::from_slice(body).map_err(|err| FrameError::Malformed(err.to_string()))
+}
+
+/// Writes one frame and flushes it.
+pub(crate) async fn write_frame<W: AsyncWrite + Unpin, T: Serialize>(w: &mut W, msg: &T) -> Result<(), FrameError> {
+    let frame = encode(msg)?;
+    w.write_all(&frame).await.map_err(FrameError::Io)?;
+    w.flush().await.map_err(FrameError::Io)
+}
+
+/// Reads one frame. Refuses an oversized one before reading its body.
+pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mut R) -> Result<T, FrameError> {
+    let mut prefix = [0u8; 4];
+    let mut got = 0;
+    while got < prefix.len() {
+        match r.read(&mut prefix[got..]).await {
+            Ok(0) if got == 0 => return Err(FrameError::Eof),
+            Ok(0) => {
+                return Err(FrameError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "the stream ended inside a frame header",
+                )));
+            }
+            Ok(n) => got += n,
+            Err(err) => return Err(FrameError::Io(err)),
+        }
+    }
+    let len = u32::from_be_bytes(prefix) as usize;
+    if len > MAX_FRAME {
+        return Err(FrameError::TooLarge(len));
+    }
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body).await.map_err(FrameError::Io)?;
+    decode(&body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limits() -> Limits {
+        Limits {
+            default_timeout_ms: 1,
+            max_timeout_ms: 2,
+            output_cap: 3,
+            read_cap: 4,
+            write_cap: 5,
+            rlimits: Rlimits { nproc: 6, fsize: 7, nofile: 8, cpu_secs: 9, data: 10 },
+        }
+    }
+
+    async fn round_trip<T: Serialize + DeserializeOwned>(msg: &T) -> T {
+        let frame = encode(msg).expect("encode");
+        read_frame(&mut frame.as_slice()).await.expect("decode")
+    }
+
+    #[tokio::test]
+    async fn every_message_round_trips() {
+        let to = [
+            ToDaemon::Hello { version: VERSION, limits: limits() },
+            ToDaemon::Request {
+                id: 7,
+                op: Op::Action {
+                    action: SandboxAction::Exec {
+                        command: "echo hi".into(),
+                        cwd: Some("src".into()),
+                        timeout_ms: None,
+                    },
+                },
+            },
+            ToDaemon::Request { id: 8, op: Op::Reset },
+            ToDaemon::Request { id: 9, op: Op::Ping },
+            ToDaemon::Cancel { id: 7 },
+        ];
+        for msg in to {
+            assert_eq!(round_trip(&msg).await, msg);
+        }
+        let from = [
+            FromDaemon::Hello { version: VERSION },
+            FromDaemon::Reply {
+                id: 1,
+                reply: Reply::Outcome { outcome: Outcome::Written { bytes: 3 }, truncated: false },
+            },
+            FromDaemon::Reply { id: 2, reply: Reply::Timeout },
+            FromDaemon::Reply { id: 3, reply: Reply::Cancelled },
+            FromDaemon::Reply { id: 4, reply: Reply::Done },
+            FromDaemon::Reply { id: 5, reply: Reply::Error { message: "busy".into() } },
+        ];
+        for msg in from {
+            assert_eq!(round_trip(&msg).await, msg);
+        }
+    }
+
+    #[tokio::test]
+    async fn frames_are_length_prefixed_json() {
+        let frame = encode(&ToDaemon::Cancel { id: 4 }).expect("encode");
+        let body = br#"{"type":"cancel","id":4}"#;
+        assert_eq!(&frame[..4], &(body.len() as u32).to_be_bytes());
+        assert_eq!(&frame[4..], body);
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_is_refused_before_its_body() {
+        let mut stream: &[u8] = &((MAX_FRAME as u32) + 1).to_be_bytes();
+        let err = read_frame::<_, ToDaemon>(&mut stream).await.unwrap_err();
+        assert!(matches!(err, FrameError::TooLarge(n) if n == MAX_FRAME + 1), "{err}");
+        let mut stream: &[u8] = &u32::MAX.to_be_bytes();
+        assert!(matches!(read_frame::<_, ToDaemon>(&mut stream).await, Err(FrameError::TooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_message_is_not_sent() {
+        let huge = ToDaemon::Request {
+            id: 1,
+            op: Op::Action { action: SandboxAction::WriteFile { path: "a".into(), content: "x".repeat(MAX_FRAME) } },
+        };
+        assert!(matches!(encode(&huge), Err(FrameError::TooLarge(_))));
+    }
+
+    #[tokio::test]
+    async fn malformed_frames_are_errors_not_panics() {
+        let cases: [&[u8]; 6] = [
+            b"\x00\x00\x00\x05hello",                 // not JSON
+            b"\x00\x00\x00\x02{}",                    // JSON, no tag
+            b"\x00\x00\x00\x10{\"type\":\"nope\"}  ", // unknown tag
+            b"\x00\x00\x00\x02\xff\xfe",              // not UTF-8
+            b"\x00\x00\x00\x09{\"type\":",            // body shorter than its prefix
+            b"\x00\x00",                              // prefix cut short
+        ];
+        for bytes in cases {
+            let mut stream = bytes;
+            let err = read_frame::<_, ToDaemon>(&mut stream).await;
+            assert!(matches!(err, Err(FrameError::Malformed(_) | FrameError::Io(_))), "{bytes:?}: {err:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_clean_end_between_frames_is_eof() {
+        let mut stream: &[u8] = b"";
+        assert!(matches!(read_frame::<_, ToDaemon>(&mut stream).await, Err(FrameError::Eof)));
+    }
+
+    #[tokio::test]
+    async fn consecutive_frames_are_read_in_order() {
+        let mut bytes = encode(&ToDaemon::Cancel { id: 1 }).unwrap();
+        bytes.extend(encode(&ToDaemon::Cancel { id: 2 }).unwrap());
+        let mut stream = bytes.as_slice();
+        assert_eq!(read_frame::<_, ToDaemon>(&mut stream).await.unwrap(), ToDaemon::Cancel { id: 1 });
+        assert_eq!(read_frame::<_, ToDaemon>(&mut stream).await.unwrap(), ToDaemon::Cancel { id: 2 });
+        assert!(matches!(read_frame::<_, ToDaemon>(&mut stream).await, Err(FrameError::Eof)));
+    }
+}
