@@ -16,7 +16,8 @@ use nixxa_contracts::*;
 #[derive(Default)]
 struct MemStore {
     sessions: Mutex<Vec<SessionRecord>>,
-    newest_last: bool, // bug switch
+    newest_last: bool,  // bug switch
+    drop_summary: bool, // bug switch: stores a `Done` summary as plain agent text
 }
 
 impl MemStore {
@@ -43,7 +44,10 @@ impl Store for MemStore {
     async fn load_session(&self, id: &SessionId) -> Result<SessionRecord, StoreError> {
         self.with(id, |s| s.clone())
     }
-    async fn append_message(&self, id: &SessionId, message: Message) -> Result<(), StoreError> {
+    async fn append_message(&self, id: &SessionId, mut message: Message) -> Result<(), StoreError> {
+        if let (true, Content::Summary { text }) = (self.drop_summary, &message.content) {
+            message.content = Content::Text { text: text.clone() };
+        }
         self.with(id, |s| s.messages.push(message))
     }
     async fn append_action(&self, id: &SessionId, record: ActionRecord) -> Result<(), StoreError> {
@@ -82,6 +86,12 @@ fn store_reference_passes() {
 #[should_panic(expected = "newest first")]
 fn store_suite_catches_wrong_order() {
     block_on(conformance::store::run(|| MemStore { newest_last: true, ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "keep its marker")]
+fn store_suite_catches_a_dropped_summary_marker() {
+    block_on(conformance::store::run(|| MemStore { drop_summary: true, ..Default::default() }));
 }
 
 // ---------- Sandbox ----------

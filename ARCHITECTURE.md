@@ -140,7 +140,7 @@ internal is `pub(crate)`.
 | `SessionId`, `TurnId`, `ActionId` | Opaque identifiers |
 | `Message` | A conversation entry: role (user / agent / system / observation) + content |
 | `Context` | Everything the brain needs for one think step: account, instructions, primer, messages, available sandbox action kinds, knowledge tool specs, limits |
-| `Content` | What a `Message` carries: text, a proposed `ActionRequest`, an `Observation`, or `Reasoning` (opaque provider data such as a signed thinking block) — so the brain can rebuild tool-call history exactly |
+| `Content` | What a `Message` carries: text, a proposed `ActionRequest`, an `Observation`, `Reasoning` (opaque provider data such as a signed thinking block) — so the brain can rebuild tool-call history exactly — or `Summary` (a turn's `Done` summary: stored, never sent back to the brain or shown, D-056) |
 | `Intent` | What the brain wants: `Say(text)`, `Act(Action)`, `Done(summary)` |
 | `Action` | `Sandbox(SandboxAction)` or `Knowledge(KnowledgeAction)` — the controller routes on this |
 | `SandboxAction` | `Exec`, `ReadFile`, `WriteFile`, `ListDir`, … |

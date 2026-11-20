@@ -67,10 +67,12 @@ pub struct SearchHit {
 /// Persists Nixxa's own sessions.
 ///
 /// Contract:
-/// * appends are returned by [`Store::load_session`] in append order;
+/// * appends are returned by [`Store::load_session`] in append order, exactly as given (every
+///   [`Content`](crate::Content) variant round-trips, so a `Summary` stays a `Summary`);
 /// * operations on an unknown session return [`StoreError::NotFound`];
 /// * [`Store::list_sessions`] is newest first (by `started_at`);
-/// * [`Store::search`] matches text message content case-insensitively.
+/// * [`Store::search`] matches the text of [`Content::Text`](crate::Content::Text) messages
+///   case-insensitively; snippets are short and drawn from the match.
 #[async_trait]
 pub trait Store: Send + Sync {
     /// Creates a session and assigns its id.

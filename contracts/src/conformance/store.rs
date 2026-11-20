@@ -17,6 +17,7 @@ pub async fn run<S: Store, F: Fn() -> S>(fresh: F) {
     unknown_session_is_not_found(&fresh()).await;
     list_is_newest_first(&fresh()).await;
     search_finds_text(&fresh()).await;
+    summaries_keep_their_marker(&fresh()).await;
 }
 
 async fn create_then_load(store: &dyn Store) {
@@ -72,4 +73,17 @@ async fn search_finds_text(store: &dyn Store) {
     let hits = store.search("needle").await.unwrap();
     assert!(hits.iter().any(|h| h.session == s), "case-insensitive search must find the message");
     assert!(store.search("zz-absent-term-zz").await.unwrap().is_empty());
+}
+
+/// D-029: a `Done` summary must come back as a summary, never as agent text, so a resumed
+/// session can keep it away from the brain.
+async fn summaries_keep_their_marker(store: &dyn Store) {
+    let s = store.create_session(new_session(T0)).await.unwrap().id;
+    let said = Message::text(Role::Agent, "all done", Timestamp(1));
+    let summary =
+        Message { role: Role::Agent, content: Content::Summary { text: "ran the tests".into() }, at: Timestamp(2) };
+    store.append_message(&s, said.clone()).await.unwrap();
+    store.append_message(&s, summary.clone()).await.unwrap();
+    let loaded = store.load_session(&s).await.unwrap();
+    assert_eq!(loaded.messages, vec![said, summary], "a summary must keep its marker (D-029)");
 }

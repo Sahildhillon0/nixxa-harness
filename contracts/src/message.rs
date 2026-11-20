@@ -46,6 +46,13 @@ pub enum Content {
         /// The provider's own representation, kept byte-for-byte equivalent.
         data: serde_json::Value,
     },
+    /// The agent's closing summary of a turn (`Intent::Done`, role [`Role::Agent`]). Kept for the
+    /// record only: it isn't part of the model's message, so it is never sent back to the brain,
+    /// and it isn't shown or searched (D-029, D-056).
+    Summary {
+        /// The summary.
+        text: String,
+    },
 }
 
 /// One conversation entry.
