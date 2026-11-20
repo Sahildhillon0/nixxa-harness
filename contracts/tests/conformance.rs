@@ -16,8 +16,9 @@ use nixxa_contracts::*;
 #[derive(Default)]
 struct MemStore {
     sessions: Mutex<Vec<SessionRecord>>,
-    newest_last: bool,  // bug switch
-    drop_summary: bool, // bug switch: stores a `Done` summary as plain agent text
+    newest_last: bool,      // bug switch
+    drop_summary: bool,     // bug switch: stores a `Done` summary as plain agent text
+    no_first_message: bool, // bug switch: never fills `first_message`
 }
 
 impl MemStore {
@@ -37,6 +38,7 @@ impl Store for MemStore {
             workspace: new.workspace,
             account: new.account,
             started_at: new.started_at,
+            first_message: None,
         };
         all.push(SessionRecord { info: info.clone(), messages: vec![], actions: vec![] });
         Ok(info)
@@ -48,7 +50,16 @@ impl Store for MemStore {
         if let (true, Content::Summary { text }) = (self.drop_summary, &message.content) {
             message.content = Content::Text { text: text.clone() };
         }
-        self.with(id, |s| s.messages.push(message))
+        let first = match (&message.role, &message.content) {
+            (Role::User, Content::Text { text }) if !self.no_first_message => Some(text.clone()),
+            _ => None,
+        };
+        self.with(id, |s| {
+            if s.info.first_message.is_none() {
+                s.info.first_message = first;
+            }
+            s.messages.push(message)
+        })
     }
     async fn append_action(&self, id: &SessionId, record: ActionRecord) -> Result<(), StoreError> {
         self.with(id, |s| s.actions.push(record))
@@ -92,6 +103,12 @@ fn store_suite_catches_wrong_order() {
 #[should_panic(expected = "keep its marker")]
 fn store_suite_catches_a_dropped_summary_marker() {
     block_on(conformance::store::run(|| MemStore { drop_summary: true, ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "first user text")]
+fn store_suite_catches_a_missing_first_message() {
+    block_on(conformance::store::run(|| MemStore { no_first_message: true, ..Default::default() }));
 }
 
 // ---------- Sandbox ----------

@@ -159,7 +159,7 @@ internal is `pub(crate)`.
 |---|---|---|
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
 | `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset() |
-| `Store` | `db` | create/load session; append message; append action record; list/search sessions |
+| `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
 | `ApprovalPort` | `harness` | ask the human about an action → `Verdict` |

@@ -29,6 +29,9 @@ pub struct SessionInfo {
     pub account: AccountRef,
     /// Start time.
     pub started_at: Timestamp,
+    /// The text of the session's first [`Role::User`](crate::Role::User) text message, for
+    /// session lists. `None` until one is appended; later messages never change it.
+    pub first_message: Option<String>,
 }
 
 /// One action as it went through the loop.
