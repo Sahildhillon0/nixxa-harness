@@ -12,11 +12,14 @@ Replace one, and the rest never notice.
 > **Status: Stage 3 — Real brain (in progress).** `cargo run -p nixxa-harness` talks to Claude (`claude-sonnet-5-5` by default) with streaming and
 > tool use, or to a **local model** (LM Studio / Ollama, through their OpenAI-compatible
 > endpoint), or to **OpenRouter** after signing in through the browser, all chosen on the setup
-> screen. Keys stay in the OS keychain, never in a file. The live checks against the Anthropic API haven't been run yet. Every launch
-> asks where the agent works: the **sandbox** (still an in-memory fake) or **this directory**, where
-> it reads, edits and runs commands on your real files, each action approved first. The store and
-> knowledge are still fakes, and the status bar says the agent isn't isolated (`NOT ISOLATED`). `--fake` runs the
-> scripted Stage 2 agent offline.
+> screen. Keys stay in the OS keychain, never in a file. The live checks against the Anthropic API haven't been run yet.
+>
+> **Stage 4 — Real sandbox (Linux): done.** Every launch asks where the agent works: an **empty
+> sandbox**, **this directory** (your real files, no isolation), or **this directory inside the
+> sandbox**, either your real files or a copy. The sandbox is bubblewrap + Landlock + seccomp:
+> commands can't reach anything outside the workspace, and only the sandbox's own localhost
+> works. Every action asks first; `shift-tab` switches to **Auto**, where the agent works without
+> asking. The store and knowledge are still fakes. `--fake` runs the scripted Stage 2 agent offline.
 
 ---
 
@@ -100,8 +103,8 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 0 | Foundations | Repo, docs, folder skeleton | done |
 | 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | done (macOS/Windows CI pending) |
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | done |
-| 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** |
-| 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | **started** (daemon + bubblewrap; Landlock, seccomp and wiring next) |
+| 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
+| 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | planned |
 | 6 | Knowledge I — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
 | 7 | Knowledge II — code & docs | **CodeGraph** + **Context7** | planned |
@@ -113,7 +116,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 ## Building
 
 ```sh
-cargo build --workspace
+cargo build --workspace                 # also builds the sandbox daemon, nixxa-sandboxd
 cargo run -p nixxa-harness              # the TUI with Claude (asks for an API key the first time)
 cargo run -p nixxa-harness -- --fake    # the scripted Stage 2 agent: no key, no network
 cargo test --workspace --all-features   # includes the conformance suites
@@ -121,6 +124,15 @@ cargo test --workspace --all-features   # includes the conformance suites
 ```
 
 Requires Rust 1.85+ (edition 2024).
+
+**The sandbox (Linux):** needs `bwrap` (`pacman -S bubblewrap`, `apt install bubblewrap`) and
+the `nixxa-sandboxd` daemon, found next to the `nixxa` binary or on `PATH`. `cargo run -p
+nixxa-harness` alone doesn't build the daemon; run `cargo build -p nixxa-sandbox --bin
+nixxa-sandboxd` (or `cargo build --workspace`) once. Without them, the sandboxed choices are shown
+as unavailable, with the reason. On macOS and Windows only **This directory** is available for now.
+
+**Keys worth knowing:** `shift-tab` switches between Ask (every action asks first) and Auto (no
+prompts); `ctrl-a` model setup; `ctrl-c` interrupts (twice: quit).
 
 ## Setting up a model
 

@@ -14,6 +14,8 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
+**Stage 4 — Real sandbox (Linux): done.** Stage 3's Anthropic live checks are still pending.
+
 **Stage 3 — Real brain (in progress).**
 - **Done so far:**
   - Claude (`AnthropicBrain`) with keys in the OS keychain (`KeychainCredentials`);
@@ -25,11 +27,14 @@ Linux, macOS and Windows. See
     sign-in method.
 - **Pending:** the Anthropic live checks, which need a key.
 
-  - every launch asks where the agent works: the sandbox (`FakeSandbox`) or the current
-    directory (`HostSandbox`, real files, not isolated; D-039).
 
-**Stage 4 — Real sandbox (Linux) done:** `BwrapSandbox` is wired into the start-up choice with
-the workspace guard and Ask/Auto approval mode. Stage 4 exit criteria are met.
+**Stage 4 — Real sandbox (Linux), done:**
+- `BwrapSandbox` and `nixxa-sandboxd` (bubblewrap namespaces, Landlock, seccomp, rlimits, cgroup
+  scope) in `sandbox/`, with escape tests (D-040 to D-046);
+- every launch asks where the agent works: an empty sandbox, this directory (`HostSandbox`, not
+  isolated), or this directory in the sandbox, as the real files or a copy (D-047, D-048), with
+  the workspace guard (D-049); unavailable choices say why, with no fallback (D-051);
+- Ask/Auto approval modes on `shift-tab`, in the harness (D-052).
 
 The store and knowledge are still fakes.
 Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
