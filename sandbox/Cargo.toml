@@ -22,7 +22,10 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process", "r
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process"] }
+landlock = "0.4"
+libc = "0.2"
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "thread"] }
+seccompiler = "0.5"
 
 [dev-dependencies]
 nixxa-contracts = { workspace = true, features = ["conformance"] }

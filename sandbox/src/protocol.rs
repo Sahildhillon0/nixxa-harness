@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use nixxa_contracts::{Outcome, SandboxAction};
 
 /// The protocol version both ends must agree on.
-pub(crate) const VERSION: u32 = 1;
+pub(crate) const VERSION: u32 = 2;
 
 /// The largest frame either end sends or accepts, in bytes (the JSON body, without the prefix).
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -82,12 +82,21 @@ pub(crate) enum Op {
     Ping,
 }
 
+/// The isolation layers the daemon applied to itself at start-up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ActiveLayers {
+    /// Whether Landlock is enforcing a filesystem (and, where supported, TCP) policy.
+    pub landlock: bool,
+    /// Whether the seccomp deny-list filter is installed.
+    pub seccomp: bool,
+}
+
 /// Daemon → client.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum FromDaemon {
     /// The answer to [`ToDaemon::Hello`].
-    Hello { version: u32 },
+    Hello { version: u32, layers: ActiveLayers },
     /// The answer to the request with this id.
     Reply { id: u64, reply: Reply },
 }
@@ -225,7 +234,7 @@ mod tests {
             assert_eq!(round_trip(&msg).await, msg);
         }
         let from = [
-            FromDaemon::Hello { version: VERSION },
+            FromDaemon::Hello { version: VERSION, layers: ActiveLayers { landlock: true, seccomp: true } },
             FromDaemon::Reply {
                 id: 1,
                 reply: Reply::Outcome { outcome: Outcome::Written { bytes: 3 }, truncated: false },

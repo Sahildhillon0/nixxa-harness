@@ -8,9 +8,13 @@ mod exec;
 #[cfg(target_os = "linux")]
 mod files;
 #[cfg(target_os = "linux")]
+mod landlock;
+#[cfg(target_os = "linux")]
 #[path = "../../protocol.rs"]
 #[allow(dead_code)] // Shared with the client, which uses the other half.
 mod protocol;
+#[cfg(target_os = "linux")]
+mod seccomp;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -104,7 +108,14 @@ mod daemon {
                 return 3;
             }
         };
-        if write_frame(&mut out, &FromDaemon::Hello { version: VERSION }).await.is_err() {
+        // Apply the isolation layers before answering the handshake, so every
+        // command inherits them. no_new_privs first.
+        let nnp_ok = rustix::thread::set_no_new_privs(true).is_ok();
+        let landlock_ok = crate::landlock::apply();
+        let seccomp_ok = nnp_ok && crate::seccomp::apply();
+        log(format_args!("layers: landlock={landlock_ok} seccomp={seccomp_ok}"));
+        let layers = crate::protocol::ActiveLayers { landlock: landlock_ok, seccomp: seccomp_ok };
+        if write_frame(&mut out, &FromDaemon::Hello { version: VERSION, layers }).await.is_err() {
             return 4;
         }
         log(format_args!("ready"));
