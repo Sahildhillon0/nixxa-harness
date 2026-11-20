@@ -22,7 +22,15 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
     account setting `model.<account>`.
 
   `wiring::Models` picks the brain from the account's provider. `--fake` uses the scripted Stage 2
-  brain. The sandbox, store and knowledge are still the Stage 2 fakes.
+  brain. The store and knowledge are still the Stage 2 fakes.
+- **Where the agent works (`place.rs`, `workplace.rs`, `copy.rs`):** asked at every launch: an
+  empty sandbox, this directory (`HostSandbox`, not isolated), or this directory in the sandbox,
+  as the real files or a copy (`BwrapSandbox`). `workplace::blocked` lists the choices that can't
+  be used here and why (not Linux, `bwrap` or `nixxa-sandboxd` missing, the workspace guard);
+  they are never swapped for something less isolated. The daemon is started before the session.
+  `FakeSandbox` is the empty sandbox only with `--fake`. D-047 to D-051.
+- **Approval modes:** `shift-tab` switches Ask ↔ Auto (`ports::AutoApprove`); in Auto,
+  `TuiApprovals` approves at once and the action is marked `auto`. D-052.
 - **Start account:** the one set up last (the `active_account` setting), else the Anthropic
   default (a stored key or `ANTHROPIC_API_KEY`), else the local default. A local account without a
   model reopens setup on its server.
@@ -70,6 +78,9 @@ its fake (scripted brain, fake sandbox, in-memory store, fake knowledge).
 | `src/ui.rs` | Drawing with ratatui (tested against `TestBackend`) |
 | `src/ports.rs` | `EventSink` and `ApprovalPort` over one unbounded channel to the UI loop |
 | `src/wiring.rs` | Composition root; holds the Stage 2 end-to-end test |
+| `src/place.rs` | The start-up question: the three choices, the second question, blocked choices |
+| `src/workplace.rs` | Builds the chosen place's sandbox and instructions; the workspace guard; finding the daemon |
+| `src/copy.rs` | Scratch folders and the copy for "Work on a copy" (Linux) |
 | `src/safe.rs` | Makes untrusted text safe to draw (control, C1 and bidi characters made visible) and scrubs each frame |
 | `src/logging.rs` | `tracing` to daily files, metadata only |
 | `src/paths.rs` | Per-OS data directory (Linux XDG, macOS Application Support, Windows `%LOCALAPPDATA%`) |
@@ -86,8 +97,8 @@ running is shown dimmed as "(queued)" until its turn starts.
 (default `info`). Metadata only — never message text or action output. If no data directory
 can be found, logging is off and the conversation says so.
 
-Keys: `enter` send · `alt-enter` / `shift-enter` newline · `tab` / `shift-tab` focus ·
+Keys: `enter` send · `alt-enter` / `shift-enter` newline · `tab` focus · `shift-tab` Ask/Auto ·
 `j` `k` / arrows move · `end` back to newest · `ctrl-c` interrupt (twice: quit).
 
-Not yet: approval modes and `m` (Stage 9), "allow all" / edit in the prompt (Stage 9),
+Not yet: LOCKED and `m` (Stage 9), "allow all" / edit in the prompt (Stage 9),
 session list (Stage 5), knowledge panel (Stage 6), accounts screen (Stage 3/8), help overlay.

@@ -6,6 +6,7 @@
 
 mod app;
 mod browser;
+#[cfg(target_os = "linux")]
 mod copy;
 mod logging;
 mod paths;
@@ -17,6 +18,7 @@ mod setup;
 mod tui;
 mod ui;
 mod wiring;
+mod workplace;
 
 use std::process::ExitCode;
 

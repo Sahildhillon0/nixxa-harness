@@ -1,6 +1,6 @@
 //! Draws [`App`] with ratatui. Layout and visual language follow DESIGN.md §4.
 
-use nixxa_contracts::{Action, ActionRequest, KnowledgeAction, Outcome, SandboxAction, SourceStatus};
+use nixxa_contracts::{Action, ActionRequest, ApprovalMode, KnowledgeAction, Outcome, SandboxAction, SourceStatus};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -8,7 +8,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
-// place module used via app.place
 use crate::safe;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 
@@ -200,6 +199,7 @@ fn activity_line(activity: &Activity, theme: Theme, width: usize) -> Line<'stati
         ActivityState::Denied => "denied".to_string(),
         ActivityState::Failed => "failed".to_string(),
     };
+    let timing = if activity.auto_approved { format!("auto · {timing}") } else { timing };
     let (kind, target) = describe(&activity.request);
     let room = width.saturating_sub(2 + 7 + 1 + timing.chars().count());
     Line::from(vec![
@@ -325,25 +325,32 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
             Step::Key(_) | Step::LocalUrl(_) => format!("enter check & save · ctrl-u clear · {leave}"),
         }
     });
-    let keys = if app.place.is_some() {
-        "↑/↓ choose · enter select · 1/2 pick · ctrl-c twice quit".to_string()
+    let keys = if let Some(picker) = &app.place {
+        let back = if picker.second { " · esc back" } else { "" };
+        format!("↑/↓ choose · enter select · 1-{} pick{back} · ctrl-c twice quit", picker.rows().len())
     } else if let Some(keys) = setup_keys {
         keys
     } else if app.approval().is_some() {
-        "y allow · n deny · ctrl-c interrupt".to_string()
+        match &app.notice {
+            Some(notice) if app.confirming_auto(std::time::Instant::now()) => safe::line(notice),
+            _ => "y allow · n deny · shift-tab auto · ctrl-c interrupt".to_string(),
+        }
     } else if let Some(notice) = &app.notice {
         safe::line(notice)
     } else {
         let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
-        format!("enter send · alt-enter newline · tab focus · j/k move{key} · ctrl-c interrupt (twice: quit)")
+        format!(
+            "enter send · alt-enter newline · tab focus · shift-tab ask/auto · j/k move{key} · ctrl-c interrupt (twice: quit)"
+        )
     };
-    let mode = format!("mode: {} ", format!("{:?}", app.mode).to_uppercase());
+    let auto = app.mode == ApprovalMode::Auto;
+    let mode = if auto { "mode: AUTO ".to_string() } else { "mode: ask ".to_string() };
     let urgent = app.place.is_some() || app.setup.is_some() || app.approval().is_some() || app.notice.is_some();
     let style = if urgent { theme.pending() } else { theme.dim() };
     let room = usize::from(width).saturating_sub(mode.chars().count() + 1);
     Line::from(vec![
         Span::styled(format!(" {:<room$}", truncate(&keys, room.saturating_sub(1))), style),
-        Span::raw(mode),
+        if auto { Span::styled(mode, theme.bad().add_modifier(Modifier::BOLD)) } else { Span::raw(mode) },
     ])
 }
 
@@ -524,30 +531,42 @@ fn draw_setup(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
 /// The start-up question: the sandbox, or the real files of the current directory.
 fn draw_place(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     let Some(picker) = app.place.as_ref() else { return };
+    let question = if picker.second {
+        "Sandbox with this directory: your real files, or a copy?"
+    } else {
+        "Where should the agent work?"
+    };
     let mut lines = vec![
         Line::default(),
-        Line::raw("Where should the agent work?"),
+        Line::raw(question),
         Line::from(vec![Span::styled("Directory  ", theme.dim()), Span::raw(safe::line(&app.directory))]),
         Line::default(),
     ];
-    for (i, (_place, name, detail)) in picker.choices().iter().enumerate() {
+    for (i, (_row, name, detail)) in picker.rows().iter().enumerate() {
         let chosen = i == picker.selected;
         let marker = if chosen { "›" } else { " " };
-        let style = if chosen { theme.accent() } else { Style::new() };
-        let disabled = picker.is_disabled(i);
-        let detail_style = if disabled { theme.bad() } else { theme.dim() };
-        let detail = if disabled { picker.reason(i).unwrap_or(detail) } else { detail };
+        let reason = picker.reason(i);
+        let style = match (reason.is_some(), chosen) {
+            (true, _) => theme.dim(),
+            (false, true) => theme.accent(),
+            (false, false) => Style::new(),
+        };
+        let (detail, detail_style) = match reason {
+            Some(why) => (safe::line(why), theme.bad()),
+            None => ((*detail).to_string(), theme.dim()),
+        };
         lines.push(Line::from(vec![
             Span::styled(format!("{marker} {}  {name}", i + 1), style.add_modifier(Modifier::BOLD)),
             Span::styled(format!(" — {detail}"), detail_style),
         ]));
     }
     lines.push(Line::default());
-    lines.push(Line::styled("Approval mode starts as Ask; Shift+Tab toggles it.", theme.dim()));
+    lines.push(Line::styled("Every action asks you first; shift-tab switches to Auto at any time.", theme.dim()));
     let width = over.width.min(84);
     let inner_width = usize::from(width.saturating_sub(2)).max(1);
     let rows: usize = lines.iter().map(|line| line.width().max(1).div_ceil(inner_width)).sum();
-    let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(2).min(over.height);
+    // Two borders, plus one row for word wrapping, which can take more rows than the width says.
+    let height = u16::try_from(rows).unwrap_or(u16::MAX).saturating_add(3).min(over.height);
     let area = Rect { x: over.x + (over.width - width) / 2, y: over.y + (over.height - height) / 2, width, height };
     let block = Block::bordered().title(" Start ").border_style(theme.accent());
     frame.render_widget(Clear, area);
@@ -660,6 +679,9 @@ pub(crate) mod tests {
     use ratatui::backend::TestBackend;
 
     use super::*;
+    use crate::app::tests::key;
+    use crate::place::Place;
+    use crossterm::event::KeyCode;
 
     pub(crate) fn screen(app: &mut App, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -696,19 +718,48 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_start_question_shows_both_places_over_the_first_run_setup() {
+    fn the_start_question_shows_the_places_over_the_first_run_setup() {
         for width in [120, 60] {
             let mut app = App::new(false);
             app.directory = "/home/me/project".into();
             app.open_setup(true);
-            app.ask_place();
+            app.ask_place(Vec::new());
             let screen = screen(&mut app, width, 24);
-            for part in ["Where should the agent work?", "/home/me/project", "1  Sandbox", "2  This directory"] {
+            for part in [
+                "Where should the agent work?",
+                "/home/me/project",
+                "1  Sandbox (empty)",
+                "2  This directory",
+                "3  Sandbox with this directory",
+            ] {
                 assert!(screen.contains(part), "{part} missing at width {width}:\n{screen}");
             }
             assert!(!screen.contains("How should Nixxa think?"), "setup waits underneath:\n{screen}");
             assert!(screen.lines().last().unwrap().contains("enter select"), "{screen}");
+            assert!(screen.contains("shift-tab switches"), "the last line fits at width {width}:\n{screen}");
         }
+    }
+
+    #[test]
+    fn the_second_question_and_blocked_places_are_drawn() {
+        let mut app = App::new(false);
+        app.directory = "/home/me/project".into();
+        app.ask_place(vec![(Place::Sandbox, "bubblewrap isn't installed".into())]);
+        let first = screen(&mut app, 120, 24);
+        assert!(first.contains("bubblewrap isn't installed"), "the reason replaces the description:\n{first}");
+        app.handle_key(key(KeyCode::Char('3')));
+        let second = screen(&mut app, 120, 24);
+        for part in ["your real files, or a copy?", "1  Work on my files", "2  Work on a copy", "esc back"] {
+            assert!(second.contains(part), "{part} missing:\n{second}");
+        }
+    }
+
+    #[test]
+    fn the_status_line_shows_the_approval_mode() {
+        let mut app = App::new(false);
+        assert!(screen(&mut app, 120, 24).lines().last().unwrap().contains("mode: ask"));
+        app.handle_key(key(KeyCode::BackTab));
+        assert!(screen(&mut app, 120, 24).lines().last().unwrap().contains("mode: AUTO"));
     }
 
     #[test]
@@ -720,7 +771,7 @@ pub(crate) mod tests {
         {
             assert!(status.contains(part), "missing {part:?} in {status:?}");
         }
-        assert!(screen.contains("mode: ASK"));
+        assert!(screen.contains("mode: ask"));
     }
 
     #[test]
