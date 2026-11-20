@@ -184,7 +184,8 @@ SQLite file, readable only by you on Linux and macOS:
 | macOS | `~/Library/Application Support/nixxa/nixxa.db` |
 | Windows | `%LOCALAPPDATA%\nixxa\nixxa.db` |
 
-- `nixxa --continue` resumes the latest session started in the current directory.
+- `nixxa --continue` resumes the latest conversation started in the current directory (sessions
+  where nothing was said are skipped).
 - `ctrl-s` lists every session (this directory's first); type to search, `enter` to resume.
 - A resumed session runs in the place you choose at that launch; the agent is told the
   workspace may have changed.
