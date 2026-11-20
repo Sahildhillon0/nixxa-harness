@@ -444,6 +444,7 @@ pub(crate) fn find_daemon() -> Option<std::path::PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn fill_config(config: &mut nixxa_sandbox::bwrap::BwrapConfig) {
     if let Ok(path) = std::env::var("PATH") {
         config.search_path = std::env::split_paths(&path).collect();
