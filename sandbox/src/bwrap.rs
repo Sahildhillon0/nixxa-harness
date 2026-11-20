@@ -306,9 +306,7 @@ impl Inner {
             let path = format!("/etc/{name}");
             args.extend(["--ro-bind-try".into(), path.clone(), path]);
         }
-        args.extend(
-            ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind"].map(str::to_owned),
-        );
+        args.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind"].map(str::to_owned));
         args.extend([host_str(&self.workspace), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
         args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into(), DAEMON_INSIDE.into()]);
         args
