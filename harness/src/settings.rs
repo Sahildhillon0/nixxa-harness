@@ -7,7 +7,8 @@ use nixxa_contracts::Secret;
 pub(crate) const USAGE: &str = "\
 Usage: nixxa [--continue] [--fake]
 
-  --continue   Resume the latest session started in this directory (a new one if there is none).
+  --continue   Resume the latest conversation started in this directory (a new one if there
+               is none).
                ctrl-s lists every session.
   --fake       Use the scripted Stage 2 brain: no API key, no network. Nothing is saved to
                your history.

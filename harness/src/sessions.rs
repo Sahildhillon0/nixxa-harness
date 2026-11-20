@@ -95,12 +95,14 @@ impl SessionList {
     }
 
     /// The rows to show: this directory's sessions, then the others, each newest first.
+    /// Sessions nothing was said in are left out (every launch starts one), except the open one.
     pub(crate) fn rows(&self) -> Vec<Row<'_>> {
         let Some(Ok(sessions)) = &self.sessions else { return Vec::new() };
         let query = self.query.trim().to_lowercase();
         let hits: &[SearchHit] = if self.hits.0 == self.query.trim() { &self.hits.1 } else { &[] };
         let mut rows: Vec<Row<'_>> = sessions
             .iter()
+            .filter(|info| info.first_message.is_some() || self.current.as_ref() == Some(&info.id))
             .filter_map(|info| {
                 let snippet = hits.iter().find(|h| h.session == info.id).map(|h| h.snippet.as_str());
                 let listed = query.is_empty() || snippet.is_some() || describes(info, &query);
@@ -234,6 +236,14 @@ mod tests {
         let rows = list.rows();
         assert!(rows[0].here && rows[1].here && !rows[2].here);
         assert!(rows[1].open && !rows[0].open, "the open session is marked");
+    }
+
+    #[test]
+    fn empty_sessions_are_left_out_except_the_open_one() {
+        let mut list = SessionList::new(&here(), Some(SessionId::new("open")));
+        let empty = |id: &str, at| SessionInfo { first_message: None, ..info(id, here(), "", at) };
+        list.listed(Ok(vec![empty("open", 50), empty("quit-at-once", 40), info("real", here(), "fix the build", 30)]));
+        assert_eq!(ids(&list), vec!["open", "real"]);
     }
 
     #[test]

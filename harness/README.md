@@ -26,8 +26,9 @@ See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
   `Store::search`, whose snippets show under the matching rows. `enter` resumes, `esc` closes.
   Resuming ends the running session first (it is saved as it goes) and runs the resumed one in
   the place chosen at this launch (D-059).
-- **`--continue`** (`-c`): the first session to start is the latest one for this directory, after
-  the start-up question; if there is none, a new one starts and the conversation says so.
+- **`--continue`** (`-c`): the first session to start is the latest one for this directory with a
+  user message, after the start-up question; if there is none, a new one starts and the
+  conversation says so. The `ctrl-s` list hides sessions nothing was said in, except the open one.
 - **Late events:** each controller's `ChannelSink` belongs to a `Generation`; starting another
   session advances it, so a replaced session's last events (its interrupt notice) never land in
   the new conversation.

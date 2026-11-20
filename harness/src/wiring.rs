@@ -73,7 +73,8 @@ pub(crate) async fn store(fake: bool, path: Option<PathBuf>) -> (Arc<dyn Store>,
 /// The newest session started in `root`, if any (`--continue`).
 pub(crate) async fn latest_session(store: &dyn Store, root: &Path) -> Result<Option<SessionId>, StoreError> {
     let sessions = store.list_sessions().await?;
-    Ok(sessions.into_iter().find(|s| s.workspace.root == root).map(|s| s.id))
+    // Every launch starts a session; one nothing was said in isn't worth continuing.
+    Ok(sessions.into_iter().find(|s| s.workspace.root == root && s.first_message.is_some()).map(|s| s.id))
 }
 
 /// A controller for `brain` and `account` working in `workplace`, recording to `store`, with the
@@ -736,6 +737,24 @@ pub(crate) mod tests {
     }
 
     /// A database that can't be opened turns history off, says why, and Nixxa carries on.
+    /// `--continue` skips sessions nothing was said in: launching and quitting at once must not
+    /// hide the last real conversation.
+    #[tokio::test]
+    async fn continue_skips_sessions_nothing_was_said_in() {
+        use nixxa_contracts::{Message, NewSession, Role, Timestamp};
+
+        let store = MemoryStore::default();
+        let here = workspace(&std::env::temp_dir().join("nixxa-continue-here"));
+        let new = |at| NewSession { workspace: here.clone(), account: scripted().1, started_at: Timestamp(at) };
+        let real = store.create_session(new(10)).await.unwrap();
+        store.append_message(&real.id, Message::text(Role::User, "fix the build", Timestamp(11))).await.unwrap();
+        let empty = store.create_session(new(20)).await.unwrap();
+        assert_eq!(latest_session(&store, &here.root).await.unwrap(), Some(real.id));
+        assert_ne!(Some(empty.id), latest_session(&store, &here.root).await.unwrap());
+        let elsewhere = std::env::temp_dir().join("nixxa-continue-elsewhere");
+        assert_eq!(latest_session(&store, &elsewhere).await.unwrap(), None);
+    }
+
     #[tokio::test]
     async fn an_unopenable_database_turns_history_off_visibly() {
         let scratch = Scratch::new("e2e5-corrupt");
