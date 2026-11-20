@@ -516,9 +516,19 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **Exit:** the agent runs real commands that provably cannot touch the host outside the
   workspace or reach the network (with tests that try).
 
-### Stage 5 — Real memory
+### Stage 5 — Real memory *(done)*
 - SQLite store, migrations, session list and resume, transcript search.
-- **Exit:** quit mid-session, relaunch, resume where you left off.
+- **Done:** `SqliteStore` (rusqlite bundled, WAL, forward-only migrations, FTS5; D-053–D-055);
+  `Done` summaries marked as `Content::Summary` and `SessionInfo.first_message` (contract
+  changes, D-056); `Controller::resume_session`, which replays the history to the UI, closes tool
+  calls a quit left open and tells the agent the workspace may have changed (D-057); the harness
+  keeps history at `<data dir>/nixxa/nixxa.db` (`MemoryStore` with `--fake`, or with a visible
+  note when the file can't be opened, D-058), lists sessions on `ctrl-s` and resumes the latest
+  one with `--continue` (D-059).
+- **Exit:** quit mid-session, relaunch, resume where you left off. Met: the harness test
+  `stage_five_quit_mid_turn_relaunch_and_resume_where_you_left_off` quits with ctrl-c twice
+  mid-turn, opens a new store on the same file and resumes, and checks the conversation, the
+  activity pane and the brain's history; the same was done by hand with a real model.
 
 ### Stage 6 — Knowledge I: personal (Obsidian + claude-mem)
 - `knowledge` crate with its MCP client (stdio + HTTP) and source-status reporting.

@@ -14,7 +14,17 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 4 — Real sandbox (Linux): done.** Stage 3's Anthropic live checks are still pending.
+**Stage 5 — Real memory: done.** Stage 3's Anthropic live checks are still pending.
+
+**Stage 5 — Real memory, done:**
+- `SqliteStore` in `db/` (rusqlite bundled, WAL, forward-only migrations, FTS5 search;
+  D-053 to D-055); `Content::Summary` and `SessionInfo.first_message` in contracts (D-056);
+- `Controller::resume_session` (D-057);
+- in the harness: history at `<data dir>/nixxa/nixxa.db`, `MemoryStore` with `--fake` or with a
+  visible note when the file can't be opened (D-058), the `ctrl-s` session list and `--continue`
+  (D-059).
+
+**Stage 4 — Real sandbox (Linux): done.**
 
 **Stage 3 — Real brain (in progress).**
 - **Done so far:**
@@ -36,7 +46,7 @@ Linux, macOS and Windows. See
   the workspace guard (D-049); unavailable choices say why, with no fallback (D-051);
 - Ask/Auto approval modes on `shift-tab`, in the harness (D-052).
 
-The store and knowledge are still fakes.
+Knowledge is still a fake.
 Do not implement module behaviour until its stage starts. The stage table in README.md is the source of truth for what is in scope.
 
 ---
