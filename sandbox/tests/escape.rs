@@ -417,3 +417,77 @@ async fn host_sockets_and_home_are_absent() {
     let tmp = sh_out(&sb, "ls -A /tmp").await;
     assert!(tmp.trim().is_empty(), "/tmp inside is not private: {tmp}");
 }
+
+#[tokio::test]
+async fn ptrace_is_blocked() {
+    let scratch = Scratch::new("ptrace");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.ptrace(0, 0, 0, 0), ctypes.get_errno())'").await;
+    assert!(out.trim_end().ends_with(" 1"), "ptrace got through: {out}");
+}
+
+#[tokio::test]
+async fn keyctl_is_blocked() {
+    let scratch = Scratch::new("keyctl");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let (code, _, _) = sh(&sb, "keyctl add user nixxa test @u").await;
+    assert_ne!(code, Some(0), "keyctl succeeded inside the sandbox");
+}
+
+#[tokio::test]
+async fn unshare_is_blocked() {
+    let scratch = Scratch::new("unshare");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    for cmd in ["unshare -U true", "unshare -n true"] {
+        let (code, _, _) = sh(&sb, cmd).await;
+        assert_ne!(code, Some(0), "{cmd} succeeded inside the sandbox");
+    }
+}
+
+#[tokio::test]
+async fn mount_is_blocked() {
+    let scratch = Scratch::new("mount");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let (code, _, _) = sh(&sb, "mkdir -p /tmp/mnt && mount -t tmpfs tmpfs /tmp/mnt").await;
+    assert_ne!(code, Some(0), "mount succeeded inside the sandbox");
+}
+
+#[tokio::test]
+async fn tiocsti_is_blocked() {
+    let scratch = Scratch::new("tiocsti");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let (code, _, _) = sh(&sb, "python3 -c 'import fcntl; f=open(\"/dev/tty\"); fcntl.ioctl(f, 0x5412, b\"x\")'").await;
+    assert_ne!(code, Some(0), "TIOCSTI succeeded inside the sandbox");
+}
+
+#[tokio::test]
+async fn io_uring_is_blocked() {
+    let scratch = Scratch::new("io_uring");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.syscall(425, 1, 0), ctypes.get_errno())'").await;
+    assert!(out.trim_end().ends_with(" 1"), "io_uring_setup got through: {out}");
+}
+
+#[tokio::test]
+async fn af_netlink_socket_is_blocked() {
+    let scratch = Scratch::new("netlink");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let (code, _, _) = sh(&sb, "python3 -c 'import socket; socket.socket(16, 3, 0)'").await;
+    assert_ne!(code, Some(0), "AF_NETLINK socket succeeded inside the sandbox");
+}
+
+#[tokio::test]
+async fn personality_is_blocked() {
+    let scratch = Scratch::new("personality");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.personality(0x40000), ctypes.get_errno())'").await;
+    assert!(out.trim_end().ends_with(" 1"), "personality got through: {out}");
+}
+
+#[tokio::test]
+async fn landlock_denies_writes_to_read_only_paths() {
+    let scratch = Scratch::new("landlock");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let (code, _, _) = sh(&sb, "echo x > /landlock-probe/landlock-test").await;
+    assert_ne!(code, Some(0), "writing under /usr succeeded (Landlock inactive?)");
+}

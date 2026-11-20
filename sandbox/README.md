@@ -16,13 +16,16 @@ directory", D-039); it refuses paths that leave the directory, hides the secrets
 names from commands, and caps time (120 s default, 600 s max) and output (64 KiB per stream).
 
 `bwrap::BwrapSandbox` (Linux, Stage 4, not wired into the harness yet) starts `nixxa-sandboxd`
-inside bubblewrap and talks to it over length-prefixed JSON frames on stdio (`src/protocol.rs`).
-The daemon runs commands as `/bin/sh -c` in their own process group and does reads, writes and
-listings itself with `openat2(RESOLVE_BENEATH)` beneath `/workspace`. Limits: a time limit per
-command, 64 KiB per output stream (the command is killed past it), rlimits, and a
-`systemd-run --user --scope` cgroup with memory and task caps when the user's systemd allows it
-(otherwise the backend is named `bubblewrap (rlimits only, no cgroup)`). It reports
-`isolated: false` until Landlock and seccomp are added. Decisions: D-040 to D-043.
+inside bubblewrap and talks to it over length-prefixed JSON frames on stdio (`src/protocol.rs`,
+protocol VERSION 2). The daemon applies Landlock (filesystem, plus TCP bind/connect where the
+ABI supports it) and a seccomp deny-list to itself at start-up, then runs commands as
+`/bin/sh -c` in their own process group and does reads, writes and listings itself with
+`openat2(RESOLVE_BENEATH)` beneath `/workspace`. Limits: a time limit per command, 64 KiB per
+output stream (the command is killed past it), rlimits, and a `systemd-run --user --scope`
+cgroup with memory and task caps when the user's systemd allows it (otherwise the backend is
+named `bubblewrap (rlimits only, no cgroup)`). It reports `isolated: true` only when
+namespaces, Landlock and seccomp are all active; a kernel without Landlock runs degraded and
+the backend name says so. Decisions: D-040 to D-046.
 
 Tests: `tests/bwrap_conformance.rs` (the contract suite), `tests/bwrap.rs` (cancellation, reset,
 daemon restart, limits) and `tests/escape.rs` (canaries outside the workspace and in `$HOME`,

@@ -22,6 +22,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -149,6 +150,11 @@ struct Inner {
     /// The request being waited for and the pipe to the daemon, so `reset` can cancel it
     /// without waiting for the connection.
     in_flight: StdMutex<Option<(Arc<Mutex<ChildStdin>>, u64)>>,
+    /// Whether the daemon reported Landlock as active (defaults to true until the
+    /// first handshake says otherwise).
+    landlock: AtomicBool,
+    /// Whether the daemon reported seccomp as active.
+    seccomp: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -193,6 +199,8 @@ impl BwrapSandbox {
                 config,
                 conn: Mutex::new(None),
                 in_flight: StdMutex::new(None),
+                landlock: AtomicBool::new(true),
+                seccomp: AtomicBool::new(true),
             }),
         })
     }
@@ -298,7 +306,10 @@ impl Inner {
             let path = format!("/etc/{name}");
             args.extend(["--ro-bind-try".into(), path.clone(), path]);
         }
-        args.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind"].map(str::to_owned));
+        args.extend(
+            ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--tmpfs", "/landlock-probe", "--bind"]
+                .map(str::to_owned),
+        );
         args.extend([host_str(&self.workspace), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
         args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into(), DAEMON_INSIDE.into()]);
         args
@@ -347,8 +358,13 @@ impl Inner {
             SandboxError::Unavailable(format!("the sandbox did not start: {why}{logs}"))
         };
         match tokio::time::timeout(START_TIMEOUT, hello).await {
-            Ok(Ok(FromDaemon::Hello { version })) if version == VERSION => {}
-            Ok(Ok(FromDaemon::Hello { version })) => return Err(failure(format!("daemon speaks version {version}"))),
+            Ok(Ok(FromDaemon::Hello { version, layers })) if version == VERSION => {
+                self.landlock.store(layers.landlock, Ordering::Relaxed);
+                self.seccomp.store(layers.seccomp, Ordering::Relaxed);
+            }
+            Ok(Ok(FromDaemon::Hello { version, .. })) => {
+                return Err(failure(format!("daemon speaks version {version}")));
+            }
             Ok(Ok(other)) => return Err(failure(format!("unexpected first message {other:?}"))),
             Ok(Err(err)) => {
                 // Let the log forwarder catch bubblewrap's last words.
@@ -498,14 +514,20 @@ impl Drop for CancelOnDrop {
 #[async_trait]
 impl Sandbox for BwrapSandbox {
     fn capabilities(&self) -> SandboxCapabilities {
+        let landlock = self.inner.landlock.load(Ordering::Relaxed);
+        let seccomp = self.inner.seccomp.load(Ordering::Relaxed);
+        let mut backend = if self.has_cgroup() {
+            "bubblewrap".to_string()
+        } else {
+            "bubblewrap (rlimits only, no cgroup)".to_string()
+        };
+        if !landlock {
+            backend.push_str(" (no Landlock)");
+        }
         SandboxCapabilities {
-            backend: if self.has_cgroup() {
-                "bubblewrap".into()
-            } else {
-                "bubblewrap (rlimits only, no cgroup)".into()
-            },
-            // Landlock and seccomp are not applied yet (D-008 needs all three layers).
-            isolated: false,
+            backend,
+            // Isolated only when namespaces, Landlock and seccomp are all active.
+            isolated: landlock && seccomp,
             network: false,
             actions: SandboxActionKind::ALL.to_vec(),
         }
