@@ -45,6 +45,8 @@ async fn fifo_read_and_write_fail_fast() {
 async fn mid_send_drop_recovers() {
     let scratch = Scratch::new("mid");
     let Some(sb) = sandbox(scratch.workspace().as_path()) else { return };
+    // A live connection first, so the single poll gets as far as writing the frame.
+    sb.health().await.unwrap();
     let big = "x".repeat(1000 * 1024);
     let fut = sb.execute(next_id(), SandboxAction::WriteFile { path: "/workspace/big.txt".into(), content: big });
     let mut fut = Box::pin(fut);
