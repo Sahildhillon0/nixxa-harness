@@ -73,6 +73,10 @@ pub struct BwrapConfig {
     /// Bytes kept from each of stdout and stderr.
     pub output_cap: u64,
     /// The largest file `ReadFile` returns, and the largest content `WriteFile` accepts.
+    ///
+    /// This must stay comfortably below `MAX_FRAME` (8 MiB): the file content is JSON-encoded
+    /// and wrapped in a frame, so worst-case escaping can roughly double it. The default of
+    /// 1 MiB leaves ample headroom.
     pub file_cap: u64,
     /// `MemoryMax` of the scope (the whole sandbox), in bytes.
     pub memory_max: u64,
@@ -155,6 +159,9 @@ struct Conn {
     next_id: u64,
     /// A request whose caller went away before its reply arrived.
     stale: Option<u64>,
+    /// True while a request frame is being written: dropping mid-write must drop the
+    /// connection rather than try to cancel, since a half-written frame can't be recovered.
+    sending: bool,
 }
 
 impl BwrapSandbox {
@@ -351,7 +358,7 @@ impl Inner {
             }
             Err(_) => return Err(failure("no answer to the handshake".into())),
         }
-        Ok(Conn { child, stdin: Arc::new(Mutex::new(stdin)), stdout, next_id: 1, stale: None })
+        Ok(Conn { child, stdin: Arc::new(Mutex::new(stdin)), stdout, next_id: 1, stale: None, sending: false })
     }
 
     /// The live connection, started (or restarted) if needed.
@@ -378,10 +385,14 @@ impl Inner {
         let conn = self.connect(slot).await?;
         let id = conn.next_id;
         conn.next_id += 1;
+        conn.sending = true;
         if let Err(err) = conn.send(&ToDaemon::Request { id, op }).await {
+            conn.sending = false;
+            conn.stale = None;
             *slot = None;
             return Err(err);
         }
+        conn.sending = false;
         conn.stale = Some(id);
         self.set_in_flight(Some((Arc::clone(&conn.stdin), id)));
         let reply = conn.await_reply(id, limit).await;
@@ -392,6 +403,7 @@ impl Inner {
                 Ok(reply)
             }
             Err(err) => {
+                self.set_in_flight(None);
                 *slot = None;
                 Err(err)
             }
@@ -461,11 +473,18 @@ struct CancelOnDrop {
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
         let Some(inner) = self.inner.take() else { return };
+        // Clear the stale in-flight id so a later `reset()` doesn't send a pointless Cancel.
+        inner.set_in_flight(None);
         // Without a runtime the next call settles it instead.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let mut slot = inner.conn.lock().await;
                 if let Some(conn) = slot.as_mut() {
+                    if conn.sending {
+                        // A frame was only partly written: the connection can't be resynchronised.
+                        *slot = None;
+                        return;
+                    }
                     if conn.settle().await.is_err() {
                         *slot = None;
                     }

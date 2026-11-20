@@ -53,7 +53,7 @@ pub(crate) fn read(root: &OwnedFd, path: &str, cap: u64) -> Outcome {
         Ok(rel) => rel,
         Err(why) => return failed(why),
     };
-    let fd = match rustix::fs::openat2(root, rel.as_str(), OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty(), BENEATH) {
+    let fd = match rustix::fs::openat2(root, rel.as_str(), OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK, Mode::empty(), BENEATH) {
         Ok(fd) => fd,
         Err(err) => return failed(errno_words(err)),
     };
@@ -111,11 +111,18 @@ pub(crate) fn write(root: &OwnedFd, path: &str, content: &str, cap: u64) -> Outc
         }
     }
     let at = dir.as_ref().map_or(root.as_fd(), |d| d.as_fd());
-    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let flags = OFlags::WRONLY | OFlags::CREATE | OFlags::TRUNC | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
     let fd = match rustix::fs::openat2(at, name, flags, Mode::from_raw_mode(0o644), BENEATH) {
         Ok(fd) => fd,
         Err(err) => return failed(errno_words(err)),
     };
+    match rustix::fs::fstat(&fd) {
+        Ok(st) if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile => {
+            return failed("that is not a regular file");
+        }
+        Ok(_) => {}
+        Err(err) => return failed(errno_words(err)),
+    }
     match std::fs::File::from(fd).write_all(content.as_bytes()) {
         Ok(()) => Outcome::Written { bytes: content.len() as u64 },
         Err(err) => failed(err.to_string()),

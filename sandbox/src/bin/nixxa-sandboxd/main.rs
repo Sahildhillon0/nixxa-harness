@@ -31,6 +31,9 @@ fn main() {
         };
         std::process::exit(code);
     }
+    // Keep the daemon's /proc entry out of reach of the commands it runs: they share a user and
+    // a PID namespace, so without this any command could open /proc/2/fd/{0,1} and forge frames.
+    let _ = rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable);
     let code = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt.block_on(daemon::serve()),
         Err(err) => {
