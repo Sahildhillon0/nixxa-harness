@@ -80,6 +80,8 @@ internal is `pub(crate)`.
   rendering, token counting, context-window trimming/summarisation, streaming.
 - **Does not own:** executing anything, deciding whether an action is allowed, storage.
 - **Pure-ish:** the brain has network access to its provider and nothing else.
+- **Planned (§11):** local-model profiles (context size, sampling, tool-call mode per model,
+  #13); a plan step in the loop (`Intent::Plan`, #2).
 
 ### `controller/` — decides
 - **Job:** run the agent loop. It is the only orchestrator.
@@ -87,6 +89,13 @@ internal is `pub(crate)`.
   actions → `Sandbox`, knowledge actions → `Knowledge`), session primer and write-back,
   budgets (steps, tokens, time, money), interrupts, retries.
 - **Does not own:** how thinking, execution, storage, knowledge lookup or rendering work.
+- **Planned (§11):**
+  - plan mode (#2);
+  - secret redaction of everything entering the brain's context (#3);
+  - enforcing the project policy file (#5);
+  - the test/lint loop (#7);
+  - waking on background-task results (#9);
+  - several controllers side by side for parallel agents (#6).
 
 ### `sandbox/` — acts
 - **Job:** execute a `SandboxAction` in isolation and return an `Observation`.
@@ -95,12 +104,21 @@ internal is `pub(crate)`.
   and truncation.
 - **Does not own:** deciding what to run. It enforces its own hard limits and does not trust
   the controller to have been strict enough.
+- **Planned (§11):**
+  - the host-side egress proxy behind the network allowlist (#1);
+  - PTY sessions for the user's terminal (#16);
+  - background jobs (#9) and long-running services (language servers, sandboxed MCP servers);
+  - workspace checkpoints and the `Patch` action behind undo (#15);
+  - LSP queries and the repo map as built-in actions (#8);
+  - read-only mounts for paths the project policy protects (#5).
 
 ### `db/` — remembers (Nixxa's own records)
 - **Job:** persist and retrieve Nixxa sessions.
 - **Owns:** schema, migrations, the storage engine, transcript and action-log storage, search.
 - **Does not own:** external memory systems (that is `knowledge`), deciding what is worth
   remembering, how it is shown.
+- **Planned (§11):** audit records (who or what approved each action, network requests,
+  redactions, checkpoints), replay, and a hash-chained JSONL export (#4).
 
 ### `knowledge/` — connects
 - **Job:** give the agent access to memory and context that lives *outside* Nixxa, and write
@@ -110,6 +128,7 @@ internal is `pub(crate)`.
   result shaping and truncation.
 - **Does not own:** deciding when to query or write (controller), Nixxa's own transcripts (db).
 - **Runs on the host, never in the sandbox.** Details in §5.
+- **Planned (§11):** user-added MCP servers and skills as sources (#10).
 
 ### `accounts/` — holds the keys
 - **Job:** store every account and credential the user adds, for any model provider or
@@ -128,6 +147,15 @@ internal is `pub(crate)`.
   prompts, rendering the event stream, choosing and constructing concrete modules.
 - **Does not own:** any agent logic. If the harness contains an `if` about what the agent
   should do, it belongs in the controller.
+- **Planned (§11):**
+  - the ctrl+t terminal pane (#16);
+  - slash commands (#10);
+  - network settings (#1);
+  - several sessions in tabs, git worktrees and the merge review (#6);
+  - notifications (#9);
+  - reading `AGENTS.md` and handing its rules to the controller (#5);
+  - two more frontends, `nixxa acp` (#11) and `nixxa run --ci` (#12), each implementing
+    `ApprovalPort` + `EventSink`.
 
 ---
 
@@ -204,6 +232,23 @@ that escape the workspace never succeed, `reset` keeps the workspace, an isolate
 supports `Exec` really runs `echo`, and dropping an in-flight `execute` doesn't wedge the
 backend (the next call works).
 
+### Planned contract changes (§11)
+These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
+`feat(contracts)` commit with conformance tests.
+
+| Change | For |
+|---|---|
+| `SandboxAction::Patch { path, edits, expected_hash }` (search/replace hunks against a known file state) | precise edits, plan diffs, undo (#15, #2) |
+| `Sandbox::checkpoint()` → `CheckpointId`, `Sandbox::restore(CheckpointId)`, `Sandbox::diff(from, to)` | undo (#15), worktree review (#6) |
+| `NetworkPolicy { Off, Allow(domains), Open }`, `Sandbox::set_network(policy)`; `Observation.network: Vec<NetRequest>` (each request made while an action ran, allowed or blocked) | network allowlist (#1), audit (#4) |
+| Background jobs: `Exec { background: true }` → `JobId`; `JobStatus`, `JobOutput`, `JobStop` actions; `Event::JobFinished` | background tasks (#9) |
+| Terminal: `Sandbox::open_terminal(size)` → a PTY stream (input, output, resize) | ctrl+t (#16) |
+| `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
+| `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
+| `Verdict` provenance (`user`, `auto`, `plan`, `policy:<rule>`, `ci`) on every `ActionRecord` | audit (#4), CI (#12) |
+| `Event::SecretRedacted { kind, source }`, `Event::CheckResult`, `Event::NetworkRequest` | redaction (#3), test loop (#7), network log (#1) |
+| `ProjectPolicy` (typed rules from `AGENTS.md`) in `ControllerConfig` | policy file (#5) |
+
 ---
 
 ## 4. The agent loop
@@ -242,6 +287,21 @@ backend (the next call works).
 The user can interrupt at any point; the controller cancels the in-flight brain stream,
 sandbox action or knowledge call and records the interruption.
 
+### Planned changes to the loop (§11)
+- **Before step 2:** everything entering the context (user text, observations, knowledge
+  results) passes the **secret scrubber** (#3). What's stored is the scrubbed form too.
+- **Step 3** gains two checks that run *before* any approval:
+  - the **project policy** (#5): protected paths, denied commands;
+  - in plan mode, **"is this in the approved plan?"** (#2). Anything outside the plan falls
+    back to Ask.
+- **Before step 4:** a **checkpoint** is taken before any action that can change files (#15).
+- **After a turn that changed files:** the **verify loop** runs the project's checks (#7) and
+  LSP diagnostics (#8). Failures go back to step 2, until they pass or the loop budget runs out.
+- **Plan mode** inserts a phase before execution. The agent investigates read-only (reads,
+  lists and LSP queries need no approval), then returns `Intent::Plan`: ordered edits (as
+  diffs) and commands. The user approves, edits or rejects the plan as a whole; the approved
+  steps then run without per-step prompts.
+
 ---
 
 ## 5. Integrations (the `knowledge` module)
@@ -262,7 +322,7 @@ Logseq, a team wiki) is a new folder under `knowledge/sources/` plus a config en
   flows both ways between Claude Code and Nixxa.
 - **Reached via:** claude-mem's local worker service (host/port read from claude-mem's own
   settings file in its data directory) and its MCP search server. The exact API is pinned
-  against a specific claude-mem version in Stage 6 and covered by a contract test.
+  against a specific claude-mem version in Stage 10 and covered by a contract test.
 - **Discovery (all OSs):** data directory `~/.claude-mem` (`%USERPROFILE%\.claude-mem` on
   Windows), overridable by `CLAUDE_MEM_DATA_DIR` or Nixxa config.
 
@@ -323,7 +383,7 @@ Any account, any provider, any integration — and as many per provider as the u
 |---|---|---|
 | `ApiKey` | Anthropic Console, OpenAI, Gemini, OpenRouter, Mistral, Groq, Context7, OpenAI-compatible endpoints | key in OS keychain |
 | `Cloud` | Bedrock, Vertex AI, Azure / Microsoft Foundry | a reference to the cloud's own profile/credentials (Nixxa does not copy them) |
-| `SignIn` | providers that officially allow third-party OAuth sign-in. First: OpenRouter's OAuth PKCE flow (Stage 3), which issues a user-controlled key | the key or token in the OS keychain; refresh where a provider issues expiring tokens (Stage 8) |
+| `SignIn` | providers that officially allow third-party OAuth sign-in. First: OpenRouter's OAuth PKCE flow (Stage 3), which issues a user-controlled key | the key or token in the OS keychain; refresh where a provider issues expiring tokens (Stage 13) |
 | `Local` | Ollama, LM Studio, llama.cpp | base URL only |
 | `Env` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, … | not stored; read at startup, shown as a read-only account |
 
@@ -358,7 +418,7 @@ recorded in the DESIGN.md decision log before it is built.
   used; the user can switch account mid-session (takes effect on the next brain call).
 - Keys are validated on add with the cheapest call the provider offers.
 - Usage and cost are tracked **per account** (shown in the status bar and the accounts screen,
-  and used by Stage 9 budgets).
+  and used by Stage 14 budgets).
 - Credentials never reach: the sandbox, the model's context, the db, claude-mem, the vault,
   logs, or crash reports. `Credential` redacts itself and is zeroised on drop.
 - Removing an account deletes its keychain entry and, for sign-in methods, revokes the token
@@ -383,12 +443,36 @@ recorded in the DESIGN.md decision log before it is built.
   them only through the controller.
 - **Your knowledge does go to the LLM provider** whenever it enters the context. The TUI shows
   when vault or memory content is being sent. A per-source "never send" switch is part of
-  Stage 9 policy.
+  Stage 14 policy.
 - **Secrets never enter the sandbox.** API keys live in the host process. The sandbox gets a
   clean environment.
 - **The sandbox enforces its own limits** (CPU, memory, wall time, output size, file system
   scope, network) independently of the controller.
-- **Network is off by default** inside the sandbox.
+- **Network is off by default** inside the sandbox. The only planned way out is the host-side
+  **egress proxy** (#1):
+  - it allows only the domains the user allowed for this session, and logs every request;
+  - "open" mode still goes through the proxy and is still logged;
+  - raw sockets (anything not using the proxy, including UDP) stay blocked.
+
+  An allowed domain is still a channel out. For example, a package registry or GitHub can
+  receive data. That's why the status bar always shows the network state.
+- **A repository's own files are untrusted input** (#5, #10). `AGENTS.md`, project skills and
+  project slash commands can only make Nixxa **stricter**. They can never turn on the network,
+  Auto mode, or a looser rule than the user's own settings. Project skills and commands are
+  shown, and approved, the first time they're used.
+- **Secret redaction is defence in depth, not a guarantee** (#3). The scrubber catches known
+  key formats, high-entropy assignments and the exact secrets Nixxa itself holds (as
+  fingerprints from `accounts`). Reading files such as `.env` or `*.pem` asks first.
+- **The ctrl+t terminal is the user, not the agent** (#16). It runs in the same place as the
+  agent (inside the same sandbox for sandboxed places), so it has the same reach. What's typed
+  there isn't approved or sent to the provider; it's recorded in the session log and shared
+  with the agent only when the user chooses.
+- **User-added MCP servers** run where the user says: on the host (trusted like any program the
+  user installs), or inside the sandbox. Their tools are treated as mutating unless the user
+  marks them read-only (#10).
+- **CI mode never runs on untrusted code with secrets** (#12): no `pull_request_target`
+  checkout of a fork's head. The provider key comes from CI secrets and stays outside the
+  sandbox.
 
 ### How the process model evolves
 - **Stages 2–3:** single process. The sandbox is a fake, labelled *not isolated* in the TUI. If
@@ -397,7 +481,15 @@ recorded in the DESIGN.md decision log before it is built.
 - **Stage 4:** the sandbox moves out of process: a thin client launches `nixxa-sandboxd`
   inside bubblewrap + Landlock + seccomp (Linux) and talks to it over a framed protocol on
   stdio. **The trait does not change.**
-- **Stage 10:** backends for macOS (Seatbelt profile) and Windows (AppContainer or
+- **Stage 6:** the daemon stops being "one command at a time, then kill everything" (D-043).
+  It tracks each job (the agent's command, the user's terminal, background jobs, services) as
+  its own process tree with its own limits. Kills target one job, never the user's shell. The
+  host side gains the egress proxy, reached from inside through a Unix socket the daemon
+  forwards to `127.0.0.1` in the sandbox.
+- **Stage 12:** background sessions. A long-running `nixxa` service hosts the controllers, and
+  the TUI becomes a client that can detach and re-attach. Until then, background work lives
+  inside a running TUI.
+- **Stage 16:** backends for macOS (Seatbelt profile) and Windows (AppContainer or
   WSL2/container — see open questions). Until an OS has a backend, Nixxa runs there with
   sandbox actions **disabled** (chat and knowledge still work) unless a container runtime
   (Docker/Podman) is available as a fallback backend.
@@ -420,6 +512,11 @@ recorded in the DESIGN.md decision log before it is built.
 | Add a model provider that needs a new kind of credential | `accounts/` (method) + `brain/providers/` (adapter) |
 | Change the look, layout or keybindings | `harness/` |
 | Replace the TUI with a web UI | new frontend crate implementing `ApprovalPort` + `EventSink`; nothing else |
+| Add an editor or CI frontend (ACP, GitHub Action) | a frontend in `harness/` implementing `ApprovalPort` + `EventSink` (§11 #11, #12) |
+| Change the network allowlist presets or the proxy | `sandbox/` (proxy), `harness/` (settings UI) |
+| Add a secret detector | `controller/` (scrubber) |
+| Add a project-policy rule | `contracts` (`ProjectPolicy`) → `harness` (parsing `AGENTS.md`) → `controller` (enforcing) → `sandbox` (if it needs a mount) |
+| Add a slash command | `harness/` (built-in) or a Markdown template in `<config>/nixxa/commands` (user) |
 
 If a change needs more than one row, it is a contract change — see [AGENT.md](AGENT.md).
 
@@ -459,6 +556,260 @@ nixxa-harness/
 ├── accounts/    → crate nixxa-accounts    (lib)   accounts/src/{store,methods/<name>}/
 └── harness/     → crate nixxa-harness     (bin `nixxa`)   harness/src/tui/
 ```
+
+---
+
+## 11. Planned capabilities
+
+Re-planned on 2026-11-23 (D-060). Each capability fits inside the existing modules: no new
+crate, and the dependency rule doesn't change. Contract changes are listed in §3 and land with
+their stage.
+
+| # | Capability | Lives in | Stage |
+|---|---|---|---|
+| 1 | Network allowlist per session, via a logging host-side proxy; network settings in the harness | sandbox, harness | 6 |
+| 16 | `ctrl+t` terminal in the harness, in place of the details pane | sandbox, harness | 6 |
+| 9 | Background tasks with notifications (in-session jobs) | sandbox, controller, harness | 6 |
+| 15 | Patch/edit action and undo (checkpoints) | contracts, sandbox, controller, harness | 7 |
+| 3 | Secret redaction before anything reaches the provider | controller, accounts | 7 |
+| 5 | Project policy file (`AGENTS.md`) | harness, controller, sandbox | 7 |
+| 2 | Plan / dry-run mode: approve the whole plan at once | contracts, brain, controller, harness | 8 |
+| 7 | Auto test/lint loop within a budget | controller | 8 |
+| 8 | LSP diagnostics and a repo map | sandbox | 9 |
+| 10 | User-added MCP servers, skills and slash commands | knowledge, harness | 11 |
+| 6 | Parallel agents: git worktrees, each in its own sandbox, with a merge review; parallel sessions on different tasks | controller, harness | 12 |
+| 9 | Background sessions (detach and re-attach) | harness | 12 |
+| 13 | Local-model profiles | brain, harness | 13 |
+| 4 | Session replay and audit export | db, harness | 14 |
+| 11 | Editor integration through the Agent Client Protocol | harness | 15 |
+| 12 | GitHub Action / CI mode | harness | 15 |
+| 14 | Team features: shared policy and budgets, org-wide audit logs, session sharing | a separate server, later | 18 |
+
+### #1 Network allowlist (sandbox + harness)
+- **Off by default**, as today. The user allows domains per session. There are presets:
+  - **crates.io:** `crates.io`, `index.crates.io`, `static.crates.io`;
+  - **npm:** `registry.npmjs.org`;
+  - **PyPI:** `pypi.org`, `files.pythonhosted.org`;
+  - **GitHub;**
+  - plus any domain the user types.
+- **Open** gives full internet for the session. It still goes through the proxy and is still
+  logged. The user turns it on and off in the harness's network settings, which a slash command
+  (`/net`) or a key opens; the status bar always shows `net: off`, `net: 3 domains` or
+  `net: OPEN`.
+- **How the proxy works:** it runs on the host, in the sandbox crate, started by the backend.
+  - The sandbox still has only `lo`. The daemon forwards `127.0.0.1:<port>` inside the sandbox
+    to the proxy's Unix socket, which is bind-mounted in.
+  - Commands get `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` (cargo, npm, pip and git honour them).
+    A tool that ignores them fails closed.
+  - HTTPS uses `CONNECT`: the proxy allows or blocks by host name and checks the TLS SNI
+    matches. There's no TLS interception and no injected CA. DNS is resolved by the proxy on the
+    host.
+  - Every request (host, port, method/URL for plain HTTP, bytes, allowed or blocked, time) is
+    logged. It's attached to the action's observation (`Observation.network`), shown in the
+    activity pane, and stored for the audit (#4).
+- **A project can ask for domains** in `AGENTS.md` (#5). The harness shows the request; only the
+  user can grant it.
+- **Exit test:** a fresh Rust project with a dependency builds and runs `cargo test` inside the
+  sandbox with only crates.io allowed; a request to any other host is blocked and logged.
+
+### #16 Terminal on `ctrl+t` (sandbox + harness)
+- **Opening it:** `ctrl+t` replaces the details pane with an interactive terminal (a PTY
+  rendered with a VT100 emulator widget); pressing it again goes back. The shell runs **in the
+  same place as the agent**:
+  - for sandboxed places, inside the same sandbox (the daemon opens a PTY job);
+  - in This directory, the user's own shell in that directory.
+- **It's you, not the agent:** nothing typed there is approved, scrubbed or sent to the
+  provider. The session log records that a terminal was used, and a "share with the agent"
+  action sends a chosen part of its output as a message.
+- **Daemon change:** it can't kill the user's shell when the agent's command ends, which is why
+  Stage 6 moves the daemon to per-job tracking (§7).
+
+### #9 Background tasks and notifications (sandbox + controller + harness)
+- **In-session jobs (Stage 6):** the agent can start a long command in the background
+  (`Exec { background: true }` → `JobId`), check on it, read its output and stop it. Each job
+  has its own limits and output files. When a job ends, the controller tells the agent at its
+  next step. If the agent is idle and waiting on that job, the controller starts a turn (within
+  budget).
+- **Notifications** (desktop notification where available, the terminal bell, a status-bar
+  badge) fire when a job, a turn or a test loop finishes while the user is away from the pane.
+- **Background sessions (Stage 12)** keep whole agent runs going without the TUI open. This
+  needs the long-running `nixxa` service (§7).
+
+### #15 Patch action and undo (contracts + sandbox + controller + harness)
+- **`SandboxAction::Patch`:** search/replace hunks against the file's hash at proposal time, so
+  a stale edit fails instead of clobbering. It's what the agent uses for edits, what plan mode
+  shows as diffs, and what makes edits exactly reversible. `WriteFile` stays for new files.
+- **Checkpoints:** before any action that can change files (patch, write, or exec), the sandbox
+  backend snapshots the workspace into a shadow store outside it
+  (`<data dir>/nixxa/checkpoints/<session>`: a separate git object store that honours
+  `.gitignore`, with a size cap).
+- **Undo:** `/undo` (or a key) shows the diff back to the checkpoint before the last action or
+  turn, and restores it on confirmation. This works in every place, including the real files in
+  This directory and Work on my files. Effects outside the workspace (network calls, `/tmp`)
+  can't be undone, and the confirmation says so.
+
+### #3 Secret redaction (controller + accounts)
+- **What's scrubbed:** everything entering the brain's context: user messages, file reads,
+  command output, knowledge results.
+- **Detectors:**
+  - known key formats: Anthropic, OpenAI, GitHub, AWS, GCP, Slack, Stripe, JWTs, PEM private
+    keys, connection strings with passwords;
+  - high-entropy values in `KEY=…`-style assignments;
+  - exact matches of secrets Nixxa holds. `accounts` gives the controller salted fingerprints,
+    never the secrets.
+- **Replacement:** a match becomes a stable placeholder such as `‹secret:aws-access-key#3f2a›`
+  (the same value gets the same placeholder within a session), and an `Event::SecretRedacted`
+  warning is shown. The user can send one item through anyway.
+- **Storage:** the store keeps the scrubbed form, so the db, the vault and claude-mem never get
+  the secret either.
+- **Sensitive files:** reading `.env`, `*.pem`, `id_*` and similar asks first, even in Auto.
+- **If the agent writes a placeholder into a file,** it's warned that the file contains a
+  placeholder, not the secret.
+
+### #5 Project policy file: `AGENTS.md` (harness + controller + sandbox)
+- **Where it's read:** the harness reads `AGENTS.md` at the workspace root (the cross-tool
+  convention) and in subdirectories; for files under a subdirectory, the nearest one wins.
+- **Two parts:**
+  - **Prose:** goes into the agent's instructions, labelled as project rules.
+  - **A fenced ` ```nixxa-policy ` TOML block:** enforced by the controller at the policy gate,
+    before any approval:
+    - `protect` (globs never written, e.g. `migrations/**`);
+    - `ask_read` (globs that ask before reading);
+    - `deny_commands` / `ask_commands` (patterns);
+    - `checks` (the test/lint commands for #7);
+    - `network` (domains the project asks for);
+    - `budgets`.
+- **Enforcement:** a patch or write to a protected path is denied, with the rule shown. As
+  defence in depth, the sandbox mounts protected paths read-only, so a command can't change them
+  either.
+- **Layering:** user policy (`<config dir>/nixxa/policy.toml`) and, later, org policy (#14)
+  layer on top; the strictest rule wins. A project file can never loosen anything (§7).
+
+### #2 Plan / dry-run mode (contracts + brain + controller + harness)
+- **The mode:** a third approval mode. `shift-tab` cycles Ask → Plan → Auto.
+- **Investigating:** in Plan, the agent first investigates read-only. Reads, lists, LSP queries
+  and the repo map need no approval; nothing writes or runs.
+- **The plan:** it then proposes `Intent::Plan`: ordered steps, each a patch (shown as a diff)
+  or a command, with what it expects and the checks it will run.
+- **Approval:** the harness shows the whole plan. The user approves it, removes or edits steps,
+  rejects it, or replies with feedback for a new plan.
+- **Execution:**
+  - Approved steps run without per-step prompts.
+  - A step whose file changed since the plan was made (hash mismatch) stops for re-planning.
+  - Any action outside the plan falls back to Ask.
+  - The verify loop (#7) runs at the end.
+
+### #7 Test/lint loop (controller)
+- **The checks** come from `AGENTS.md`, or are detected (`Cargo.toml` → `cargo test` and
+  `cargo clippy`; `package.json` scripts; `pyproject.toml` → `pytest`/`ruff`) and confirmed once
+  per project.
+- **When they run:** after a turn or plan that changed files, inside the sandbox (with the
+  network allowlist for dependencies).
+- **The loop:** failures, trimmed, plus LSP diagnostics (#8) go back to the agent, until the
+  checks pass or the loop budget runs out (iterations, default 5; wall time; tokens/cost). The
+  last result is reported either way.
+- **Approval:** the checks run without per-run approval because the user configured them, but
+  each run is shown.
+
+### #8 LSP diagnostics and a repo map (sandbox)
+- **Language servers run inside the sandbox** as long-running services. rust-analyzer, for
+  example, runs build scripts and proc macros, which is project code, so it never runs on the
+  host for sandboxed places.
+- **Querying them:** the sandbox crate runs the LSP client on its side of the protocol. It
+  exposes `Diagnostics`, `Definition`, `References` and `Hover` as built-in actions, all
+  read-only and free in every mode.
+- **The repo map** is a compact, ranked symbol outline of the workspace (tree-sitter tags,
+  ranked by references) within a token budget. It's built by the sandbox (`RepoMap`), included
+  in the context at session start, and refreshed after large changes.
+- **CodeGraph and Context7** (knowledge, §5) join this stage.
+
+### #10 User MCP servers, skills and slash commands (knowledge + harness)
+- **MCP servers:** configured in `config.toml` (`command` or `url`, credentials from
+  `accounts`, `run = "host" | "sandbox"`) and served by the knowledge module's MCP client.
+  - Their tools appear like any knowledge tool and go through the policy gate.
+  - They're treated as mutating unless the user marks them read-only.
+  - Sandboxed stdio servers run as sandbox services (#8).
+- **Skills:** folders with a `SKILL.md` (name, description, instructions) in
+  `<config dir>/nixxa/skills` and the project's `.nixxa/skills` (Claude Code's `.claude/skills`
+  layout is read too).
+  - They're listed by name and description in the agent's instructions, and loaded on demand
+    through a `skills` knowledge source.
+  - Project skills are untrusted, like `AGENTS.md`.
+- **Slash commands:**
+  - built-ins in the harness: `/plan`, `/ask`, `/auto`, `/net`, `/undo`, `/terminal`,
+    `/agents`, `/replay`, `/export`, `/help`;
+  - user commands: Markdown prompt templates with `$ARGUMENTS`, in
+    `<config dir>/nixxa/commands` and `.nixxa/commands`.
+
+### #6 Parallel agents (controller + harness)
+- **Tabs:** the harness hosts several sessions as tabs. Each has its own controller, sandbox,
+  place and history; budgets and notifications are shared.
+- **Worktrees:** for parallel work on one repo, the harness creates a git worktree per agent
+  (`<data dir>/nixxa/worktrees/<repo>/<branch>`, from the current `HEAD`). Each agent works in
+  its own worktree, mounted in its own sandbox.
+- **Merge review:** when they're done, a review screen shows each branch's diff and test
+  result. The user picks what to merge, and the harness merges or cherry-picks on the host.
+  Conflicts go to the user, or to an agent the user points at them.
+- **Different tasks:** parallel sessions on different tasks work the same way. Two agents never
+  write to the same directory at once: a directory has one writer, and others get a worktree or
+  read-only access.
+
+### #13 Local-model profiles (brain + harness)
+- **What a profile holds,** per server and model:
+  - context window (read from LM Studio's or Ollama's API where possible) and max output;
+  - temperature and top-p;
+  - tool-call mode: native, or a prompted-JSON fallback for models without tool calling;
+  - reasoning on/off and effort;
+  - parallel tool calls;
+  - extra system-prompt text and timeouts.
+- **Presets** for common models (gpt-oss, Qwen, Llama).
+- **Choosing one:** per session, on the setup or accounts screen. The harness hands it to the
+  OpenAI-compatible provider. Context trimming uses the real context size (LM Studio often
+  loads models at 4k).
+
+### #4 Session replay and audit export (db + harness)
+- **What's stored per action:** who or what approved it (user, Auto, plan, a policy rule, CI),
+  its network requests, redactions, checkpoints, and when a terminal was used.
+- **Replay** (from the `ctrl-s` list) is a read-only timeline: step through messages, actions,
+  diffs and outputs with timestamps.
+- **Export** (`nixxa export <session>` or `/export`):
+  - **JSONL:** the audit format. Each record carries the hash of the one before, so edits show.
+  - **Markdown or HTML:** for people.
+  - Exports keep secrets redacted.
+
+### #11 Editor integration: Agent Client Protocol (harness)
+- **The frontend:** `nixxa acp` runs Nixxa as an ACP agent over stdio JSON-RPC, for editors
+  that speak ACP. It's a second frontend in the harness implementing `ApprovalPort` and
+  `EventSink`. The start-up choice comes from the editor's session settings instead of the TUI
+  question.
+- **Mapping:**
+  - prompts → turns;
+  - events → session updates (messages, tool calls with diffs, plans);
+  - approvals → the editor's permission requests;
+  - plan mode → ACP plans.
+- **Where work happens:** execution stays in Nixxa's sandbox. The editor sees the changes on
+  disk and as diffs. Reading the editor's unsaved buffers through ACP is optional and
+  read-only.
+
+### #12 GitHub Action / CI mode (harness)
+- **The command:** `nixxa run --ci --task <text|file>` runs headless: JSONL events to a file or
+  stdout, no human.
+- **Approvals** come only from policy (`AGENTS.md` plus the CI config). Anything that would ask
+  is denied. Alternatively, plan mode posts the plan as a PR comment and waits for a
+  maintainer's `/approve`.
+- **Budgets** are mandatory.
+- **Output:** a branch or PR, a patch, the audit JSONL as an artifact, and a summary comment.
+- **Runs** on Linux runners with bubblewrap, like our own CI.
+- **Packaging:** shipped as a GitHub Action that wraps the binary.
+- **Security** is in §7: no fork code with secrets, and the key stays outside the sandbox.
+
+### #14 Team features (later)
+- **What:** shared policy (org, then user, then project; the strictest wins), org-wide budgets
+  and per-user usage, central audit-log collection (the hash-chained JSONL from #4), read-only
+  session sharing (redacted replays), and SSO.
+- **Needs** a separate, self-hostable server.
+- **Seams in place before then:** policy layering (#5), the audit export (#4), and a remote
+  `EventSink`.
 
 ---
 
@@ -530,7 +881,55 @@ Every stage ends with something that runs and a checklist that must be true befo
   mid-turn, opens a new store on the same file and resumes, and checks the conversation, the
   activity pane and the brain's history; the same was done by hand with a real model.
 
-### Stage 6 — Knowledge I: personal (Obsidian + claude-mem)
+### Stage 6 — Working in the sandbox: network, terminal, background jobs
+- **The daemon moves to per-job tracking:** each job is its own process tree with its own
+  limits (the agent's command, the user's terminal, background jobs, services). This replaces
+  the "kill everything after each command" sweep (D-043) without loosening isolation.
+- **Network allowlist (#1):** the host-side egress proxy with per-request logging; presets and
+  "Open"; network settings in the harness; the network state always shown.
+- **Terminal (#16):** `ctrl+t` replaces the details pane with a terminal in the same place as
+  the agent.
+- **In-session background jobs and notifications (#9).**
+- **Exit:**
+  - `cargo test` on a fresh project with a crates.io dependency passes inside the sandbox with
+    only crates.io allowed, and a request to another host is blocked and logged;
+  - `ctrl+t` opens a shell in the same sandbox, and it survives the agent's commands;
+  - a long background build notifies when it finishes;
+  - the Stage 4 escape tests still pass.
+
+### Stage 7 — Safe edits: patches, undo, secrets, project policy
+- **Patches and undo (#15):** `SandboxAction::Patch`, checkpoints and `/undo` in every place.
+- **Secret scrubbing and warnings (#3).**
+- **`AGENTS.md` policy (#5):** the prose goes into the agent's instructions, and the
+  `nixxa-policy` block is enforced, including read-only mounts for protected paths.
+- **Exit:**
+  - edits arrive as patches, and `/undo` restores the files, including after a command changed
+    them;
+  - a fake key planted in a file never reaches the provider (checked with a recording brain) and
+    the user is warned;
+  - with `protect = ["migrations/**"]`, both a patch and a `rm` command fail to change
+    `migrations/`.
+
+### Stage 8 — Plan mode and the verify loop
+- **Plan mode (#2)** and the Ask → Plan → Auto cycle.
+- **The test/lint loop (#7)** with a budget.
+- **Exit:** in Plan, the agent investigates read-only, proposes edits and commands as one plan,
+  which is approved once and executed. The checks then run, and failures are fixed within the
+  budget. It ends green, or says why not.
+
+### Stage 9 — Code intelligence
+- **LSP (#8):** language servers as sandbox services; diagnostics, definition, references and
+  hover as actions.
+- **The repo map.**
+- **CodeGraph** (detect `.codegraph/`, its tools, a user-triggered indexing command) and
+  **Context7** (resolve-library and query-docs, optional API key from `accounts`).
+- **Exit:**
+  - after an edit, the agent sees and fixes a compiler diagnostic without running a build;
+  - a session starts with a repo map;
+  - in an indexed repo, "who calls X" goes through CodeGraph;
+  - a named library's docs come from Context7.
+
+### Stage 10 — Knowledge: personal (Obsidian + claude-mem)
 - `knowledge` crate with its MCP client (stdio + HTTP) and source-status reporting.
 - Obsidian: cross-OS vault discovery, search/read/links, project-note primer, session-note
   write-back.
@@ -540,15 +939,27 @@ Every stage ends with something that runs and a checklist that must be true befo
   project note, and ends with a note in the vault and a session in claude-mem that Claude
   Code can then find. With neither installed, Nixxa starts normally and says so.
 
-### Stage 7 — Knowledge II: code & docs (CodeGraph + Context7)
-- CodeGraph: detect `.codegraph/`, explore/symbol/call-path tools, user-triggered indexing
-  command, clear health errors.
-- Context7: resolve-library and query-docs tools, optional API key from `accounts`.
-- **Exit:** in an indexed repo the agent answers "who calls X" via CodeGraph instead of grep,
-  and looks up current docs for a named library via Context7, with both calls visible in the
-  activity pane.
+### Stage 11 — Extensibility: MCP servers, skills, slash commands
+- User-added MCP servers (#10), on the host or in the sandbox.
+- Skills (user and project).
+- Built-in and user slash commands.
+- **Exit:**
+  - a user-added stdio MCP server's tool is called through the policy gate;
+  - a skill is loaded on demand;
+  - a user command expands its template;
+  - a project skill asks before its first use.
 
-### Stage 8 — Accounts & providers
+### Stage 12 — Parallel and background agents
+- **Tabs:** several sessions at once.
+- **Worktrees:** one per agent, each in its own sandbox, with the merge review screen (#6).
+- **Background sessions:** the long-running `nixxa` service, a detachable TUI, and
+  notifications (#9).
+- **Exit:**
+  - two agents work on two branches of one repo at once, each in its own sandbox;
+  - the user reviews both diffs and merges one;
+  - a session keeps running after the TUI quits, and re-attaches.
+
+### Stage 13 — Accounts, providers and local-model profiles
 - Provider adapters: Anthropic, OpenAI, Google Gemini, OpenRouter, Mistral, Groq, any
   OpenAI-compatible endpoint, local (Ollama / LM Studio), and cloud routes (Bedrock, Vertex
   AI, Azure / Microsoft Foundry).
@@ -557,22 +968,39 @@ Every stage ends with something that runs and a checklist that must be true befo
   decision log. (OpenRouter's arrived early, in Stage 3.)
 - Encrypted-file fallback for headless Linux; token refresh and revocation.
 - Accounts screen in the TUI; per-account usage and cost.
+- Local-model profiles and presets (#13).
 - **Exit:** add two accounts for one provider and one for another, switch between them in a
   single session, restart, and everything is still there — on Linux, macOS and Windows — with
-  a test proving no secret appears in logs, the db, or the model's context.
+  a test proving no secret appears in logs, the db, or the model's context. A local model runs
+  with its profile's real context size.
 
-### Stage 9 — Policy & control
-- Approval modes (locked / ask / autonomous), per-action and per-source rules (including
-  "never send this source to the provider"), budgets (steps, tokens, time, cost — per session
-  and per account), interrupt, audit log view.
-- **Exit:** the agent can run unattended within a budget and stops cleanly at the limit.
+### Stage 14 — Policy, replay and audit
+- Approval modes (adds LOCKED), per-action and per-source rules (including "never send this
+  source to the provider"), budgets (steps, tokens, time, cost — per session and per account),
+  interrupt, user and project policy layering.
+- Session replay and the audit export (JSONL hash chain, Markdown/HTML) (#4).
+- **Exit:** the agent runs unattended within a budget and stops cleanly at the limit, and the
+  session's exported audit log shows every action, who approved it, and every network request.
 
-### Stage 10 — Every OS
-- Sandbox backends for macOS and Windows; container fallback backend.
-- **Exit:** the Stage 4 escape tests pass on all three OSs (or sandbox actions are clearly
+### Stage 15 — Editor and CI
+- `nixxa acp` (#11) and `nixxa run --ci` plus the GitHub Action (#12).
+- **Exit:**
+  - an ACP-capable editor drives a session, with approvals and diffs shown in the editor;
+  - a GitHub Action run takes a task, works in the sandbox under policy and a budget, and opens
+    a PR with the audit log attached.
+
+### Stage 16 — Every OS
+- Sandbox backends for macOS and Windows, and a container fallback backend. Each carries the
+  Stage 6 capabilities: proxy, PTY, jobs.
+- **Exit:** the Stage 4 and 6 tests pass on all three OSs (or sandbox actions are clearly
   disabled where no backend is available).
 
-### Stage 11 — Hardening & release
-- User-added MCP tools, config UX, packaging (Linux, macOS, Windows), docs
-  site, first release.
+### Stage 17 — Hardening & release
+- Config UX, packaging (Linux, macOS, Windows), docs site, first release.
 - **Exit:** `v0.1.0` tagged and installable on all three OSs.
+
+### Stage 18 — Team (later)
+- Shared policy and budgets, org-wide audit logs and session sharing (#14), with a
+  self-hostable server.
+- **Exit:** an org policy applies on every member's machine and can't be loosened locally; the
+  org's audit view shows every member's sessions.

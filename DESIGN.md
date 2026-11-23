@@ -128,7 +128,7 @@ The mode is always shown in the hint bar and changeable with one key.
 (including on an open prompt, which it approves). Every launch starts in Ask. Auto is shown as
 `mode: AUTO` and each action it approves is marked `auto` in the activity pane. In **This
 directory** (no isolation), switching to Auto takes a second `shift-tab` within 5 seconds. Today
-Ask prompts for every action; the finer Ask rules, LOCKED and budgets come with Stage 9.
+Ask prompts for every action. Plan mode comes with Stage 8 (`shift-tab` will cycle Ask → Plan → Auto); the finer Ask rules, LOCKED and budgets come with Stage 14 (D-060).
 
 ### Keybindings (initial)
 
@@ -139,7 +139,7 @@ Ask prompts for every action; the finer Ask rules, LOCKED and budgets come with 
 | `shift-tab` | switch approval mode: Ask ↔ Auto (D-052) |
 | `j` `k` / arrows | move within focused pane |
 | `ctrl-c` | interrupt the agent (twice: quit) |
-| `m` | cycle approval mode, LOCKED included (Stage 9) |
+| `m` | cycle approval mode, LOCKED included (Stage 14) |
 | `y` / `n` | approve / deny in a prompt |
 | `ctrl-s` | session list: type to search, `enter` resume, `esc` close (Stage 5, D-059) |
 | `ctrl-k` | knowledge panel: source status, paths found, enable/disable per source |
@@ -288,14 +288,15 @@ Both appear in the activity pane as the last lines of the session.
 | D-058 | `--fake` keeps sessions in `MemoryStore`. When there is no data directory or the database can't be opened, Nixxa says why in the conversation ("History is off: …") and continues with `MemoryStore` | The demo must never write the user's history. Losing history shouldn't stop the user from working, so this is the one fallback in Nixxa, and it is always visible; the file is left untouched. | 5 |
 | D-059 | `ctrl-s` opens the session list (§4): newest first, this directory's sessions first, filter by text and transcript search; `enter` resumes, ending the running session first. `nixxa --continue` resumes the latest session for this directory that has a user message (every launch starts a session, so an empty one would hide the real last conversation; the list hides empty sessions too, except the open one), or starts a new one and says so. Each controller's event sink belongs to a generation that starting another session advances, so a replaced session's last events are dropped | Most returns are to the same project, so it comes first. Ending the old session is safe because everything is saved as it goes. Without generations, the old session's interrupt notice would land in the resumed conversation. | 5 |
 
+| D-060 | Roadmap re-planned (2026-11-23). Sixteen new capabilities are placed in the existing modules (ARCHITECTURE.md §11; no new crate, dependency rule unchanged): network allowlist through a logging host-side proxy, a `ctrl+t` terminal, background jobs, patch/undo, secret redaction, an `AGENTS.md` project policy, plan mode, a test/lint loop, LSP and a repo map, user MCP servers/skills/slash commands, parallel agents in worktrees, background sessions, local-model profiles, replay and audit export, ACP and CI frontends, and team features later. The order puts daily-coding features first: Stages 6 (network, terminal, jobs), 7 (safe edits), 8 (plan + verify) and 9 (code intelligence) come before Knowledge, which moves from Stage 6 to 10. Old Stages 7–11 become 9, 13, 14, 16 and 17, with 11 (extensibility), 12 (parallel agents), 15 (editor & CI) and 18 (team) added | The user changed plans: the agent should install dependencies and run tests without opening the network, edits should be reviewable and undoable, and a whole plan approvable at once. Placing each feature inside an existing module keeps the blackbox rule. Project files (`AGENTS.md`, project skills and commands) are untrusted input and can only make Nixxa stricter. The terminal and background jobs require the daemon to track jobs rather than kill everything after each command (D-043 is superseded in Stage 6). Earlier decision rows keep their original stage numbers. | 5 |
 New decisions get the next ID. A reversed decision is struck through, not deleted.
 
 ## 6. Open questions
 
 - Which LLM provider ships first in Stage 3? (Leaning Anthropic via API key.)
-- Which providers, if any, permit third-party subscription sign-in at the time Stage 8 starts?
+- Which providers, if any, permit third-party subscription sign-in at the time Stage 13 starts?
 - Should an account be pinnable per workspace (e.g. this repo always uses `anthropic:work`)?
-- Stage 8, account registry (from the PR #5 review): Windows caps a Credential Manager blob at
+- Stage 13, account registry (from the PR #5 review): Windows caps a Credential Manager blob at
   about 2.5 KB, so a single `nixxa/_registry` entry fits only a dozen or two accounts. Shard it
   (one entry per provider) or use a more compact format? And the registry lock is per process:
   two Nixxa instances adding accounts at once can lose an update. Re-read and retry, or an
@@ -304,9 +305,30 @@ New decisions get the next ID. A reversed decision is struck through, not delete
   Warn when a session is open elsewhere (a lock row with a heartbeat), or refuse?
 - History retention: delete a session from the list, or expire old ones? Today the only way is
   deleting the whole file (README).
-- User-added external tools (Stage 11): MCP only, or also a native plugin trait?
-- Sandbox network policy: off / allow-list / proxy-with-log? (Today: only the sandbox's own
-  loopback, D-045.)
+- User-added external tools (Stage 11): MCP servers and skills are planned (D-060). Also a native
+  plugin trait?
+- Sandbox network policy (Stage 6, D-060: allow-list through a logging proxy, or open). Still
+  open: which presets ship (crates.io, npm, PyPI, GitHub, Go proxy, Maven?); whether git over
+  SSH is ever allowed (the proxy speaks HTTP(S) only); and whether per-domain rules can narrow
+  to URL paths (only for plain HTTP, since HTTPS isn't intercepted).
+- Daemon job model (Stage 6): per-job cgroups under the delegated systemd scope, or a
+  process-tree tracker? Seccomp already forbids new namespaces after start-up, so per-job PID
+  namespaces are out.
+- Checkpoints (Stage 7): a shadow git object store per session, or a content-addressed copy?
+  What size cap, and are ignored build directories excluded?
+- `AGENTS.md` policy block (Stage 7): TOML in a fenced `nixxa-policy` block, or a separate
+  `.nixxa/policy.toml`? Should other tools' files (`CLAUDE.md`, `.cursorrules`) be read as
+  prose?
+- Plan mode (Stage 8): can the user edit a step's command or diff in the TUI, or only remove
+  steps and send feedback?
+- The `ctrl+t` terminal (Stage 6): how is "share with the agent" chosen (a selection, the last
+  command's output)?
+- Background sessions (Stage 12): one `nixxa` service per user, or per workspace? Where does it
+  listen (a Unix socket in the runtime dir, a named pipe on Windows)?
+- ACP (Stage 15): should Nixxa ever let the editor perform file writes, or always write in its
+  own sandbox?
+- Team features (Stage 18): self-hosted only, or also hosted? What can be shared without
+  sharing the content of sessions?
 - "Work on a copy" (D-048): offer the agent's changes back as a patch or a diff to apply, and
   clean the copy up then?
 - Windows sandbox backend: AppContainer, WSL2, or container-only?

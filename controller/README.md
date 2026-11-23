@@ -8,7 +8,7 @@ Runs the agent loop and is the only orchestrator: asks the brain, gates every ac
 | **Does not own** | How thinking, execution, storage or rendering work |
 | **Contract** | Consumes `Brain`, `Sandbox`, `Store`, `Knowledge`, `ApprovalPort`, `EventSink` |
 | **Depends on** | `contracts` only |
-| **Comes alive** | Minimal in Stage 2, full policy in Stage 9 |
+| **Comes alive** | Minimal in Stage 2; redaction and project policy in Stage 7; plan mode and the verify loop in Stage 8; full policy and budgets in Stage 14 |
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
@@ -54,7 +54,7 @@ messages are appended to it.
   When the session was recorded with another account, it says so and continues with the current
   one; a missing or different account never fails the resume.
 
-Not yet: token/time/cost budgets and approval modes (Stage 9), retries, session write-back (Stage 6).
+Not yet: secret redaction and `AGENTS.md` policy (Stage 7), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
 
 Tests: `cargo test -p nixxa-controller`. The fakes live in `tests/controller.rs` because the
 controller may depend only on `contracts`.

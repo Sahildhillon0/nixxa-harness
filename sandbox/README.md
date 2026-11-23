@@ -8,7 +8,7 @@ Executes an `Action` in isolation and returns an `Observation`. The only place a
 | **Does not own** | Deciding what to run |
 | **Contract** | Implements `Sandbox` |
 | **Depends on** | `contracts` only |
-| **Comes alive** | Fake in Stage 2, isolated out-of-process on Linux in Stage 4, macOS + Windows backends in Stage 10 |
+| **Comes alive** | Fake in Stage 2, isolated out-of-process on Linux in Stage 4, network allowlist proxy, terminal PTY and background jobs in Stage 6, patches and checkpoints in Stage 7, LSP and repo map in Stage 9, macOS + Windows backends in Stage 16 |
 
 Backends today: `fake::FakeSandbox` (in memory) and `host::HostSandbox`, which works on the real
 files of one host directory with no isolation. The user picks the second at start-up ("This

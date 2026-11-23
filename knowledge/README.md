@@ -9,7 +9,7 @@ Runs on the host; never inside, or reachable from, the sandbox.
 | **Does not own** | Deciding when to query or write (controller), Nixxa's own transcripts (db) |
 | **Contract** | Implements `Knowledge` |
 | **Depends on** | `contracts` only (gets `Credentials` from the harness) |
-| **Comes alive** | Fake in Stage 2; Obsidian + claude-mem in Stage 6; CodeGraph + Context7 in Stage 7 |
+| **Comes alive** | Fake in Stage 2; CodeGraph + Context7 in Stage 9; Obsidian + claude-mem in Stage 10; user MCP servers and skills in Stage 11 |
 
 | Source | Default | Found via (Linux / macOS / Windows) |
 |---|---|---|

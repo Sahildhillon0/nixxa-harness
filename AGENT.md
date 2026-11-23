@@ -15,6 +15,9 @@ Linux, macOS and Windows. See
 ## Current stage
 
 **Stage 5 — Real memory: done.** Stage 3's Anthropic live checks are still pending.
+**Next: Stage 6 — Working in the sandbox** (network allowlist, `ctrl+t` terminal, background
+jobs). The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each
+new capability lives and the Stages section for the order.
 
 **Stage 5 — Real memory, done:**
 - `SqliteStore` in `db/` (rusqlite bundled, WAL, forward-only migrations, FTS5 search;

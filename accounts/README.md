@@ -9,7 +9,7 @@ accounts per provider), and hands out a valid credential on request.
 | **Does not own** | Calling model APIs (brain), choosing a session's account (controller/harness), UI (harness) |
 | **Contract** | Implements `Credentials` |
 | **Depends on** | `contracts` only |
-| **Comes alive** | In-memory fake in Stage 2; API keys + keychain in Stage 3; all methods, multi-account and switching in Stage 8 |
+| **Comes alive** | In-memory fake in Stage 2; API keys + keychain in Stage 3; all methods, multi-account and switching in Stage 13 |
 
 | Method | Examples |
 |---|---|
@@ -34,7 +34,7 @@ claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md
   (`AuthMethod::Env`). It can't be added over or removed, is never stored, and is the
   provider's default unless a stored account is.
 - **Unavailable keychain:** `CredentialsError::Storage` with a clear message. Env accounts keep
-  working. The encrypted-file fallback is Stage 8.
+  working. The encrypted-file fallback is Stage 13.
 - **Stage 3 scope:** API keys and local servers (`Credential::Local { base_url }`). A local server
   has no secret: its base URL (plain `http(s)://`, no credentials in it) is the registry hint,
   and no keychain secret entry is written. Other credential kinds return `Unsupported` until their

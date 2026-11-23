@@ -65,7 +65,7 @@ struct Registry {
 /// API-key accounts in the OS keychain, plus read-only environment accounts.
 ///
 /// * Stage 3 stores API keys only; other credential kinds arrive with their sign-in methods
-///   (Stage 8) and are refused with [`CredentialsError::Unsupported`].
+///   (Stage 13) and are refused with [`CredentialsError::Unsupported`].
 /// * An environment account is its provider's default whenever no stored account is.
 /// * A keychain that cannot be reached (e.g. headless Linux without a Secret Service) gives
 ///   [`CredentialsError::Storage`]; environment accounts keep working.

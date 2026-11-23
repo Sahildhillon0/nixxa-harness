@@ -127,5 +127,5 @@ can be found, logging is off and the conversation says so.
 Keys: `enter` send · `alt-enter` / `shift-enter` newline · `tab` focus · `shift-tab` Ask/Auto ·
 `j` `k` / arrows move · `end` back to newest · `ctrl-s` sessions · `ctrl-c` interrupt (twice: quit).
 
-Not yet: LOCKED and `m` (Stage 9), "allow all" / edit in the prompt (Stage 9),
-knowledge panel (Stage 6), accounts screen (Stage 3/8), help overlay.
+Not yet: the `ctrl+t` terminal and network settings (Stage 6), plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
+knowledge panel (Stage 10), slash commands (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.

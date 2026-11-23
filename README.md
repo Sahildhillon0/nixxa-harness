@@ -110,12 +110,19 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
-| 6 | Knowledge I — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
-| 7 | Knowledge II — code & docs | **CodeGraph** + **Context7** | planned |
-| 8 | Accounts & providers | All major providers, multiple accounts per provider, cloud accounts, sign-in where permitted, account switcher, per-account usage | planned |
-| 9 | Policy & control | Approval modes, budgets, interrupts, audit log | planned |
-| 10 | Every OS | Sandbox backends for macOS and Windows | planned |
-| 11 | Hardening & release | External tools, packaging, `v0.1.0` | planned |
+| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **next** |
+| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | planned |
+| 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
+| 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
+| 10 | Knowledge — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
+| 11 | Extensibility | User-added **MCP servers**, **skills**, **slash commands** | planned |
+| 12 | Parallel & background agents | Tabs, **git worktrees** each in its own sandbox with a merge review, background sessions | planned |
+| 13 | Accounts & providers | All major providers, multiple accounts per provider, cloud accounts, sign-in where permitted, account switcher, per-account usage, **local-model profiles** | planned |
+| 14 | Policy, replay & audit | LOCKED mode, per-source rules, budgets, **session replay**, **audit export** | planned |
+| 15 | Editor & CI | **Agent Client Protocol** for editors, **GitHub Action / CI mode** | planned |
+| 16 | Every OS | Sandbox backends for macOS and Windows | planned |
+| 17 | Hardening & release | Config UX, packaging, `v0.1.0` | planned |
+| 18 | Team *(later)* | Shared policy and budgets, org-wide audit logs, session sharing | later |
 
 ## Building
 

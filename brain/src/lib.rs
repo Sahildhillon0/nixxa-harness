@@ -2,7 +2,7 @@
 //!
 //! Stage 3: [`AnthropicBrain`] talks to Claude over the Messages API, and [`OpenAiCompatBrain`]
 //! to any OpenAI-compatible server (local models through LM Studio or Ollama), both with
-//! streaming and tool use. More providers arrive in Stage 8.
+//! streaming and tool use. More providers arrive in Stage 13.
 
 pub mod fake;
 mod providers;
