@@ -186,7 +186,7 @@ internal is `pub(crate)`.
 | Trait | Implemented by | Core operations |
 |---|---|---|
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
-| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); subscribe() → `SandboxEvent`s (job finished, network request) |
+| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request) |
 | `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
@@ -237,6 +237,10 @@ backend (the next call works).
   `JobStatus`, `JobOutput` and `JobStop` actions; `Sandbox::subscribe()` → a stream of
   `SandboxEvent` (`JobFinished`, and `NetRequest` for the network log); `SandboxCapabilities.jobs`
   (D-061 to D-063). `Event::JobFinished` for the controller comes with the wake-ups.
+- **Network allowlist (#1):** `NetworkPolicy { Off, Allow(Vec<DomainRule>), Open }`,
+  `Sandbox::set_network(policy)`, `SandboxCapabilities.network: NetworkAccess` (the policy, or
+  `Unrestricted` for a backend that isn't isolated), `Observation.network: Vec<NetRequest>`, and
+  `SandboxEvent::NetRequest` (D-064, D-065).
 
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
@@ -246,7 +250,6 @@ These aren't in `contracts` yet. Each lands with the stage that needs it, as its
 |---|---|
 | `SandboxAction::Patch { path, edits, expected_hash }` (search/replace hunks against a known file state) | precise edits, plan diffs, undo (#15, #2) |
 | `Sandbox::checkpoint()` → `CheckpointId`, `Sandbox::restore(CheckpointId)`, `Sandbox::diff(from, to)` | undo (#15), worktree review (#6) |
-| `NetworkPolicy { Off, Allow(domains), Open }`, `Sandbox::set_network(policy)`; `Observation.network: Vec<NetRequest>` (each request made while an action ran, allowed or blocked) | network allowlist (#1), audit (#4) |
 | Terminal: `Sandbox::open_terminal(size)` → a PTY stream (input, output, resize) | ctrl+t (#16) |
 | `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
@@ -490,7 +493,9 @@ recorded in the DESIGN.md decision log before it is built.
   It tracks each job (the agent's command, the user's terminal, background jobs, services) as
   its own process tree with its own limits. Kills target one job, never the user's shell.
   *Done (D-061, D-062):* each job runs under a supervisor that is a child subreaper, so a job is
-  exactly that supervisor's descendants; the daemon is a subreaper too, as a backstop. The
+  exactly that supervisor's descendants; the daemon is a subreaper too, as a backstop. *Done
+  (D-064):* the egress proxy, a Unix socket mounted at `/run/nixxa` and forwarded from
+  `127.0.0.1:3128`. The
   host side gains the egress proxy, reached from inside through a Unix socket the daemon
   forwards to `127.0.0.1` in the sandbox.
 - **Stage 12:** background sessions. A long-running `nixxa` service hosts the controllers, and
@@ -899,7 +904,10 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **In-session background jobs and notifications (#9).**
 - **Progress:**
   - PR A, the job model and background jobs (D-061 to D-063): done.
-  - PR B (network), PR C (terminal), PR D (wake-ups and notifications): not started.
+  - PR B, the network allowlist (D-064, D-065): done. `cargo test` with a crates.io dependency
+    passes inside the sandbox with only the crates.io preset allowed, and another host is
+    blocked and logged (`needs_internet_cargo_test_with_only_crates_io_allowed`).
+  - PR C (terminal), PR D (wake-ups and notifications): not started.
 - **Exit:**
   - `cargo test` on a fresh project with a crates.io dependency passes inside the sandbox with
     only crates.io allowed, and a request to another host is blocked and logged;

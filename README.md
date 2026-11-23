@@ -28,7 +28,9 @@ Replace one, and the rest never notice.
 > **Stage 6 — Working in the sandbox: in progress.** The agent can run long builds and test
 > suites as **background jobs** (up to 4 at once, 30 min each by default) and check on them while
 > it works; each job is its own process tree, so ending one never touches another. The network
-> allowlist, the `ctrl+t` terminal and notifications come next.
+> is **off** until you allow it: `ctrl+n` lets you allow crates.io, npm, PyPI or GitHub (or your
+> own hosts), or open it; every request is logged, and the status bar always shows `net: …`. The
+> `ctrl+t` terminal and notifications come next.
 
 ---
 
@@ -115,7 +117,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
-| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **in progress** (background jobs done) |
+| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **in progress** (background jobs and the network allowlist done) |
 | 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | planned |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
@@ -184,6 +186,21 @@ another one switches to it right away, in a new session.
 Other settings: `NIXXA_MODEL` (the Claude model; default `claude-sonnet-5-5`), `NIXXA_EFFORT`
 (`low`…`max`, Claude), `NIXXA_LOG` (log level), `NO_COLOR`. See `nixxa --help`. Logs go to
 `<data dir>/nixxa/logs/` and contain metadata only, never your key or messages.
+
+## The network
+
+In the sandbox the network starts **off**. Press `ctrl+n` to change it for this run:
+
+- `1` Off, `2` Allow, `3` Open (press `3` twice; it opens every public host).
+- In Allow, `space` turns a preset on or off (crates.io, npm, PyPI, GitHub), `a` adds your own
+  host (`example.com`, `*.example.com`, an IP, with `:port` if not 443 or 80), `d` removes one.
+- The panel lists recent requests, allowed and blocked; the status bar shows `net: off`,
+  `net: N domains` or `net: OPEN`.
+
+Everything goes through a proxy on your machine: HTTPS is checked against the host it claims,
+names are resolved on your machine, and local and private addresses (your router, your own
+services) are never reachable, whatever you allow. The agent is told the policy and why a request
+was blocked, but can't change it. In **This directory** the network isn't restricted at all.
 
 ## Your history
 
