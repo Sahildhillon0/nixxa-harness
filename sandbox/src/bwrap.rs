@@ -113,7 +113,9 @@ pub struct BwrapConfig {
     pub open_files_max: u64,
     /// Limits on background jobs.
     pub jobs: JobLimits,
-    /// Names the network proxy resolves from this table instead of asking the system (tests).
+    /// Tests only: names the network proxy resolves from this table instead of asking the
+    /// system resolver. The harness leaves it empty.
+    #[doc(hidden)]
     pub hosts: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
 }
 

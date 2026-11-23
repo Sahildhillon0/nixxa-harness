@@ -198,7 +198,7 @@ async fn plain_http_is_sent_on_with_connection_close_and_its_url_logged() {
     let mut client = rig.connect("fg", request).await;
     assert_eq!(answer(&mut client).await, "pong");
     let got = String::from_utf8(rig.received.recv().await.unwrap()).unwrap();
-    assert_eq!(got, "GET /crates?q=1 HTTP/1.1\r\nAccept: */*\r\nHost: allowed.test\r\nConnection: close\r\n\r\n");
+    assert_eq!(got, "GET /crates?q=1 HTTP/1.1\r\nHost: allowed.test\r\nAccept: */*\r\nConnection: close\r\n\r\n");
     let entry = rig.logged().await;
     assert_eq!(entry.method.as_deref(), Some("GET"));
     assert_eq!(entry.url.as_deref(), Some("http://allowed.test/crates?q=1"));
@@ -243,4 +243,35 @@ async fn a_policy_change_applies_to_the_next_connection() {
     let mut client = rig.connect("fg", "GET http://allowed.test/ HTTP/1.1\r\n\r\n").await;
     assert_eq!(answer(&mut client).await, "pong");
     assert_eq!(rig.logged().await.result, NetResult::Allowed);
+}
+
+/// Regression (PR #16 review): the client's own `Host`, and any request after the first, must
+/// never reach the allowed host's address: on a shared address they name other sites.
+#[tokio::test]
+async fn plain_http_sends_only_the_checked_host_and_one_request() {
+    let mut rig = rig(allow(&["allowed.test"])).await;
+    let request = "GET http://allowed.test/ HTTP/1.1\r\nHost: evil.example\r\n\r\n\
+                   GET /second HTTP/1.1\r\nHost: evil2.example\r\n\r\n";
+    let mut client = rig.connect("fg", request).await;
+    assert_eq!(answer(&mut client).await, "pong");
+    let got = String::from_utf8(rig.received.recv().await.unwrap()).unwrap();
+    assert_eq!(got, "GET / HTTP/1.1\r\nHost: allowed.test\r\nConnection: close\r\n\r\n");
+    assert_eq!(rig.logged().await.host, "allowed.test");
+}
+
+#[tokio::test]
+async fn a_request_body_is_sent_once_and_ambiguous_framing_is_refused() {
+    let mut rig = rig(allow(&["allowed.test"])).await;
+    let request = "POST http://allowed.test/up HTTP/1.1\r\nContent-Length: 5\r\n\r\nhelloGET /x HTTP/1.1\r\n\r\n";
+    let mut client = rig.connect("fg", request).await;
+    assert_eq!(answer(&mut client).await, "pong");
+    let got = String::from_utf8(rig.received.recv().await.unwrap()).unwrap();
+    assert!(got.ends_with("Connection: close\r\n\r\nhello"), "{got:?}");
+    rig.logged().await;
+    let smuggled =
+        "POST http://allowed.test/ HTTP/1.1\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n";
+    let mut client = rig.connect("fg", smuggled).await;
+    assert!(answer(&mut client).await.starts_with("HTTP/1.1 400"));
+    assert_eq!(blocked(&rig.logged().await), "a request with both Content-Length and Transfer-Encoding");
+    assert!(rig.received.try_recv().is_err(), "nothing went upstream");
 }

@@ -112,22 +112,31 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_public_v6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
+    let s = ip.segments();
+    let first = s[0];
     !(ip.is_unspecified()
         || ip.is_loopback()
+        || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1) // NAT64 local use, 64:ff9b:1::/48
+        || (s[0] == 0x2001 && s[1] == 0x0db8) // documentation
+        || (s[0] == 0x2001 && s[1] == 0) // Teredo: its IPv4 address is hidden
+        || (s[0] == 0x100 && s[1] == 0 && s[2] == 0 && s[3] == 0) // discard, 100::/64
         || (first & 0xfe00) == 0xfc00 // unique local
         || (first & 0xffc0) == 0xfe80 // link-local
         || (first & 0xffc0) == 0xfec0 // site-local (deprecated)
         || (first & 0xff00) == 0xff00) // multicast
 }
 
-/// The IPv4 address carried by an IPv4-mapped, IPv4-compatible or NAT64 (64:ff9b::/96) address.
+/// The IPv4 address carried by an IPv4-mapped, IPv4-translated, IPv4-compatible, NAT64
+/// (64:ff9b::/96) or 6to4 (2002::/16) address.
 fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
     let s = ip.segments();
-    let v4 = || Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    let v4 = |hi: u16, lo: u16| Ipv4Addr::new((hi >> 8) as u8, hi as u8, (lo >> 8) as u8, lo as u8);
     match s {
-        [0, 0, 0, 0, 0, 0xffff, ..] | [0x64, 0xff9b, 0, 0, 0, 0, ..] => Some(v4()),
-        [0, 0, 0, 0, 0, 0, hi, _] if hi != 0 => Some(v4()),
+        [0, 0, 0, 0, 0, 0xffff, ..] | [0x64, 0xff9b, 0, 0, 0, 0, ..] | [0, 0, 0, 0, 0xffff, 0, ..] => {
+            Some(v4(s[6], s[7]))
+        }
+        [0, 0, 0, 0, 0, 0, hi, _] if hi != 0 => Some(v4(s[6], s[7])),
+        [0x2002, hi, lo, ..] => Some(v4(hi, lo)),
         _ => None,
     }
 }
@@ -207,10 +216,20 @@ mod tests {
             "::ffff:10.1.1.1",
             "64:ff9b::a00:1",
             "::127.0.0.1",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "2002:7f00:1::",
+            "2002:c0a8:101::1",
+            "64:ff9b:1::a00:1",
+            "2001:db8::1",
+            "100::1",
+            "2001:0:4136:e378::1",
         ] {
             assert!(!is_public(ip.parse().unwrap()), "{ip} must not count as public");
         }
-        for ip in ["1.1.1.1", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:1.1.1.1"] {
+        for ip in
+            ["1.1.1.1", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:1.1.1.1", "2002:101:101::1"]
+        {
             assert!(is_public(ip.parse().unwrap()), "{ip} is public");
         }
     }

@@ -277,8 +277,7 @@ impl Shared {
                 method: Some(head.method.clone()),
                 url: Some(head.target.clone()),
             };
-            let upstream_head = http::upstream_head(&head, &req.host, req.port, &path);
-            self.forward(&policy, req, client, upstream_head, body).await;
+            self.forward(&policy, req, client, &head, &path, body).await;
         } else {
             refuse(&mut client, 400, "this proxy takes CONNECT host:port, or an absolute http:// URL").await;
         }
@@ -329,25 +328,54 @@ impl Shared {
         self.log(req, hello.len() as u64 + up, down, NetResult::Allowed);
     }
 
-    /// Plain HTTP: check, resolve, connect, send the rewritten head and the rest.
+    /// Plain HTTP: check, resolve, connect, then exactly one request: the head with `Host`
+    /// written from the checked URL, and its one body. Nothing the client sends after that body
+    /// is read, so a second request (for another host on the same address) never goes out.
     async fn forward(
         &self,
         policy: &NetworkPolicy,
         mut req: Request,
         mut client: UnixStream,
-        head: Vec<u8>,
-        body: Vec<u8>,
+        head: &http::Head,
+        path: &str,
+        early: Vec<u8>,
     ) {
-        let (_, mut upstream) = match self.open(policy, &mut req).await {
+        let framing = match http::framing(head) {
+            Ok(framing) => framing,
+            Err(why) => {
+                refuse(&mut client, 400, &why).await;
+                return self.log(req, 0, 0, NetResult::Blocked { reason: why });
+            }
+        };
+        let (host, upstream) = match self.open(policy, &mut req).await {
             Ok(opened) => opened,
             Err((status, why)) => return self.block(&mut client, req, status, why).await,
         };
-        let sent = upstream.write_all(&head).await.is_ok() && upstream.write_all(&body).await.is_ok();
-        if !sent {
+        let upstream_head = http::upstream_head(head, &host.shown(), req.port, path);
+        let (mut client_read, mut client_write) = client.into_split();
+        let (mut upstream_read, mut upstream_write) = upstream.into_split();
+        if upstream_write.write_all(&upstream_head).await.is_err() {
             return self.log(req, 0, 0, NetResult::Allowed);
         }
-        let (up, down) = splice(&mut client, &mut upstream).await;
-        self.log(req, (head.len() + body.len()) as u64 + up, down, NetResult::Allowed);
+        // The response is copied while the body is sent, so a client waiting for
+        // `100 Continue` gets it.
+        let send = http::forward_body(&mut client_read, &mut upstream_write, early, framing);
+        let receive = async {
+            let n = tokio::io::copy(&mut upstream_read, &mut client_write).await.unwrap_or(0);
+            let _ = client_write.shutdown().await;
+            n
+        };
+        tokio::pin!(send, receive);
+        let (body, down) = tokio::select! {
+            sent = &mut send => match sent {
+                Ok(body) => (body, receive.await),
+                // A broken body: nothing more is sent, and the connection ends.
+                Err(_) => (0, 0),
+            },
+            // The server answered and closed before the body was all sent.
+            down = &mut receive => (0, down),
+        };
+        self.log(req, upstream_head.len() as u64 + body, down, NetResult::Allowed);
     }
 
     /// Checks the policy, resolves, and connects to the first public address that answers.

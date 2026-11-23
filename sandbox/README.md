@@ -39,9 +39,12 @@ the backend name says so. Decisions: D-040 to D-046, D-061 to D-063.
 
 **The network (D-064):** `BwrapSandbox` owns a host-side proxy (`src/proxy/`): a Unix socket in a
 private directory mounted read-only at `/run/nixxa`, which the daemon forwards from
-`127.0.0.1:3128`. HTTPS is CONNECT with an SNI check, plain HTTP is absolute-form, names are
-resolved on the host and only public addresses are dialled, IP literals need an exact rule, and
-every request is logged into the foreground command's observation and as a `SandboxEvent`. The
+`127.0.0.1:3128`. HTTPS is CONNECT with an SNI check; plain HTTP is absolute-form, sent as one
+request with `Host` from the checked URL; names are resolved on the host and only public
+addresses are dialled, IP literals need an exact rule, and every request is logged into the
+foreground command's observation and as a `SandboxEvent`. **The allowlist limits which servers
+are reached, not which sites they serve:** inside an HTTPS tunnel the `Host` is encrypted, so
+allowing a name on a shared CDN lets commands ask that server for its other sites too. The
 policy starts Off (no proxy variables, nothing logged). The presets live in `src/network.rs`.
 `HostSandbox` reports the network as unrestricted; `FakeSandbox` keeps the policy it is given.
 
