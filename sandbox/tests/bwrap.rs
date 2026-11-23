@@ -22,7 +22,7 @@ async fn it_describes_itself_as_isolated() {
     assert!(caps.backend.starts_with("bubblewrap"), "{}", caps.backend);
     assert_eq!(caps.backend == "bubblewrap", sb.has_cgroup(), "the name must say when there is no cgroup");
     assert!(caps.isolated, "isolated once Landlock and seccomp are applied");
-    assert!(!caps.network);
+    assert_eq!(caps.network, nixxa_contracts::NetworkAccess::Controlled(nixxa_contracts::NetworkPolicy::Off));
     assert_eq!(caps.actions, SandboxActionKind::ALL.to_vec());
 }
 

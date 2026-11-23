@@ -51,6 +51,8 @@ pub(crate) struct Limits {
     pub max_background_jobs: u64,
     /// Put before every job id, so a restarted daemon never reuses an earlier daemon's ids.
     pub job_prefix: String,
+    /// Whether commands get the network proxy (the policy isn't `Off`).
+    pub network: bool,
 }
 
 /// Per-process resource limits (`setrlimit`, soft = hard, so a command can't raise them).
@@ -90,6 +92,8 @@ pub(crate) enum Op {
     Reset,
     /// Check the daemon is responsive.
     Ping,
+    /// Turn the network proxy on or off for the commands started from now on.
+    Network { on: bool },
 }
 
 /// The isolation layers the daemon applied to itself at start-up.
@@ -221,6 +225,7 @@ mod tests {
             background_output_cap: 13,
             max_background_jobs: 14,
             job_prefix: "2-".into(),
+            network: true,
         }
     }
 
@@ -246,6 +251,7 @@ mod tests {
             },
             ToDaemon::Request { id: 8, op: Op::Reset },
             ToDaemon::Request { id: 9, op: Op::Ping },
+            ToDaemon::Request { id: 10, op: Op::Network { on: true } },
             ToDaemon::Cancel { id: 7 },
         ];
         for msg in to {

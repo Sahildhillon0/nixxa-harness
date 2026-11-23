@@ -25,8 +25,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, DirEntry, JobId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
-    SandboxError, SandboxEvent,
+    ActionId, DirEntry, JobId, NetworkAccess, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind,
+    SandboxCapabilities, SandboxError, SandboxEvent,
 };
 
 use crate::JobLimits;
@@ -414,7 +414,7 @@ impl Sandbox for HostSandbox {
         SandboxCapabilities {
             backend: "host".into(),
             isolated: false,
-            network: true,
+            network: NetworkAccess::Unrestricted,
             jobs: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }

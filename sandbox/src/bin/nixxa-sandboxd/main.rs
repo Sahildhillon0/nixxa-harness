@@ -16,6 +16,8 @@ mod jobs;
 #[cfg(target_os = "linux")]
 mod landlock;
 #[cfg(target_os = "linux")]
+mod network;
+#[cfg(target_os = "linux")]
 #[path = "../../protocol.rs"]
 #[allow(dead_code)]
 mod protocol;
@@ -76,6 +78,7 @@ mod daemon {
     use crate::files;
     use crate::job::{End, Table, no_such_job};
     use crate::jobs::{self, Capture, Spec, Supervisors};
+    use crate::network::{self, Forwarder};
     use crate::protocol::{FrameError, FromDaemon, Limits, Op, Reply, ToDaemon, VERSION, read_frame, write_frame};
 
     /// How often orphans of a dead supervisor are looked for.
@@ -142,6 +145,15 @@ mod daemon {
         let seccomp_ok = nnp_ok && crate::seccomp::apply();
         log(format_args!("layers: landlock={landlock_ok} seccomp={seccomp_ok}"));
         let layers = crate::protocol::ActiveLayers { landlock: landlock_ok, seccomp: seccomp_ok };
+        let supervisors = Supervisors::default();
+        // Bound before the first command runs, so none can take the port first.
+        let forwarder = match Forwarder::start(supervisors.clone(), limits.network).await {
+            Ok(forwarder) => Some(forwarder),
+            Err(err) => {
+                log(format_args!("cannot listen on {}: {err}", network::PROXY));
+                None
+            }
+        };
         if out.send(FromDaemon::Hello { version: VERSION, layers }).is_err() {
             return 4;
         }
@@ -149,8 +161,7 @@ mod daemon {
 
         let background =
             Table::new(limits.max_background_jobs as usize, limits.background_output_cap as usize, &limits.job_prefix);
-        let mut daemon =
-            Daemon { out, limits, root, self_exe, supervisors: Supervisors::default(), background, foreground: None };
+        let mut daemon = Daemon { out, limits, root, self_exe, supervisors, background, foreground: None, forwarder };
         let output = daemon.out.clone();
         let mut sweep = tokio::time::interval(SWEEP_EVERY);
         loop {
@@ -219,6 +230,8 @@ mod daemon {
         self_exe: String,
         supervisors: Supervisors,
         background: Table,
+        /// `127.0.0.1:3128`, if it could be bound.
+        forwarder: Option<Forwarder>,
         /// The agent's foreground command, if one is running.
         foreground: Option<Foreground>,
     }
@@ -231,6 +244,11 @@ mod daemon {
     }
 
     impl Daemon {
+        /// The proxy variables, while the network is on.
+        fn network_env(&self) -> Vec<(String, String)> {
+            if self.forwarder.as_ref().is_some_and(Forwarder::is_on) { network::env() } else { Vec::new() }
+        }
+
         fn reply(&self, id: u64, reply: Reply) {
             let _ = self.out.send(FromDaemon::Reply { id, reply });
         }
@@ -269,6 +287,19 @@ mod daemon {
         async fn handle(&mut self, id: u64, op: Op) {
             match op {
                 Op::Ping => self.reply(id, Reply::Done),
+                Op::Network { on } => match &self.forwarder {
+                    Some(forwarder) => {
+                        forwarder.set(on);
+                        log(format_args!("network on={on}"));
+                        self.reply(id, Reply::Done);
+                    }
+                    None if !on => self.reply(id, Reply::Done),
+                    None => {
+                        let message =
+                            format!("the sandbox couldn't listen on {} for the network proxy", network::PROXY);
+                        self.reply(id, Reply::Error { message });
+                    }
+                },
                 Op::Reset => {
                     self.stop_all().await;
                     log(format_args!("reset id={id}"));
@@ -351,6 +382,8 @@ mod daemon {
                 limit: Duration::from_millis(limit),
                 rlimits: limits.rlimits,
                 self_exe: self.self_exe.clone(),
+                owner: "fg".into(),
+                env: self.network_env(),
             };
             let capture = Capture::First { cap: limits.output_cap as usize };
             let (stop, stopped) = oneshot::channel();
@@ -389,8 +422,15 @@ mod daemon {
             // A long build may use more CPU time than a foreground command is allowed.
             let mut rlimits = limits.rlimits;
             rlimits.cpu_secs = rlimits.cpu_secs.max(limits.background_max_timeout_ms / 1000);
-            let spec =
-                Spec { command, cwd, limit: Duration::from_millis(limit), rlimits, self_exe: self.self_exe.clone() };
+            let spec = Spec {
+                command,
+                cwd,
+                limit: Duration::from_millis(limit),
+                rlimits,
+                self_exe: self.self_exe.clone(),
+                owner: job.id.to_string(),
+                env: self.network_env(),
+            };
             let capture = Capture::Last { stdout: Arc::clone(&job.stdout), stderr: Arc::clone(&job.stderr) };
             // The reply goes out before the task runs (one thread, no await in between), so
             // `Started` always precedes the job's `JobFinished`.

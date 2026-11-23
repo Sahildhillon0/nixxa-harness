@@ -35,20 +35,35 @@ const KILL_PATIENCE: Duration = Duration::from_secs(10);
 /// How long the output readers get once every process of the job is dead.
 const DRAIN: Duration = Duration::from_secs(2);
 
-/// The pids of the live supervisors: the daemon's only legitimate children.
+/// The live supervisors, the daemon's only legitimate children, with who each job is for
+/// (`fg` for the foreground command, else the job's id).
 #[derive(Debug, Clone, Default)]
-pub(crate) struct Supervisors(Arc<Mutex<HashSet<i32>>>);
+pub(crate) struct Supervisors(Arc<Mutex<HashMap<i32, String>>>);
 
 impl Supervisors {
-    fn register(&self, pid: i32) -> Registered {
+    fn register(&self, pid: i32, owner: &str) -> Registered {
         if let Ok(mut set) = self.0.lock() {
-            set.insert(pid);
+            set.insert(pid, owner.to_string());
         }
         Registered { pid, set: self.clone() }
     }
 
     fn contains(&self, pid: i32) -> bool {
-        self.0.lock().is_ok_and(|set| set.contains(&pid))
+        self.0.lock().is_ok_and(|set| set.contains_key(&pid))
+    }
+
+    /// Whose job the process `pid` belongs to: its nearest supervisor's owner.
+    pub(crate) fn owner_of(&self, pid: i32) -> Option<String> {
+        let table = processes();
+        let set = self.0.lock().ok()?;
+        let mut at = pid;
+        for _ in 0..table.len() + 1 {
+            if let Some(owner) = set.get(&at) {
+                return Some(owner.clone());
+            }
+            at = table.get(&at)?.parent;
+        }
+        None
     }
 }
 
@@ -79,6 +94,10 @@ pub(crate) struct Spec {
     pub rlimits: Rlimits,
     /// This binary, to run as the supervisor.
     pub self_exe: String,
+    /// Who the job is for: `fg` or the job's id.
+    pub owner: String,
+    /// Variables added to the job's environment (the network proxy's).
+    pub env: Vec<(String, String)>,
 }
 
 /// How to keep the job's output.
@@ -136,6 +155,7 @@ pub(crate) async fn run(
         .arg("--")
         .arg(&spec.command)
         .current_dir(&spec.cwd)
+        .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::from(OwnedFd::from(theirs)))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -150,7 +170,7 @@ pub(crate) async fn run(
         return failed("the shell exited at once".into());
     };
     // Registered before the next await, so the orphan sweep never mistakes it for an orphan.
-    let registered = supervisors.register(pid);
+    let registered = supervisors.register(pid, &spec.owner);
     let status = shell_status(ours);
     tokio::pin!(status);
 
