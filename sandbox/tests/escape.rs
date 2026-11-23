@@ -171,9 +171,12 @@ async fn dot_dot_traversal_fails() {
         let list = run(&sb, SandboxAction::ListDir { path: path.into() }).await.unwrap();
         assert!(is_failed(&list), "ListDir {path}: {list:?}");
     }
-    let cwd = run(&sb, SandboxAction::Exec { command: "pwd".into(), cwd: Some("..".into()), timeout_ms: None })
-        .await
-        .unwrap();
+    let cwd = run(
+        &sb,
+        SandboxAction::Exec { command: "pwd".into(), cwd: Some("..".into()), timeout_ms: None, background: false },
+    )
+    .await
+    .unwrap();
     assert!(is_failed(&cwd), "an Exec cwd of `..`: {cwd:?}");
     assert_no_secret("cat ..", &sh_out(&sb, "cat ../outside/canary.txt; cat ../../outside/canary.txt").await);
     // The parent of /workspace is the sandbox's own root, not the host directory.
@@ -358,7 +361,7 @@ async fn fork_bomb(cgroup: bool) {
                 i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done; \
                 n=0; for p in /proc/[0-9]*; do n=$((n+1)); done; echo procs=$n";
     let started = Instant::now();
-    let action = SandboxAction::Exec { command: bomb.into(), cwd: None, timeout_ms: Some(15_000) };
+    let action = SandboxAction::Exec { command: bomb.into(), cwd: None, timeout_ms: Some(15_000), background: false };
     match run(&sb, action).await {
         Ok(obs) => {
             if let Outcome::Exec { stdout, .. } = &obs.outcome {
@@ -394,6 +397,7 @@ async fn memory_hog(cgroup: bool) {
         command: "awk 'BEGIN { s = \"xxxxxxxxxxxxxxxx\"; while (1) s = s s }'".into(),
         cwd: None,
         timeout_ms: Some(30_000),
+        background: false,
     };
     let started = Instant::now();
     let obs = run(&sb, hog).await.expect("the hog must end before its time limit");
@@ -412,7 +416,8 @@ async fn sleep_is_killed_by_the_timeout() {
     let scratch = Scratch::new("timeout");
     let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
     let started = Instant::now();
-    let action = SandboxAction::Exec { command: "sleep 1000".into(), cwd: None, timeout_ms: Some(1_000) };
+    let action =
+        SandboxAction::Exec { command: "sleep 1000".into(), cwd: None, timeout_ms: Some(1_000), background: false };
     assert_eq!(run(&sb, action).await.unwrap_err(), SandboxError::Timeout);
     assert!(started.elapsed() < Duration::from_secs(10), "took {:?}", started.elapsed());
     let left = sh_out(&sb, "pgrep -c sleep || true").await;

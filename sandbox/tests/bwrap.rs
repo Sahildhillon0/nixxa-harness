@@ -47,9 +47,12 @@ async fn files_are_shared_with_the_workspace_on_the_host() {
     assert_eq!(sh(&sb, "cat src/host.txt").await.1, "from the host");
     sh(&sb, "mkdir -p out && echo from inside > out/inside.txt").await;
     assert_eq!(std::fs::read_to_string(ws.join("out/inside.txt")).unwrap(), "from inside\n");
-    let obs = run(&sb, SandboxAction::Exec { command: "pwd; ls".into(), cwd: Some("src".into()), timeout_ms: None })
-        .await
-        .unwrap();
+    let obs = run(
+        &sb,
+        SandboxAction::Exec { command: "pwd; ls".into(), cwd: Some("src".into()), timeout_ms: None, background: false },
+    )
+    .await
+    .unwrap();
     assert_eq!(
         obs.outcome,
         Outcome::Exec { exit_code: Some(0), stdout: "/workspace/src\nhost.txt\n".into(), stderr: String::new() }
@@ -118,7 +121,8 @@ async fn timeouts_are_capped_by_the_configured_maximum() {
     config.max_timeout = Duration::from_secs(1);
     let Some(sb) = common::sandbox_with(config) else { return };
     let started = Instant::now();
-    let action = SandboxAction::Exec { command: "sleep 30".into(), cwd: None, timeout_ms: Some(100_000) };
+    let action =
+        SandboxAction::Exec { command: "sleep 30".into(), cwd: None, timeout_ms: Some(100_000), background: false };
     assert_eq!(run(&sb, action).await.unwrap_err(), SandboxError::Timeout);
     assert!(started.elapsed() < Duration::from_secs(8), "{:?}", started.elapsed());
 }

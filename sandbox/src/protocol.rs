@@ -18,10 +18,10 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use nixxa_contracts::{Outcome, SandboxAction};
+use nixxa_contracts::{Outcome, SandboxAction, SandboxEvent};
 
 /// The protocol version both ends must agree on.
-pub(crate) const VERSION: u32 = 2;
+pub(crate) const VERSION: u32 = 3;
 
 /// The largest frame either end sends or accepts, in bytes (the JSON body, without the prefix).
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -41,6 +41,14 @@ pub(crate) struct Limits {
     pub write_cap: u64,
     /// Per-process rlimits applied to every command.
     pub rlimits: Rlimits,
+    /// Default time limit for a background job, in milliseconds.
+    pub background_default_timeout_ms: u64,
+    /// The most time any background job gets, in milliseconds.
+    pub background_max_timeout_ms: u64,
+    /// Bytes kept from each stream of a background job.
+    pub background_output_cap: u64,
+    /// The most background jobs running at once.
+    pub max_background_jobs: u64,
 }
 
 /// Per-process resource limits (`setrlimit`, soft = hard, so a command can't raise them).
@@ -99,6 +107,8 @@ pub(crate) enum FromDaemon {
     Hello { version: u32, layers: ActiveLayers },
     /// The answer to the request with this id.
     Reply { id: u64, reply: Reply },
+    /// An unsolicited event (job completion, network request, terminal output).
+    Event { event: SandboxEvent },
 }
 
 /// The result of one request.
@@ -204,6 +214,10 @@ mod tests {
             read_cap: 4,
             write_cap: 5,
             rlimits: Rlimits { nproc: 6, fsize: 7, nofile: 8, cpu_secs: 9, data: 10 },
+            background_default_timeout_ms: 11,
+            background_max_timeout_ms: 12,
+            background_output_cap: 13,
+            max_background_jobs: 14,
         }
     }
 
@@ -223,6 +237,7 @@ mod tests {
                         command: "echo hi".into(),
                         cwd: Some("src".into()),
                         timeout_ms: None,
+                        background: false,
                     },
                 },
             },

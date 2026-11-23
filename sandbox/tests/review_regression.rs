@@ -30,7 +30,11 @@ async fn proc2_fd_forgery_fails() {
 async fn fifo_read_and_write_fail_fast() {
     let scratch = Scratch::new("fifo");
     let Some(sb) = sandbox(scratch.workspace().as_path()) else { return };
-    let _ = run(&sb, SandboxAction::Exec { command: "mkfifo f".into(), cwd: None, timeout_ms: Some(5000) }).await;
+    let _ = run(
+        &sb,
+        SandboxAction::Exec { command: "mkfifo f".into(), cwd: None, timeout_ms: Some(5000), background: false },
+    )
+    .await;
     let started = Instant::now();
     let obs = run(&sb, SandboxAction::ReadFile { path: "/workspace/f".into() }).await.unwrap();
     assert!(started.elapsed().as_millis() < 1000, "read stalled: {:?}", started.elapsed());
