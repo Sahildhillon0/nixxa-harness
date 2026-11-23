@@ -55,6 +55,10 @@ id_type!(
     ActionId
 );
 id_type!(
+    /// Identifies a background job started in the sandbox.
+    JobId
+);
+id_type!(
     /// Identifies a knowledge source, e.g. `claude-mem`, `obsidian`, `codegraph`, `context7`.
     SourceId
 );

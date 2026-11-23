@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::ActionId;
+use crate::JobId;
 
 /// One entry of a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,6 +28,11 @@ pub enum Outcome {
         stdout: String,
         /// Captured stderr.
         stderr: String,
+    },
+    /// A background job was started and is now running.
+    Started {
+        /// The job's id.
+        job: JobId,
     },
     /// Text content: a file read, or a knowledge tool result.
     Text {
