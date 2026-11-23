@@ -15,8 +15,9 @@ use nixxa_controller::Command;
 use crate::ports::{AutoApprove, PendingApproval};
 use nixxa_accounts::methods::openrouter::KEYS_PAGE;
 use nixxa_brain::ModelInfo;
-use nixxa_contracts::{AccountInfo, AuthMethod, Secret};
+use nixxa_contracts::{AccountInfo, AuthMethod, NetworkAccess, NetworkPolicy, SandboxEvent, Secret};
 
+use crate::network::{self, Mode, NetworkPanel, PanelKey};
 use crate::place::{Place, PlacePicker};
 use crate::sessions::{ListKey, SessionList};
 use crate::setup::Setup;
@@ -115,6 +116,8 @@ pub(crate) enum Effect {
     ListSessions,
     /// Search stored transcripts for the session list.
     SearchSessions(String),
+    /// Apply this network policy to the sandbox (the network settings, `ctrl+n`).
+    SetNetwork(nixxa_contracts::NetworkPolicy),
     /// End the running session (it is already saved) and continue this stored one.
     Resume(SessionId),
 }
@@ -166,6 +169,8 @@ pub(crate) struct App {
     pub(crate) root: PathBuf,
     /// The session list (`ctrl-s`), when open.
     pub(crate) sessions: Option<SessionList>,
+    /// The network settings (`ctrl+n`) and the recent requests.
+    pub(crate) network: NetworkPanel,
 }
 
 impl App {
@@ -201,6 +206,7 @@ impl App {
             directory: String::new(),
             root: PathBuf::new(),
             sessions: None,
+            network: NetworkPanel::default(),
         }
     }
 
@@ -468,6 +474,15 @@ impl App {
         if self.sessions.is_some() {
             return self.sessions_key(key);
         }
+        if self.network.open {
+            return self.network_key(key);
+        }
+        // Over an approval prompt too: allowing a host may be the answer to it.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
+            self.network.open = true;
+            self.network.error = None;
+            return Vec::new();
+        }
         if self.approval().is_some() {
             if key.code == KeyCode::BackTab {
                 self.toggle_mode(Instant::now());
@@ -524,6 +539,47 @@ impl App {
                 self.sessions = None;
                 vec![Effect::Resume(id)]
             }
+        }
+    }
+
+    fn network_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let access = self.sandbox.as_ref().map(|caps| caps.network.clone());
+        match self.network.key(key, access.as_ref()) {
+            PanelKey::Apply(policy) => vec![Effect::SetNetwork(policy)],
+            PanelKey::Nothing | PanelKey::Close => Vec::new(),
+        }
+    }
+
+    /// The sandbox applied a network policy, or couldn't. A change is recorded in the session.
+    pub(crate) fn network_set(&mut self, result: Result<NetworkPolicy, String>) -> Vec<Effect> {
+        match result {
+            Ok(policy) => {
+                if let Some(caps) = self.sandbox.as_mut() {
+                    caps.network = NetworkAccess::Controlled(policy.clone());
+                }
+                vec![Effect::Send(Command::Note(network::note(&policy)))]
+            }
+            Err(why) => {
+                // The panel shows what was asked for; put it back to what the sandbox applies.
+                if let Some(NetworkAccess::Controlled(policy)) = self.sandbox.as_ref().map(|caps| &caps.network) {
+                    self.network.mode = match policy {
+                        NetworkPolicy::Off => Mode::Off,
+                        NetworkPolicy::Allow(_) => Mode::Allow,
+                        NetworkPolicy::Open => Mode::Open,
+                    };
+                }
+                self.network.error = Some(format!("the network wasn't changed: {why}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Something happened in the sandbox.
+    pub(crate) fn sandbox_event(&mut self, event: SandboxEvent) {
+        match event {
+            SandboxEvent::NetRequest(request) => self.network.record(request),
+            // Job results are shown from Stage 6 PR D.
+            SandboxEvent::JobFinished { .. } => {}
         }
     }
 
@@ -986,6 +1042,55 @@ pub(crate) mod tests {
         app.handle_key(key(KeyCode::End));
         app.apply(Event::ActionProposed { turn: turn(), request: request("a4") });
         assert_eq!(app.selected(), Some(3));
+    }
+
+    #[test]
+    fn ctrl_n_opens_the_network_settings_and_keys_go_to_them() {
+        let mut app = App::new(false);
+        app.apply(Event::SandboxStatus {
+            capabilities: nixxa_contracts::SandboxCapabilities {
+                backend: "fake".into(),
+                isolated: false,
+                network: NetworkAccess::default(),
+                jobs: false,
+                actions: Vec::new(),
+            },
+        });
+        assert!(app.handle_key(ctrl('n')).is_empty());
+        assert!(app.network.open);
+        assert_eq!(app.handle_key(key(KeyCode::Char('2'))), vec![Effect::SetNetwork(NetworkPolicy::Allow(Vec::new()))]);
+        assert!(app.input.is_empty(), "keys don't reach the input");
+        assert!(app.handle_key(key(KeyCode::Char('3'))).is_empty(), "Open waits for a second press");
+        assert_eq!(app.handle_key(key(KeyCode::Char('3'))), vec![Effect::SetNetwork(NetworkPolicy::Open)]);
+        app.handle_key(key(KeyCode::Esc));
+        assert!(!app.network.open);
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.input, "x");
+    }
+
+    #[test]
+    fn an_applied_policy_is_noted_in_the_session_and_a_refused_one_is_undone() {
+        let mut app = App::new(false);
+        app.apply(Event::SandboxStatus {
+            capabilities: nixxa_contracts::SandboxCapabilities {
+                backend: "bubblewrap".into(),
+                isolated: true,
+                network: NetworkAccess::default(),
+                jobs: true,
+                actions: Vec::new(),
+            },
+        });
+        let effects = app.network_set(Ok(NetworkPolicy::Open));
+        assert_eq!(
+            effects,
+            vec![Effect::Send(Command::Note("The user opened the network to every public host.".into()))]
+        );
+        assert_eq!(app.sandbox.as_ref().unwrap().network, NetworkAccess::Controlled(NetworkPolicy::Open));
+        app.network.mode = Mode::Allow;
+        assert!(app.network_set(Err("the network proxy can't start: no room".into())).is_empty());
+        assert_eq!(app.network.mode, Mode::Open, "back to what the sandbox applies");
+        assert!(app.network.error.as_deref().is_some_and(|e| e.contains("no room")));
+        assert_eq!(app.sandbox.as_ref().unwrap().network, NetworkAccess::Controlled(NetworkPolicy::Open));
     }
 
     #[test]

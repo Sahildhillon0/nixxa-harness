@@ -30,6 +30,10 @@ pub(crate) enum UiEvent {
     SessionsListed(Result<Vec<nixxa_contracts::SessionInfo>, String>),
     /// Transcript matches for the session list's query, or why not.
     SessionsFound { query: String, result: Result<Vec<nixxa_contracts::SearchHit>, String> },
+    /// The sandbox now applies this network policy, or why it couldn't.
+    NetworkSet(Result<nixxa_contracts::NetworkPolicy, String>),
+    /// Something happened in the sandbox (a network request; later, jobs ending).
+    Sandbox(nixxa_contracts::SandboxEvent),
 }
 
 /// Which session the UI shows. Each controller's sink is tied to the generation it was made in;

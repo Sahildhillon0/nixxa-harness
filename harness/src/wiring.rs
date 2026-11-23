@@ -421,6 +421,8 @@ pub(crate) mod tests {
                     app.handle_key(key(KeyCode::Char('y')));
                 }
                 UiEvent::AccountSaved(_)
+                | UiEvent::NetworkSet(_)
+                | UiEvent::Sandbox(_)
                 | UiEvent::ModelsListed(_)
                 | UiEvent::SignInStarted(_)
                 | UiEvent::SignedIn(_)
