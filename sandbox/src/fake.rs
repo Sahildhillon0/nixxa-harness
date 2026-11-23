@@ -31,7 +31,7 @@ impl Default for FakeSandbox {
     fn default() -> Self {
         Self {
             files: Mutex::default(),
-            jobs: Mutex::new(Table::new(4, 64 * 1024)),
+            jobs: Mutex::new(Table::new(4, 64 * 1024, "")),
             events: broadcast::channel(crate::events::CAPACITY).0,
         }
     }
@@ -154,8 +154,8 @@ impl Sandbox for FakeSandbox {
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
-        // Fake jobs end at once, so there is nothing to kill; forget them. The workspace is kept.
-        if let Ok(mut jobs) = self.jobs.lock() {
+        // Fake jobs end at once, so there is nothing to kill. The workspace is kept.
+        if let Ok(jobs) = self.jobs.lock() {
             jobs.stop_all();
         }
         Ok(())

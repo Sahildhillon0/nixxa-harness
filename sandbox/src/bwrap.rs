@@ -142,6 +142,7 @@ impl BwrapConfig {
             background_max_timeout_ms: self.jobs.max_timeout.as_millis() as u64,
             background_output_cap: self.jobs.output_cap,
             max_background_jobs: self.jobs.max_running,
+            job_prefix: String::new(),
         }
     }
 }
@@ -177,6 +178,9 @@ struct Inner {
     /// Jobs started and not yet finished, with when they started, so they can be reported as
     /// finished if their daemon dies.
     jobs: Jobs,
+    /// Daemons started so far. Each one's job ids get a different prefix (`j1`, then `2-j1`, …),
+    /// so a restarted daemon never reuses an id the agent already has.
+    generation: AtomicU64,
 }
 
 type Jobs = Arc<StdMutex<HashMap<JobId, Instant>>>;
@@ -235,6 +239,7 @@ impl BwrapSandbox {
                 seccomp: AtomicBool::new(false),
                 events: broadcast::channel(crate::events::CAPACITY).0,
                 jobs: Jobs::default(),
+                generation: AtomicU64::new(0),
             }),
         })
     }
@@ -373,8 +378,11 @@ impl Inner {
         let recent = Arc::new(StdMutex::new(VecDeque::new()));
         tokio::spawn(forward_logs(stderr, Arc::clone(&recent)));
 
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut limits = self.config.limits();
+        limits.job_prefix = if generation == 1 { String::new() } else { format!("{generation}-") };
         let hello = async {
-            write_frame(&mut stdin, &ToDaemon::Hello { version: VERSION, limits: self.config.limits() }).await?;
+            write_frame(&mut stdin, &ToDaemon::Hello { version: VERSION, limits }).await?;
             read_frame::<_, FromDaemon>(&mut stdout).await
         };
         let failure = |why: String| {

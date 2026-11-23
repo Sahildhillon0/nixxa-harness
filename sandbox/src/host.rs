@@ -12,6 +12,7 @@
 //! group, and ending it kills the group; a process that leaves the group (`setsid`) escapes,
 //! which is one more way this mode isn't isolated. On Windows only the shell itself is killed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, DirEntry, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
+    ActionId, DirEntry, JobId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
     SandboxError, SandboxEvent,
 };
 
@@ -63,15 +64,25 @@ pub struct HostSandbox {
     hidden_env: Vec<String>,
     job_limits: JobLimits,
     jobs: Mutex<Table>,
+    /// The shell pid of each running job (its process group on Unix), so dropping the sandbox
+    /// can kill them at once, even when the runtime is shutting down and no task runs again.
+    running: Groups,
     events: broadcast::Sender<SandboxEvent>,
 }
 
+/// Shell pids of the running jobs, by job.
+type Groups = Arc<Mutex<HashMap<JobId, u32>>>;
+
 impl Drop for HostSandbox {
-    /// The session is over: its jobs end with it.
+    /// The session is over: its jobs end with it. The groups are killed here, synchronously:
+    /// when the app quits, the runtime drops the jobs' tasks without running them again, and
+    /// `kill_on_drop` alone would kill only each shell, not what it started.
     fn drop(&mut self) {
-        if let Ok(mut jobs) = self.jobs.lock() {
+        if let Ok(jobs) = self.jobs.lock() {
             jobs.stop_all();
         }
+        let pids: Vec<u32> = self.running.lock().map(|running| running.values().copied().collect()).unwrap_or_default();
+        pids.into_iter().for_each(kill_group);
     }
 }
 
@@ -85,12 +96,13 @@ impl HostSandbox {
         if !root.is_dir() {
             return Err(SandboxError::Unavailable(format!("{} is not a directory", root.display())));
         }
-        let jobs = Table::new(config.jobs.max_running as usize, config.jobs.output_cap as usize);
+        let jobs = Table::new(config.jobs.max_running as usize, config.jobs.output_cap as usize, "");
         Ok(Self {
             root,
             hidden_env: config.hidden_env,
             job_limits: config.jobs,
             jobs: Mutex::new(jobs),
+            running: Groups::default(),
             events: broadcast::channel(crate::events::CAPACITY).0,
         })
     }
@@ -209,15 +221,16 @@ impl HostSandbox {
         }
         let id = job.id.clone();
         let events = self.events.clone();
+        let running = Arc::clone(&self.running);
         tokio::spawn(async move {
-            let event = run_job(job, handles, shell, limit).await;
+            let event = run_job(job, handles, shell, limit, running).await;
             let _ = events.send(event);
         });
         Outcome::Started { job: id }
     }
 
     /// Answers `JobStatus` (`tail_bytes: None`) or `JobOutput`.
-    fn answer(&self, id: &nixxa_contracts::JobId, tail_bytes: Option<u64>) -> Outcome {
+    fn answer(&self, id: &JobId, tail_bytes: Option<u64>) -> Outcome {
         match self.jobs.lock() {
             Ok(jobs) => jobs.answer(id, tail_bytes),
             Err(_) => failed("jobs unavailable"),
@@ -225,7 +238,7 @@ impl HostSandbox {
     }
 
     /// Stops a job and says how it ended.
-    async fn stop_job(&self, id: &nixxa_contracts::JobId) -> Outcome {
+    async fn stop_job(&self, id: &JobId) -> Outcome {
         let Some(job) = self.jobs.lock().ok().and_then(|jobs| jobs.find(id)) else { return no_such_job(id) };
         job.stop();
         job.wait().await;
@@ -281,7 +294,13 @@ fn shell(command: &str) -> Command {
 
 /// Runs a background job to its end: the shell exits (its leftovers get [`LINGER`]), the time
 /// limit passes, or it is stopped. Returns its `JobFinished`.
-async fn run_job(job: Arc<Job>, handles: Handles, mut shell: Command, limit: Duration) -> SandboxEvent {
+async fn run_job(
+    job: Arc<Job>,
+    handles: Handles,
+    mut shell: Command,
+    limit: Duration,
+    running: Groups,
+) -> SandboxEvent {
     let started = Instant::now();
     let Handles { mut stop, done } = handles;
     let mut child = match shell.spawn() {
@@ -290,6 +309,9 @@ async fn run_job(job: Arc<Job>, handles: Handles, mut shell: Command, limit: Dur
             return job.finish(done, End::Failed(format!("couldn't start the shell: {err}")), started.elapsed());
         }
     };
+    if let (Some(pid), Ok(mut running)) = (child.id(), running.lock()) {
+        running.insert(job.id.clone(), pid);
+    }
     let out = tokio::spawn(keep_last(child.stdout.take(), Arc::clone(&job.stdout)));
     let err = tokio::spawn(keep_last(child.stderr.take(), Arc::clone(&job.stderr)));
     let aborts = [out.abort_handle(), err.abort_handle()];
@@ -308,6 +330,9 @@ async fn run_job(job: Arc<Job>, handles: Handles, mut shell: Command, limit: Dur
     }
     kill_job(&mut child);
     let _ = child.wait().await;
+    if let Ok(mut running) = running.lock() {
+        running.remove(&job.id);
+    }
     if !drained && tokio::time::timeout(DRAIN, &mut collect).await.is_err() {
         aborts.iter().for_each(|task| task.abort());
     }
@@ -316,11 +341,21 @@ async fn run_job(job: Arc<Job>, handles: Handles, mut shell: Command, limit: Dur
 
 /// Kills a job's process group (Unix) or its shell (elsewhere).
 fn kill_job(child: &mut Child) {
-    #[cfg(unix)]
-    if let Some(group) = child.id().and_then(|pid| rustix::process::Pid::from_raw(pid as i32)) {
-        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    if let Some(pid) = child.id() {
+        kill_group(pid);
     }
     let _ = child.start_kill();
+}
+
+/// Kills the process group led by the shell `pid`. Elsewhere than Unix there is no group to
+/// kill: the shell itself is killed through its `Child` (`kill_on_drop` covers a quit).
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
 }
 
 /// Reads a stream to its end into `tail`.
@@ -428,7 +463,7 @@ impl Sandbox for HostSandbox {
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
-        let stopped = self.jobs.lock().map(|mut jobs| jobs.stop_all()).unwrap_or_default();
+        let stopped = self.jobs.lock().map(|jobs| jobs.stop_all()).unwrap_or_default();
         for job in stopped {
             job.wait().await;
         }
@@ -652,6 +687,42 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(state, "dead\n", "the job's child survived its stop");
+    }
+
+    /// What quitting does: the sandbox is dropped inside the runtime, then the runtime is
+    /// dropped, so the job's task never runs again.
+    #[cfg(unix)]
+    #[test]
+    fn jobs_end_when_the_app_quits() {
+        let root = scratch();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let sandbox = host(&root);
+            let start = background("sleep 4243 & echo $! > child.pid; wait");
+            assert!(matches!(run_action(&sandbox, start).await, Outcome::Started { .. }));
+            for _ in 0..250 {
+                if std::fs::read_to_string(root.join("child.pid")).is_ok_and(|pid| pid.ends_with('\n')) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(sandbox);
+        });
+        drop(runtime);
+        let pid: i32 = std::fs::read_to_string(root.join("child.pid")).unwrap().trim().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        // A killed child may linger as a zombie until its new parent reaps it.
+        let gone = (0..100).any(|_| {
+            let alive = rustix::process::test_kill_process(pid).is_ok()
+                && !std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero())).is_ok_and(|stat| {
+                    stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                });
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "the job's child {} outlived the session", pid.as_raw_nonzero());
     }
 
     #[cfg(unix)]

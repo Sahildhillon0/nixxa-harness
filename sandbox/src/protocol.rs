@@ -49,6 +49,8 @@ pub(crate) struct Limits {
     pub background_output_cap: u64,
     /// The most background jobs running at once.
     pub max_background_jobs: u64,
+    /// Put before every job id, so a restarted daemon never reuses an earlier daemon's ids.
+    pub job_prefix: String,
 }
 
 /// Per-process resource limits (`setrlimit`, soft = hard, so a command can't raise them).
@@ -218,6 +220,7 @@ mod tests {
             background_max_timeout_ms: 12,
             background_output_cap: 13,
             max_background_jobs: 14,
+            job_prefix: "2-".into(),
         }
     }
 

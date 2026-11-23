@@ -193,8 +193,8 @@ async fn reset_stops_every_job() {
     for cmdline in ["sleep 320", "sleep 321", "sleep 322"] {
         assert_eq!(count(&sb, cmdline).await, 0, "`{cmdline}` survived a reset");
     }
-    let gone = run(&sb, SandboxAction::JobStatus { job: a }).await.unwrap();
-    assert!(matches!(gone.outcome, Outcome::Failed { .. }), "reset forgets its jobs: {gone:?}");
+    let status = text(&sb, SandboxAction::JobStatus { job: a }).await;
+    assert!(status.contains("was stopped"), "a job reset stopped is still known: {status}");
 }
 
 #[tokio::test]
@@ -221,4 +221,31 @@ async fn events_arrive_while_a_foreground_command_runs() {
     let (event, out) = tokio::join!(finished(&mut events, &job), foreground);
     assert_eq!(event, (Some(4), false));
     assert_eq!(out, "done\n");
+}
+
+#[tokio::test]
+async fn a_restarted_daemon_never_reuses_a_job_id() {
+    let scratch = Scratch::new("job-ids");
+    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let mut events = sb.subscribe();
+    let first = start(&sb, "sleep 340").await;
+    // PID 2 is the daemon; killing it takes its jobs with it.
+    assert!(
+        run(
+            &sb,
+            SandboxAction::Exec {
+                command: "kill -9 2; sleep 5".into(),
+                cwd: None,
+                timeout_ms: None,
+                background: false
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(finished(&mut events, &first).await, (None, false), "a dead daemon's job is reported as ended");
+    let second = start(&sb, "sleep 341").await;
+    assert_ne!(second, first, "a restarted daemon reused job id {first}");
+    let old = run(&sb, SandboxAction::JobStatus { job: first.clone() }).await.unwrap();
+    assert!(matches!(old.outcome, Outcome::Failed { .. }), "{first} must not name the new job: {old:?}");
 }

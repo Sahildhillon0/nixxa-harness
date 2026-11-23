@@ -13,6 +13,9 @@ use nixxa_contracts::{JobId, Outcome, SandboxEvent};
 
 /// Ended jobs kept for `JobStatus` / `JobOutput`.
 const KEPT_ENDED: usize = 32;
+/// The most one `JobOutput` shows of each stream, like a foreground command's output cap (the
+/// table may keep more).
+pub(crate) const SHOWN_CAP: usize = 64 * 1024;
 
 /// The background jobs of one sandbox: running, and recently ended.
 #[derive(Debug)]
@@ -20,6 +23,8 @@ pub(crate) struct Table {
     /// Oldest first.
     jobs: Vec<Arc<Job>>,
     next: u64,
+    /// Put before every id, so ids stay unique across tables of one sandbox (a restarted daemon).
+    prefix: String,
     max_running: usize,
     output_cap: usize,
 }
@@ -36,9 +41,10 @@ pub(crate) struct Handles {
 pub(crate) struct Done(watch::Sender<bool>);
 
 impl Table {
-    /// A table allowing `max_running` jobs at once, each keeping `output_cap` bytes per stream.
-    pub(crate) fn new(max_running: usize, output_cap: usize) -> Self {
-        Self { jobs: Vec::new(), next: 1, max_running, output_cap }
+    /// A table allowing `max_running` jobs at once, each keeping `output_cap` bytes per stream,
+    /// with ids `<prefix>j1`, `<prefix>j2`, …
+    pub(crate) fn new(max_running: usize, output_cap: usize, prefix: &str) -> Self {
+        Self { jobs: Vec::new(), next: 1, prefix: prefix.to_string(), max_running, output_cap }
     }
 
     /// Starts tracking a new job, or says why it can't start.
@@ -53,7 +59,7 @@ impl Table {
         let (stop_tx, stop) = oneshot::channel();
         let (done, done_rx) = watch::channel(false);
         let job = Arc::new(Job {
-            id: JobId::new(format!("j{}", self.next)),
+            id: JobId::new(format!("{}j{}", self.prefix, self.next)),
             started: Instant::now(),
             stop: Mutex::new(Some(stop_tx)),
             stdout: Arc::new(Mutex::new(Tail::new(self.output_cap))),
@@ -83,18 +89,18 @@ impl Table {
         let Some(job) = self.find(id) else { return no_such_job(id) };
         let status = job.status();
         let Some(n) = tail_bytes else { return Outcome::Text { content: status } };
-        let n = usize::try_from(n).unwrap_or(usize::MAX).min(self.output_cap);
+        let n = usize::try_from(n).unwrap_or(usize::MAX).min(self.output_cap).min(SHOWN_CAP);
         let (Ok(out), Ok(err)) = (job.stdout.lock(), job.stderr.lock()) else {
             return Outcome::Failed { message: "the output is unavailable".into() };
         };
         Outcome::Text { content: output_text(&status, &out, &err, n) }
     }
 
-    /// Asks every job to stop and forgets them all; the caller waits for the returned ones.
-    pub(crate) fn stop_all(&mut self) -> Vec<Arc<Job>> {
-        let jobs = std::mem::take(&mut self.jobs);
-        jobs.iter().for_each(|job| job.stop());
-        jobs
+    /// Asks every job to stop; the caller waits for the returned ones. They stay in the table,
+    /// so their status says they were stopped.
+    pub(crate) fn stop_all(&self) -> Vec<Arc<Job>> {
+        self.jobs.iter().for_each(|job| job.stop());
+        self.jobs.clone()
     }
 }
 
@@ -285,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_table_limits_running_jobs_and_answers_for_them() {
-        let mut table = Table::new(2, 16);
+        let mut table = Table::new(2, 16, "");
         let (first, handles) = table.add().unwrap();
         let (_second, _keep) = table.add().unwrap();
         let Err(refused) = table.add() else { panic!("a third job must be refused") };
@@ -302,7 +308,9 @@ mod tests {
         assert!(matches!(table.answer(&JobId::new("nope"), None), Outcome::Failed { .. }));
         let stopped = table.stop_all();
         assert_eq!(stopped.len(), 3);
-        assert!(table.find(&first.id).is_none());
+        assert!(table.find(&first.id).is_some(), "stopped jobs are still known");
+        let mut later = Table::new(1, 16, "2-");
+        assert_eq!(later.add().map(|(job, _)| job.id.to_string()).ok().as_deref(), Some("2-j1"));
     }
 
     #[test]

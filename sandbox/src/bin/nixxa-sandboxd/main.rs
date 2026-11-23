@@ -147,7 +147,8 @@ mod daemon {
         }
         log(format_args!("ready"));
 
-        let background = Table::new(limits.max_background_jobs as usize, limits.background_output_cap as usize);
+        let background =
+            Table::new(limits.max_background_jobs as usize, limits.background_output_cap as usize, &limits.job_prefix);
         let mut daemon =
             Daemon { out, limits, root, self_exe, supervisors: Supervisors::default(), background, foreground: None };
         let output = daemon.out.clone();
