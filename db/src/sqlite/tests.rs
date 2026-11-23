@@ -84,7 +84,9 @@ async fn reopening_the_file_returns_everything() {
     let scratch = Scratch::new("reopen");
     let request = ActionRequest {
         id: ActionId::new("toolu_1"),
-        action: Action::Sandbox { action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None } },
+        action: Action::Sandbox {
+            action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None, background: false },
+        },
         reason: Some("look".into()),
     };
     let observation = Observation::new(
