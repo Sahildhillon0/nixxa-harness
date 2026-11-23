@@ -18,8 +18,8 @@ use crate::job::{End, Table};
 /// An in-memory fake sandbox. It never touches the host filesystem, network or environment.
 ///
 /// Commands don't run: `Exec` answers with the command line as its output. A background job
-/// ends at once the same way, with the code of a final `exit N` (else 0) as its exit code, so a
-/// demo, and the contract's scenarios, can tell jobs apart.
+/// ends at once the same way, with the code of a final `exit N` (after `;` or `&&`, else 0) as its
+/// exit code, so a demo, and the contract's scenarios, can tell jobs apart.
 #[derive(Debug)]
 pub struct FakeSandbox {
     files: Mutex<HashMap<String, String>>,
@@ -39,7 +39,11 @@ impl Default for FakeSandbox {
 
 /// The code of a final `exit N` in `command`, else 0.
 fn final_exit_code(command: &str) -> i32 {
-    command.rsplit(';').next().and_then(|last| last.trim().strip_prefix("exit ")?.trim().parse().ok()).unwrap_or(0)
+    command
+        .rsplit([';', '&'])
+        .next()
+        .and_then(|last| last.trim().strip_prefix("exit ")?.trim().parse().ok())
+        .unwrap_or(0)
 }
 
 impl FakeSandbox {
@@ -191,6 +195,7 @@ mod tests {
     fn a_final_exit_sets_the_code() {
         assert_eq!(super::final_exit_code("echo hi; exit 3"), 3);
         assert_eq!(super::final_exit_code("exit 7"), 7);
+        assert_eq!(super::final_exit_code("echo hi && exit 4"), 4);
         assert_eq!(super::final_exit_code("cargo build"), 0);
     }
 }

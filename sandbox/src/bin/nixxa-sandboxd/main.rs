@@ -334,6 +334,11 @@ mod daemon {
             if let Some(fg) = self.foreground.take_if(|fg| fg.stop.is_none()) {
                 let _ = fg.task.await;
             }
+            // The last command's task ends right after sending its reply, and the main loop may
+            // read the caller's next request before it notices: a finished task is no command.
+            if self.foreground.as_ref().is_some_and(|fg| fg.task.is_finished()) {
+                self.foreground = None;
+            }
             if self.foreground.is_some() {
                 return self.reply(id, Reply::Error { message: "busy: a command is running".into() });
             }

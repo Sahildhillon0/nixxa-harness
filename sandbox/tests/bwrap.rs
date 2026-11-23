@@ -149,3 +149,14 @@ async fn rlimits_apply_to_commands() {
     let (code, _, _) = sh(&sb, &format!("ulimit -n {}", files + 1)).await;
     assert_ne!(code, Some(0), "a command must not raise its own limits");
 }
+
+#[tokio::test]
+async fn back_to_back_commands_never_find_the_daemon_busy() {
+    // The previous command's task ends just after its reply; the next request can arrive first.
+    let scratch = Scratch::new("back-to-back");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    for n in 0..200 {
+        let obs = run(&sb, exec("true")).await;
+        assert!(obs.is_ok(), "command {n}: {obs:?}");
+    }
+}
