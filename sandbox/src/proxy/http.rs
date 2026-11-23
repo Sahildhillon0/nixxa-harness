@@ -27,6 +27,9 @@ pub(crate) fn head(buf: &[u8]) -> Result<Option<Head>, String> {
     let text = std::str::from_utf8(&buf[..end]).map_err(|_| "the request head isn't text".to_string())?;
     let mut lines = text.split("\r\n");
     let request = lines.next().unwrap_or_default();
+    if request.chars().any(char::is_control) {
+        return Err("a malformed request line".into());
+    }
     let mut parts = request.split(' ');
     let (Some(method), Some(target), Some(version), None) = (parts.next(), parts.next(), parts.next(), parts.next())
     else {
@@ -37,10 +40,24 @@ pub(crate) fn head(buf: &[u8]) -> Result<Option<Head>, String> {
     }
     let mut headers = Vec::new();
     for line in lines {
+        // A bare CR or LF, or any other control character but a tab, could end the line for the
+        // server but not for us, and smuggle a header past [`upstream_head`] (a second `Host`).
+        // So could a folded line, or a name with spaces before its colon.
+        if line.starts_with([' ', '\t']) || line.chars().any(|c| c.is_control() && c != '\t') {
+            return Err("a malformed header".into());
+        }
         let (name, value) = line.split_once(':').ok_or_else(|| "a malformed header".to_string())?;
-        headers.push((name.trim().to_string(), value.trim().to_string()));
+        if name.is_empty() || !name.bytes().all(is_token) {
+            return Err("a malformed header".into());
+        }
+        headers.push((name.to_string(), value.trim_matches([' ', '\t']).to_string()));
     }
     Ok(Some(Head { method: method.into(), target: target.into(), version: version.into(), headers, len: end + 4 }))
+}
+
+/// Whether `b` may appear in a header name (an RFC 9110 token).
+fn is_token(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
 }
 
 /// `host:port` (`[v6]:port`) split in two.
@@ -255,6 +272,25 @@ mod tests {
         assert!(head(b"get http://a/ HTTP/1.1\r\n\r\n").is_err());
         assert!(head(b"GET http://a/ HTTP/1.1\r\nno colon\r\n\r\n").is_err());
         assert!(head(&vec![b'a'; MAX_HEAD + 1]).is_err());
+    }
+
+    #[test]
+    fn heads_that_could_smuggle_a_header_are_refused() {
+        for bad in [
+            "GET http://a/ HTTP/1.1\r\nX-A: y\nHost: evil\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\nX-A: y\rHost: evil\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\nX-A: y\0z\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\nX-A: y\r\n Host: evil\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\nX-A: y\r\n\tHost: evil\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\nHost : evil\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\nHo(st: evil\r\n\r\n",
+            "GET http://a/ HTTP/1.1\r\n: evil\r\n\r\n",
+            "GET http://a/\n HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(head(bad.as_bytes()).is_err(), "{bad:?}");
+        }
+        let ok = head(b"GET http://a/ HTTP/1.1\r\nX-A:\tspaced \t value\t\r\n\r\n").unwrap().unwrap();
+        assert_eq!(ok.headers, vec![("X-A".to_string(), "spaced \t value".to_string())]);
     }
 
     #[test]

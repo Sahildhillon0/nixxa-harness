@@ -275,3 +275,13 @@ async fn a_request_body_is_sent_once_and_ambiguous_framing_is_refused() {
     assert_eq!(blocked(&rig.logged().await), "a request with both Content-Length and Transfer-Encoding");
     assert!(rig.received.try_recv().is_err(), "nothing went upstream");
 }
+
+#[tokio::test]
+async fn a_header_hidden_behind_a_bare_line_feed_never_reaches_upstream() {
+    let mut rig = rig(allow(&["allowed.test"])).await;
+    let mut client = rig.connect("fg", "GET http://allowed.test/ HTTP/1.1\r\nX-A: y\nHost: evil.example\r\n\r\n").await;
+    let reply = answer(&mut client).await;
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    let sent = tokio::time::timeout(Duration::from_millis(300), rig.received.recv()).await;
+    assert!(sent.is_err(), "upstream got {sent:?}");
+}
