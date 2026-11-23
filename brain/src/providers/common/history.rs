@@ -1,7 +1,7 @@
 //! Provider-neutral pieces of a request: the system prompt and what the model sees of an
 //! observation.
 
-use nixxa_contracts::{Observation, Outcome, Primer};
+use nixxa_contracts::{NetRequest, NetResult, Observation, Outcome, Primer};
 
 /// Inserted where older turns were trimmed away.
 pub(crate) const TRIMMED_NOTE: &str = "[Earlier conversation was trimmed to fit the context window.]";
@@ -73,7 +73,35 @@ pub(crate) fn observation_text(observation: &Observation) -> (String, bool) {
     if text.trim().is_empty() {
         text = "(no output)".to_string();
     }
+    text.push_str(&network_text(&observation.network));
     (text, is_error)
+}
+
+/// Requests shown in one observation; the rest are counted.
+const SHOWN_REQUESTS: usize = 20;
+
+/// The network requests an action made, one line each, blocked ones with the reason.
+fn network_text(requests: &[NetRequest]) -> String {
+    if requests.is_empty() {
+        return String::new();
+    }
+    let mut text = String::from("\n--- network ---");
+    for request in requests.iter().take(SHOWN_REQUESTS) {
+        let target = match &request.url {
+            Some(url) => format!("{} {url}", request.method.as_deref().unwrap_or("?")),
+            None => format!("{}:{}", request.host, request.port),
+        };
+        match &request.result {
+            NetResult::Allowed => {
+                text.push_str(&format!("\nallowed: {target} ({} bytes received)", request.bytes_down))
+            }
+            NetResult::Blocked { reason } => text.push_str(&format!("\nblocked: {target}: {reason}")),
+        }
+    }
+    if requests.len() > SHOWN_REQUESTS {
+        text.push_str(&format!("\n… and {} more requests", requests.len() - SHOWN_REQUESTS));
+    }
+    neutralise(&text)
 }
 
 #[cfg(test)]
@@ -97,6 +125,40 @@ mod tests {
         assert_eq!(system.matches("</untrusted-context>").count(), 1, "the body can't close the block: {system}");
         assert!(system.contains("title=\"Recent 'memory'\""));
         assert_eq!(super::system("Be helpful.", &Primer::default()), "Be helpful.");
+    }
+
+    #[test]
+    fn network_requests_follow_the_output_blocked_ones_with_the_reason() {
+        let request = |host: &str, result| NetRequest {
+            time: nixxa_contracts::Timestamp(0),
+            job: None,
+            host: host.into(),
+            port: 443,
+            method: None,
+            url: None,
+            bytes_up: 1,
+            bytes_down: 2048,
+            duration_ms: 5,
+            result,
+        };
+        let mut observation = Observation::new(
+            ActionId::new("x"),
+            Outcome::Exec { exit_code: Some(1), stdout: String::new(), stderr: String::new() },
+        );
+        observation.network = vec![
+            request("index.crates.io", NetResult::Allowed),
+            request("example.com", NetResult::Blocked { reason: "host example.com isn't allowed".into() }),
+        ];
+        let (text, _) = observation_text(&observation);
+        assert!(
+            text.ends_with(
+                "--- network ---\nallowed: index.crates.io:443 (2048 bytes received)\n\
+                 blocked: example.com:443: host example.com isn't allowed"
+            ),
+            "{text}"
+        );
+        observation.network = (0..25).map(|_| request("a.b", NetResult::Allowed)).collect();
+        assert!(observation_text(&observation).0.ends_with("… and 5 more requests"));
     }
 
     #[test]
