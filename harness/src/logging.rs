@@ -101,6 +101,9 @@ fn action_kind(action: &Action) -> &'static str {
             nixxa_contracts::SandboxActionKind::ReadFile => "read",
             nixxa_contracts::SandboxActionKind::WriteFile => "write",
             nixxa_contracts::SandboxActionKind::ListDir => "list",
+            nixxa_contracts::SandboxActionKind::JobStatus => "job-status",
+            nixxa_contracts::SandboxActionKind::JobOutput => "job-output",
+            nixxa_contracts::SandboxActionKind::JobStop => "job-stop",
         },
         Action::Knowledge { action: KnowledgeAction::Call { .. } } => "knowledge-call",
         Action::Knowledge { action: KnowledgeAction::Record { .. } } => "knowledge-record",
@@ -116,6 +119,7 @@ fn outcome_kind(outcome: &Outcome) -> &'static str {
         Outcome::Recorded { .. } => "recorded",
         Outcome::Denied { .. } => "denied",
         Outcome::Failed { .. } => "failed",
+        Outcome::Started { .. } => "started",
     }
 }
 
@@ -200,7 +204,12 @@ pub(crate) mod tests {
         let request = ActionRequest {
             id: ActionId::new("a1"),
             action: Action::Sandbox {
-                action: SandboxAction::Exec { command: "cat secret.txt".into(), cwd: None, timeout_ms: None },
+                action: SandboxAction::Exec {
+                    command: "cat secret.txt".into(),
+                    cwd: None,
+                    timeout_ms: None,
+                    background: false,
+                },
             },
             reason: None,
         };

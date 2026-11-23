@@ -16,11 +16,18 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use nixxa_contracts::{Sandbox, WorkspaceInfo};
+use nixxa_sandbox::JobLimits;
 use nixxa_sandbox::fake::FakeSandbox;
 use nixxa_sandbox::host::{HostConfig, HostSandbox};
 
 use crate::paths::{self, Platform};
 use crate::place::Place;
+
+/// Limits on the agent's background jobs, the same in the sandbox and in This directory: 30 min
+/// each by default (2 h at most), the last 1 MiB of each output stream, 4 at once.
+fn job_limits() -> JobLimits {
+    JobLimits::default()
+}
 
 /// The scripted demo (`--fake`): the in-memory sandbox.
 const FAKE_INSTRUCTIONS: &str = "You are Nixxa, a coding agent working in a sandbox, apart from the user's machine. \
@@ -93,6 +100,7 @@ impl Workplace {
             let config = HostConfig {
                 root: workspace.root.clone(),
                 hidden_env: SECRET_ENV.iter().map(|name| (*name).to_string()).collect(),
+                jobs: job_limits(),
             };
             let sandbox = HostSandbox::new(config).map_err(|err| format!("can't work in this directory: {err}"))?;
             return Ok(Self { place, sandbox: Arc::new(sandbox), copy: None, fake: false });
@@ -171,6 +179,7 @@ fn bwrap(dir: &Path, daemon: &Path) -> Result<Arc<dyn Sandbox>, String> {
         config.search_path = std::env::split_paths(&path).collect();
     }
     config.runtime_dir = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+    config.jobs = job_limits();
     let sandbox = BwrapSandbox::new(config).map_err(|err| format!("the sandbox can't start: {err}"))?;
     Ok(Arc::new(sandbox))
 }
@@ -450,7 +459,7 @@ mod tests {
         }
 
         fn exec(command: &str) -> SandboxAction {
-            SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(20_000) }
+            SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(20_000), background: false }
         }
 
         #[tokio::test]

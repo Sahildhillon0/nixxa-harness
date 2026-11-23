@@ -233,6 +233,9 @@ fn describe(request: &ActionRequest) -> (String, String) {
             SandboxAction::ReadFile { path } => ("read".into(), path.clone()),
             SandboxAction::WriteFile { path, .. } => ("write".into(), path.clone()),
             SandboxAction::ListDir { path } => ("list".into(), path.clone()),
+            SandboxAction::JobStatus { job } => ("job-status".into(), job.to_string()),
+            SandboxAction::JobOutput { job, .. } => ("job-output".into(), job.to_string()),
+            SandboxAction::JobStop { job } => ("job-stop".into(), job.to_string()),
         },
         Action::Knowledge { action } => match action {
             KnowledgeAction::Call { source, tool, args } => (source.to_string(), format!("{tool} {args}")),
@@ -285,6 +288,7 @@ fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
         Some(Outcome::Failed { message }) => {
             lines.push(Line::styled(format!("failed: {}", safe::line(message)), theme.bad()))
         }
+        Some(Outcome::Started { job }) => lines.push(Line::raw(format!("started job {job}"))),
     }
     if activity.observation.as_ref().is_some_and(|o| o.truncated) {
         lines.push(Line::styled("(output truncated)", theme.dim()));
@@ -826,6 +830,7 @@ pub(crate) mod tests {
                 backend: "fake".into(),
                 isolated: false,
                 network: false,
+                jobs: false,
                 actions: SandboxActionKind::ALL.to_vec(),
             },
         });
@@ -915,7 +920,12 @@ pub(crate) mod tests {
         let request = ActionRequest {
             id: ActionId::new("a1"),
             action: Action::Sandbox {
-                action: SandboxAction::Exec { command: "cargo test".into(), cwd: None, timeout_ms: None },
+                action: SandboxAction::Exec {
+                    command: "cargo test".into(),
+                    cwd: None,
+                    timeout_ms: None,
+                    background: false,
+                },
             },
             reason: Some("check".into()),
         };
@@ -943,7 +953,12 @@ pub(crate) mod tests {
         let request = ActionRequest {
             id: ActionId::new("a1"),
             action: Action::Sandbox {
-                action: SandboxAction::Exec { command: "ls".into(), cwd: Some("src".into()), timeout_ms: None },
+                action: SandboxAction::Exec {
+                    command: "ls".into(),
+                    cwd: Some("src".into()),
+                    timeout_ms: None,
+                    background: false,
+                },
             },
             reason: Some("look".into()),
         };
@@ -969,7 +984,12 @@ pub(crate) mod tests {
         let request = ActionRequest {
             id: ActionId::new("a1"),
             action: Action::Sandbox {
-                action: SandboxAction::Exec { command: HOSTILE.into(), cwd: Some(HOSTILE.into()), timeout_ms: None },
+                action: SandboxAction::Exec {
+                    command: HOSTILE.into(),
+                    cwd: Some(HOSTILE.into()),
+                    timeout_ms: None,
+                    background: false,
+                },
             },
             reason: Some(HOSTILE.into()),
         };
@@ -1044,6 +1064,7 @@ pub(crate) mod tests {
                     command: "rm -rf ~ \r\x1b[2Kecho harmless".into(),
                     cwd: None,
                     timeout_ms: None,
+                    background: false,
                 },
             },
             reason: Some("tidy \u{202E}up".into()),
