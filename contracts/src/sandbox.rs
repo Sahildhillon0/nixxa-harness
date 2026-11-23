@@ -4,7 +4,10 @@ use async_trait::async_trait;
 use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionId, JobId, Observation, SandboxAction, SandboxActionKind, SandboxError, Timestamp};
+use crate::{
+    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, SandboxAction, SandboxActionKind, SandboxError,
+    Timestamp,
+};
 
 /// What a sandbox backend can do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -13,8 +16,9 @@ pub struct SandboxCapabilities {
     pub backend: String,
     /// Whether execution is actually isolated from the host. The TUI shows this prominently.
     pub isolated: bool,
-    /// Whether network access is available inside.
-    pub network: bool,
+    /// What commands can reach on the network: the policy the sandbox enforces, or
+    /// unrestricted for a backend that isn't isolated.
+    pub network: NetworkAccess,
     /// Whether background jobs are supported: `Exec { background: true }`, the `Job*` actions
     /// and [`SandboxEvent::JobFinished`].
     #[serde(default)]
@@ -46,6 +50,17 @@ pub struct SandboxCapabilities {
 ///
 /// Without jobs, `Exec { background: true }` returns [`SandboxError::Unsupported`], the `Job*`
 /// kinds aren't listed, and [`subscribe`](Sandbox::subscribe) returns an empty stream.
+///
+/// The network, when [`SandboxCapabilities::network`] is [`NetworkAccess::Controlled`]:
+/// * it starts [`NetworkPolicy::Off`];
+/// * [`set_network`](Sandbox::set_network) takes effect for the next connection, and
+///   `capabilities().network` reports it at once;
+/// * the requests a command makes are in its observation's `network`, and every request is
+///   also a [`SandboxEvent::NetRequest`] (except under `Off`, where nothing is logged);
+/// * local and private addresses are never reachable through it, whatever the policy.
+///
+/// A backend that can't restrict the network reports [`NetworkAccess::Unrestricted`], and
+/// `set_network` returns [`SandboxError::Unsupported`].
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     /// What this backend supports.
@@ -59,6 +74,13 @@ pub trait Sandbox: Send + Sync {
 
     /// Kills anything running and returns to a clean state (the workspace is kept).
     async fn reset(&self) -> Result<(), SandboxError>;
+
+    /// Sets the network policy, for the next connection a command makes. The default, for
+    /// backends that can't restrict the network, is [`SandboxError::Unsupported`].
+    async fn set_network(&self, policy: NetworkPolicy) -> Result<(), SandboxError> {
+        let _ = policy;
+        Err(SandboxError::Unsupported("this sandbox can't restrict the network".into()))
+    }
 
     /// The sandbox's events from now on. Dropping the stream unsubscribes. The default, for
     /// backends without jobs, is an empty stream.

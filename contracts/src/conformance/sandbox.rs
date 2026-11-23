@@ -8,7 +8,10 @@ use futures::future::Either;
 use futures::stream::BoxStream;
 
 use super::id;
-use crate::{JobId, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxError, SandboxEvent};
+use crate::{
+    DomainRule, JobId, NetworkAccess, NetworkPolicy, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxError,
+    SandboxEvent,
+};
 
 /// The job kinds a backend with jobs must list.
 const JOB_KINDS: [SandboxActionKind; 3] =
@@ -46,6 +49,7 @@ pub async fn run<S: Sandbox, F: Fn() -> S>(fresh: F) {
     background_jobs_report_their_end(&fresh()).await;
     unknown_jobs_fail(&fresh()).await;
     reset_stops_jobs(&fresh()).await;
+    network_policy_is_reported(&fresh()).await;
 }
 
 async fn describes_itself(sandbox: &dyn Sandbox) {
@@ -300,4 +304,29 @@ async fn reset_stops_jobs(sandbox: &dyn Sandbox) {
     let job = start(sandbox, 630, "sleep 300").await;
     sandbox.reset().await.expect("reset");
     wait_finished(&mut events, std::slice::from_ref(&job), "reset must stop every job").await;
+}
+
+async fn network_policy_is_reported(sandbox: &dyn Sandbox) {
+    let crates = DomainRule { host: "crates.io".into(), ports: Vec::new() };
+    let allow = NetworkPolicy::Allow(vec![crates]);
+    match sandbox.capabilities().network {
+        NetworkAccess::Unrestricted => {
+            let r = sandbox.set_network(allow).await;
+            assert!(
+                matches!(r, Err(SandboxError::Unsupported(_))),
+                "a sandbox that can't restrict the network must refuse a policy, got {r:?}"
+            );
+        }
+        NetworkAccess::Controlled(start) => {
+            assert_eq!(start, NetworkPolicy::Off, "the network must start off");
+            for policy in [allow, NetworkPolicy::Open, NetworkPolicy::Off] {
+                sandbox.set_network(policy.clone()).await.expect("set the network policy");
+                assert_eq!(
+                    sandbox.capabilities().network,
+                    NetworkAccess::Controlled(policy),
+                    "capabilities must report the policy just set"
+                );
+            }
+        }
+    }
 }

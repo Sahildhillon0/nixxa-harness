@@ -107,12 +107,13 @@ its fake (scripted brain, fake sandbox, in-memory store, fake knowledge).
 | `src/place.rs` | The start-up question: the three choices, the second question, blocked choices |
 | `src/workplace.rs` | Builds the chosen place's sandbox and instructions; the workspace guard; finding the daemon |
 | `src/sessions.rs` | The session list (`ctrl-s`): rows, grouping, filtering, keys |
+| `src/network.rs` | The network settings (`ctrl+n`): modes, presets, hosts, recent requests, keys (D-065) |
 | `src/copy.rs` | Scratch folders and the copy for "Work on a copy" (Linux) |
 | `src/safe.rs` | Makes untrusted text safe to draw (control, C1 and bidi characters made visible) and scrubs each frame |
 | `src/logging.rs` | `tracing` to daily files, metadata only |
 | `src/paths.rs` | Per-OS data directory (Linux XDG, macOS Application Support, Windows `%LOCALAPPDATA%`) |
 
-On screen: status bar (session, account · model, sandbox, knowledge sources, cost), conversation,
+On screen: status bar (session, account · model, sandbox, network, knowledge sources, cost), conversation,
 activity + detail, input, hint bar. Under 100 columns the panes collapse to one, with Activity
 behind `tab`. Approval prompts take `y` / `n`. `NO_COLOR` is honoured. A message sent while a turn is
 running is shown dimmed as "(queued)" until its turn starts.
@@ -125,7 +126,8 @@ running is shown dimmed as "(queued)" until its turn starts.
 can be found, logging is off and the conversation says so.
 
 Keys: `enter` send · `alt-enter` / `shift-enter` newline · `tab` focus · `shift-tab` Ask/Auto ·
-`j` `k` / arrows move · `end` back to newest · `ctrl-s` sessions · `ctrl-c` interrupt (twice: quit).
+`j` `k` / arrows move · `end` back to newest · `ctrl-s` sessions · `ctrl-n` network · `ctrl-c` interrupt
+(twice: quit).
 
-Not yet: the `ctrl+t` terminal and network settings (Stage 6), plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
+Not yet: the `ctrl+t` terminal (Stage 6), plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
 knowledge panel (Stage 10), slash commands (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.

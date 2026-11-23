@@ -37,7 +37,20 @@ named `bubblewrap (rlimits only, no cgroup)`). It reports `isolated: true` only 
 namespaces, Landlock and seccomp are all active; a kernel without Landlock runs degraded and
 the backend name says so. Decisions: D-040 to D-046, D-061 to D-063.
 
-Tests: `tests/bwrap_conformance.rs` (the contract suite), `tests/bwrap.rs` (cancellation, reset,
+**The network (D-064):** `BwrapSandbox` owns a host-side proxy (`src/proxy/`): a Unix socket in a
+private directory mounted read-only at `/run/nixxa`, which the daemon forwards from
+`127.0.0.1:3128`. HTTPS is CONNECT with an SNI check; plain HTTP is absolute-form, sent as one
+request with `Host` from the checked URL; names are resolved on the host and only public
+addresses are dialled, IP literals need an exact rule, and every request is logged into the
+foreground command's observation and as a `SandboxEvent`. **The allowlist limits which servers
+are reached, not which sites they serve:** inside an HTTPS tunnel the `Host` is encrypted, so
+allowing a name on a shared CDN lets commands ask that server for its other sites too. The
+policy starts Off (no proxy variables, nothing logged). The presets live in `src/network.rs`.
+`HostSandbox` reports the network as unrestricted; `FakeSandbox` keeps the policy it is given.
+
+Tests: `tests/network.rs` (blocked and allowed hosts, private addresses, IP literals, ports, raw
+TCP and UDP, Off, the mount, job attribution; two `needs_internet_` tests run with `--ignored`),
+the proxy's own tests (`src/proxy/tests.rs`), `tests/bwrap_conformance.rs` (the contract suite), `tests/bwrap.rs` (cancellation, reset,
 daemon restart, limits), `tests/jobs.rs` (background jobs: a job's whole tree dies with it and
 nothing else does, `setsid` orphans, a job that kills its own supervisor, the limits, reset,
 events while a command runs) and `tests/escape.rs` (canaries outside the workspace and in `$HOME`,

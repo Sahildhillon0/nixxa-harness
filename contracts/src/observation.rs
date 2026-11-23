@@ -2,8 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ActionId;
-use crate::JobId;
+use crate::{ActionId, JobId, NetRequest};
 
 /// One entry of a directory listing.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,12 +76,15 @@ pub struct Observation {
     pub duration_ms: u64,
     /// Whether output was cut to fit limits.
     pub truncated: bool,
+    /// The network requests the action made, allowed or blocked, in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<NetRequest>,
 }
 
 impl Observation {
     /// An observation with no timing or truncation.
     pub fn new(action_id: ActionId, outcome: Outcome) -> Self {
-        Self { action_id, outcome, duration_ms: 0, truncated: false }
+        Self { action_id, outcome, duration_ms: 0, truncated: false, network: Vec::new() }
     }
 
     /// A [`Outcome::Denied`] observation.

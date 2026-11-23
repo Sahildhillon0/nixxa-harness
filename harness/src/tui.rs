@@ -252,6 +252,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                 while let Ok(event) = ui_rx.try_recv() {
                     events.push(event);
                 }
+                let mut produced = Vec::new();
                 for event in events {
                     match &event {
                         UiEvent::SignInStarted(Ok(url)) => {
@@ -292,7 +293,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         (UiEvent::AccountSaved(Ok(info)), Some(found)) => Some((info.account.clone(), found.clone())),
                         _ => None,
                     };
-                    receive(&mut app, event);
+                    produced.extend(receive(&mut app, event));
                     if let Some((account, found)) = saved {
                         // A key rotation for the account in use needs nothing: the brain reads the
                         // key on every request. Anything else starts a session with the new brain.
@@ -318,7 +319,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         }
                     }
                 }
-                Vec::new()
+                produced
             }
         };
         let mut quit = false;
@@ -432,6 +433,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                                     resume,
                                 ));
                             }
+                            watch_sandbox(&chosen, &ui_tx);
                             workplace = Some(chosen);
                         }
                         Err(why) => {
@@ -487,6 +489,17 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         _ => app.note("Set up a model first (ctrl-a); then the session can be resumed."),
                     }
                 }
+                Effect::SetNetwork(policy) => match &workplace {
+                    Some(place) => {
+                        let (sandbox, ui_tx) = (place.sandbox.clone(), ui_tx.clone());
+                        tokio::spawn(async move {
+                            let result =
+                                sandbox.set_network(policy.clone()).await.map(|()| policy).map_err(|e| e.to_string());
+                            let _ = ui_tx.send(UiEvent::NetworkSet(result));
+                        });
+                    }
+                    None => produced_now(&mut app, UiEvent::NetworkSet(Err("choose where to work first".into()))),
+                },
                 Effect::Quit => quit = true,
             }
         }
@@ -519,7 +532,26 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     result
 }
 
-fn receive(app: &mut App, event: UiEvent) {
+/// Forwards the sandbox's events (network requests) to the UI loop for as long as it runs.
+fn watch_sandbox(place: &Workplace, ui_tx: &mpsc::UnboundedSender<UiEvent>) {
+    let mut events = place.sandbox.subscribe();
+    let ui_tx = ui_tx.clone();
+    tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            if ui_tx.send(UiEvent::Sandbox(event)).is_err() {
+                return;
+            }
+        }
+    });
+}
+
+/// Applies an event at once, outside the event branch (its effects are only notes here).
+fn produced_now(app: &mut App, event: UiEvent) {
+    let _ = receive(app, event);
+}
+
+/// Applies an event from the controller side; returns what it asks for in turn.
+fn receive(app: &mut App, event: UiEvent) -> Vec<Effect> {
     match event {
         UiEvent::Controller(event) => {
             logging::event(&event);
@@ -531,7 +563,10 @@ fn receive(app: &mut App, event: UiEvent) {
         UiEvent::ModelsListed(result) => app.models_listed(result),
         UiEvent::SessionsListed(result) => app.sessions_listed(result),
         UiEvent::SessionsFound { query, result } => app.sessions_found(&query, result),
+        UiEvent::NetworkSet(result) => return app.network_set(result),
+        UiEvent::Sandbox(event) => app.sandbox_event(event),
         // Handled in the loop, which holds the sign-in state.
         UiEvent::SignInStarted(_) | UiEvent::SignedIn(_) => {}
     }
+    Vec::new()
 }

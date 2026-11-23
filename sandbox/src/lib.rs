@@ -11,8 +11,11 @@ mod events;
 pub mod fake;
 pub mod host;
 mod job;
+pub mod network;
 #[cfg(target_os = "linux")]
 mod protocol;
+#[cfg(target_os = "linux")]
+mod proxy;
 
 use std::time::Duration;
 

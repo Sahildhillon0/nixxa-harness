@@ -9,10 +9,10 @@ use async_trait::async_trait;
 use nixxa_contracts::{
     AccountRef, Action, ActionId, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainError, BrainEvent, BrainInfo,
     BrainStream, Content, Context, Event, EventSink, Intent, Knowledge, KnowledgeAction, KnowledgeEntry,
-    KnowledgeError, Message, NewSession, Observation, Outcome, Primer, PrimerSection, ProviderId, Role, Sandbox,
-    SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SearchHit, SessionId, SessionInfo,
-    SessionRecord, SourceId, SourceInfo, SourceStatus, Store, StoreError, Timestamp, ToolSpec, TurnId, Usage, Verdict,
-    WorkspaceInfo,
+    KnowledgeError, Message, NetRequest, NetResult, NetworkAccess, NetworkPolicy, NewSession, Observation, Outcome,
+    Primer, PrimerSection, ProviderId, Role, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
+    SandboxError, SearchHit, SessionId, SessionInfo, SessionRecord, SourceId, SourceInfo, SourceStatus, Store,
+    StoreError, Timestamp, ToolSpec, TurnId, Usage, Verdict, WorkspaceInfo,
 };
 use nixxa_controller::{Command, Controller, ControllerConfig, DEFAULT_MAX_STEPS};
 use tokio::sync::{Notify, mpsc};
@@ -82,7 +82,7 @@ impl Sandbox for EchoSandbox {
         SandboxCapabilities {
             backend: "fake".into(),
             isolated: false,
-            network: false,
+            network: NetworkAccess::default(),
             jobs: false,
             actions: SandboxActionKind::ALL.to_vec(),
         }
@@ -95,6 +95,51 @@ impl Sandbox for EchoSandbox {
             }
             other => Err(SandboxError::Unsupported(format!("{:?}", other.kind()))),
         }
+    }
+
+    async fn health(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+}
+
+/// Allows only crates.io, and every command makes one blocked request to example.com.
+struct AllowlistSandbox;
+
+fn blocked_request() -> NetRequest {
+    NetRequest {
+        time: Timestamp(0),
+        job: None,
+        host: "example.com".into(),
+        port: 443,
+        method: None,
+        url: None,
+        bytes_up: 0,
+        bytes_down: 0,
+        duration_ms: 0,
+        result: NetResult::Blocked {
+            reason: "host example.com isn't allowed in this session; ask the user to allow it".into(),
+        },
+    }
+}
+
+#[async_trait]
+impl Sandbox for AllowlistSandbox {
+    fn capabilities(&self) -> SandboxCapabilities {
+        let crates = nixxa_contracts::DomainRule::parse("crates.io").unwrap();
+        SandboxCapabilities {
+            network: NetworkAccess::Controlled(NetworkPolicy::Allow(vec![crates])),
+            ..EchoSandbox.capabilities()
+        }
+    }
+
+    async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
+        let mut observation = EchoSandbox.execute(id, action).await?;
+        observation.network.push(blocked_request());
+        Ok(observation)
     }
 
     async fn health(&self) -> Result<(), SandboxError> {
@@ -280,6 +325,8 @@ struct ScriptedApprovals {
     decisions: Mutex<VecDeque<Verdict>>,
     hang: bool,
     asked: Mutex<Vec<String>>,
+    /// When set, each answer waits for a [`ScriptedApprovals::release`].
+    gate: Option<tokio::sync::Semaphore>,
 }
 
 impl ScriptedApprovals {
@@ -294,6 +341,25 @@ impl ScriptedApprovals {
     fn hanging() -> Arc<Self> {
         Arc::new(Self { hang: true, ..Self::default() })
     }
+
+    fn holding() -> Arc<Self> {
+        Arc::new(Self { gate: Some(tokio::sync::Semaphore::new(0)), ..Self::default() })
+    }
+
+    /// Lets one held prompt be answered with `verdict`.
+    fn release(&self, verdict: Verdict) {
+        self.decisions.lock().unwrap().push_back(verdict);
+        if let Some(gate) = &self.gate {
+            gate.add_permits(1);
+        }
+    }
+
+    /// Waits until `n` prompts have been asked.
+    async fn wait_asked(&self, n: usize) {
+        while self.asked.lock().unwrap().len() < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
 }
 
 #[async_trait]
@@ -302,6 +368,11 @@ impl ApprovalPort for ScriptedApprovals {
         self.asked.lock().unwrap().push(reason.to_string());
         if self.hang {
             Notify::new().notified().await;
+        }
+        if let Some(gate) = &self.gate {
+            if let Ok(permit) = gate.acquire().await {
+                permit.forget();
+            }
         }
         self.decisions.lock().unwrap().pop_front().unwrap_or(Verdict::Allow)
     }
@@ -1244,4 +1315,60 @@ async fn resuming_an_unknown_session_is_an_error() {
     );
     let err = controller.resume_session(&SessionId::new("nope")).await.unwrap_err();
     assert!(err.to_string().contains("not found"), "{err}");
+}
+
+#[tokio::test]
+async fn the_agent_is_told_the_network_policy_and_sees_what_was_blocked() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: exec_request("act-1", "curl https://example.com") })]),
+        step(vec![intent(Intent::Done { summary: "blocked".into() })]),
+    ]);
+    let rig = Rig::start(brain, ScriptedApprovals::allowing(), Arc::new(AllowlistSandbox), DEFAULT_MAX_STEPS).await;
+    rig.turn("fetch it").await;
+    let contexts = rig.brain.contexts();
+    assert!(contexts[0].instructions.starts_with("Reply briefly.\n\nNetwork: only these hosts are reachable"));
+    assert!(contexts[0].instructions.contains(": crates.io."), "{}", contexts[0].instructions);
+    let observed = contexts[1].messages.iter().find_map(|m| match &m.content {
+        Content::Observation { observation } => Some(observation.clone()),
+        _ => None,
+    });
+    assert_eq!(observed.expect("the observation reaches the brain").network, vec![blocked_request()]);
+}
+
+#[tokio::test]
+async fn a_note_is_recorded_between_turns_never_inside_one() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: exec_request("act-1", "ls") })]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+        step(vec![intent(Intent::Done { summary: "again".into() })]),
+    ]);
+    let approvals = ScriptedApprovals::holding();
+    let rig = Rig::start(brain, approvals.clone(), Arc::new(EchoSandbox), DEFAULT_MAX_STEPS).await;
+    rig.say("first").await;
+    approvals.wait_asked(1).await;
+    // Mid-turn, waiting for approval: the note waits for the turn to end.
+    rig.tx.send(Command::Note("the user allowed crates.io".into())).await.unwrap();
+    approvals.release(Verdict::Allow);
+    rig.turn("second").await;
+    let roles: Vec<(Role, String)> = rig
+        .brain
+        .contexts()
+        .last()
+        .unwrap()
+        .messages
+        .iter()
+        .map(|m| {
+            (
+                m.role,
+                match &m.content {
+                    Content::Text { text } => text.clone(),
+                    _ => "…".into(),
+                },
+            )
+        })
+        .collect();
+    let note = roles.iter().position(|(role, text)| *role == Role::System && text == "the user allowed crates.io");
+    let observation = roles.iter().position(|(role, _)| *role == Role::Observation);
+    let second = roles.iter().position(|(role, text)| *role == Role::User && text == "second");
+    assert!(observation < note && note < second, "the note sits after the first turn: {roles:?}");
 }

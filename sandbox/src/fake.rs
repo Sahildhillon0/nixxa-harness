@@ -9,8 +9,8 @@ use futures::stream::BoxStream;
 use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, JobId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
-    SandboxError, SandboxEvent,
+    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind,
+    SandboxCapabilities, SandboxError, SandboxEvent,
 };
 
 use crate::job::{End, Table};
@@ -25,6 +25,8 @@ pub struct FakeSandbox {
     files: Mutex<HashMap<String, String>>,
     jobs: Mutex<Table>,
     events: broadcast::Sender<SandboxEvent>,
+    /// The policy set, reported back; the fake has no network to apply it to.
+    network: Mutex<NetworkPolicy>,
 }
 
 impl Default for FakeSandbox {
@@ -33,6 +35,7 @@ impl Default for FakeSandbox {
             files: Mutex::default(),
             jobs: Mutex::new(Table::new(4, 64 * 1024, "")),
             events: broadcast::channel(crate::events::CAPACITY).0,
+            network: Mutex::default(),
         }
     }
 }
@@ -85,7 +88,7 @@ impl Sandbox for FakeSandbox {
         SandboxCapabilities {
             backend: "fake".into(),
             isolated: false,
-            network: false,
+            network: NetworkAccess::Controlled(self.network.lock().map(|p| p.clone()).unwrap_or_default()),
             jobs: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }
@@ -157,6 +160,13 @@ impl Sandbox for FakeSandbox {
         // Fake jobs end at once, so there is nothing to kill. The workspace is kept.
         if let Ok(jobs) = self.jobs.lock() {
             jobs.stop_all();
+        }
+        Ok(())
+    }
+
+    async fn set_network(&self, policy: NetworkPolicy) -> Result<(), SandboxError> {
+        if let Ok(mut network) = self.network.lock() {
+            *network = policy;
         }
         Ok(())
     }

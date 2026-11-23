@@ -183,6 +183,16 @@ async fn a_newer_file_is_refused_and_left_alone() {
     {
         let conn = raw(&scratch.db());
         conn.pragma_update(None, "user_version", latest() + 1).unwrap();
+        // Everything into the main file before the snapshot. The first store closes its
+        // connection on its own thread, possibly after this; once the WAL is empty its closing
+        // checkpoint has nothing to write. Retry while that connection is still busy.
+        loop {
+            let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0)).unwrap();
+            if busy == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
     let before = std::fs::read(scratch.db()).unwrap();
     let Err(StoreError::Backend(message)) = SqliteStore::open(scratch.db()).await else {

@@ -6,6 +6,7 @@
 
 #![warn(missing_docs)]
 
+mod network;
 mod policy;
 
 use std::collections::VecDeque;
@@ -47,6 +48,10 @@ pub enum Command {
     Interrupt,
     /// Cancel the in-flight turn and end the session.
     Shutdown,
+    /// Record a notice from Nixxa in the session, as a system message the agent sees (e.g. the
+    /// user changed the network policy). Kept until the in-flight turn ends, so it never lands
+    /// between an action and its result.
+    Note(String),
 }
 
 /// Tunables for the agent loop.
@@ -273,15 +278,19 @@ impl Controller {
     pub async fn run(&mut self, mut commands: mpsc::Receiver<Command>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.cancel = cancel_rx;
-        let mut queued: VecDeque<String> = VecDeque::new();
+        let mut queued: VecDeque<Command> = VecDeque::new();
         let mut shutting_down = false;
         while !shutting_down {
             let command = match queued.pop_front() {
-                Some(text) => Command::UserMessage(text),
+                Some(command) => command,
                 None => commands.recv().await.unwrap_or(Command::Shutdown),
             };
             let text = match command {
                 Command::UserMessage(text) => text,
+                Command::Note(text) => {
+                    self.note(text).await;
+                    continue;
+                }
                 Command::Interrupt => continue,
                 Command::Shutdown => break,
             };
@@ -300,7 +309,7 @@ impl Controller {
                     tokio::select! {
                         () = &mut turn_future => break,
                         command = commands.recv(), if listening => match command {
-                            Some(Command::UserMessage(text)) => queued.push_back(text),
+                            Some(command @ (Command::UserMessage(_) | Command::Note(_))) => queued.push_back(command),
                             Some(Command::Interrupt) => {
                                 cancel_tx.send_replace(true);
                             }
@@ -318,6 +327,16 @@ impl Controller {
         if let Some(session) = self.session.take() {
             self.emit(Event::SessionEnded { session: session.id });
         }
+    }
+
+    /// Records a notice between turns. Without a session there is nothing to record it in.
+    async fn note(&mut self, text: String) {
+        if self.session.is_none() {
+            return;
+        }
+        let turn = TurnId::new(format!("note-{}", self.next_turn));
+        let message = Message::text(Role::System, text, self.now());
+        self.record_message(&turn, message, true).await;
     }
 
     /// Runs one user turn until the brain is done, something fails, the step budget runs out
@@ -560,7 +579,11 @@ impl Controller {
             session,
             account: self.config.account.clone(),
             model: None,
-            instructions: self.config.instructions.clone(),
+            instructions: format!(
+                "{}\n\n{}",
+                self.config.instructions,
+                network::instructions(&self.sandbox.capabilities().network)
+            ),
             primer,
             messages,
             sandbox_actions: self.sandbox.capabilities().actions,

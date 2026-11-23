@@ -9,6 +9,7 @@ mod browser;
 #[cfg(target_os = "linux")]
 mod copy;
 mod logging;
+mod network;
 mod paths;
 mod place;
 mod ports;

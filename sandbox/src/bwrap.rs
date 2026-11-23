@@ -37,18 +37,33 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use nixxa_contracts::{
-    ActionId, JobId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
-    SandboxError, SandboxEvent,
+    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind,
+    SandboxCapabilities, SandboxError, SandboxEvent,
 };
 
 use crate::JobLimits;
 use crate::protocol::{FromDaemon, Limits, Op, Reply, Rlimits, ToDaemon, VERSION, encode, read_frame, write_frame};
+use crate::proxy::Proxy;
 
+/// Where the network proxy's directory is mounted inside the sandbox.
+const PROXY_INSIDE: &str = "/run/nixxa";
 /// Where the daemon binary is mounted inside the sandbox.
 const DAEMON_INSIDE: &str = "/.nixxa/nixxa-sandboxd";
 /// The few `/etc` entries commands need (user names, the dynamic linker cache, the time zone,
 /// Debian-style `alternatives` symlinks). Bound read-only if they exist.
-const ETC: [&str; 7] = ["passwd", "group", "nsswitch.conf", "ld.so.cache", "ld.so.conf", "localtime", "alternatives"];
+const ETC: [&str; 10] = [
+    "passwd",
+    "group",
+    "nsswitch.conf",
+    "ld.so.cache",
+    "ld.so.conf",
+    "localtime",
+    "alternatives",
+    // The public CA trust store, so TLS through the network proxy can verify servers.
+    "ssl",
+    "ca-certificates",
+    "pki",
+];
 /// How long the daemon gets to start and answer the handshake.
 const START_TIMEOUT: Duration = Duration::from_secs(15);
 /// Extra time the client allows past a command's own limit before giving up on the daemon.
@@ -98,6 +113,10 @@ pub struct BwrapConfig {
     pub open_files_max: u64,
     /// Limits on background jobs.
     pub jobs: JobLimits,
+    /// Tests only: names the network proxy resolves from this table instead of asking the
+    /// system resolver. The harness leaves it empty.
+    #[doc(hidden)]
+    pub hosts: std::collections::HashMap<String, Vec<std::net::IpAddr>>,
 }
 
 impl BwrapConfig {
@@ -121,6 +140,7 @@ impl BwrapConfig {
             file_size_max: 1024 * 1024 * 1024,
             open_files_max: 1024,
             jobs: JobLimits::default(),
+            hosts: std::collections::HashMap::new(),
         }
     }
 
@@ -143,6 +163,7 @@ impl BwrapConfig {
             background_output_cap: self.jobs.output_cap,
             max_background_jobs: self.jobs.max_running,
             job_prefix: String::new(),
+            network: false,
         }
     }
 }
@@ -178,6 +199,8 @@ struct Inner {
     /// Jobs started and not yet finished, with when they started, so they can be reported as
     /// finished if their daemon dies.
     jobs: Jobs,
+    /// The network proxy (D-064). Its policy is the sandbox's network policy.
+    proxy: Proxy,
     /// Daemons started so far. Each one's job ids get a different prefix (`j1`, then `2-j1`, …),
     /// so a restarted daemon never reuses an id the agent already has.
     generation: AtomicU64,
@@ -226,6 +249,10 @@ impl BwrapSandbox {
             )
         })?;
         let scope = if config.cgroup { probe_scope(&config) } else { None };
+        let events = broadcast::channel(crate::events::CAPACITY).0;
+        // The proxy's private directory goes where the user's runtime files do.
+        let base = config.runtime_dir.clone().unwrap_or_else(std::env::temp_dir);
+        let proxy = Proxy::new(&base, config.hosts.clone(), events.clone());
         Ok(Self {
             inner: Arc::new(Inner {
                 workspace,
@@ -237,8 +264,9 @@ impl BwrapSandbox {
                 foreground: Mutex::new(()),
                 landlock: AtomicBool::new(false),
                 seccomp: AtomicBool::new(false),
-                events: broadcast::channel(crate::events::CAPACITY).0,
+                events,
                 jobs: Jobs::default(),
+                proxy,
                 generation: AtomicU64::new(0),
             }),
         })
@@ -341,7 +369,11 @@ impl Inner {
         }
         args.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind"].map(str::to_owned));
         args.extend([host_str(&self.workspace), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
-        args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into(), DAEMON_INSIDE.into()]);
+        args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into()]);
+        if let Some(dir) = self.proxy.dir() {
+            args.extend(["--ro-bind".into(), host_str(dir), PROXY_INSIDE.into()]);
+        }
+        args.push(DAEMON_INSIDE.into());
         args
     }
 
@@ -381,6 +413,10 @@ impl Inner {
         let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let mut limits = self.config.limits();
         limits.job_prefix = if generation == 1 { String::new() } else { format!("{generation}-") };
+        limits.network = self.proxy.policy() != NetworkPolicy::Off;
+        if limits.network {
+            self.proxy.serve().map_err(SandboxError::Unavailable)?;
+        }
         let hello = async {
             write_frame(&mut stdin, &ToDaemon::Hello { version: VERSION, limits }).await?;
             read_frame::<_, FromDaemon>(&mut stdout).await
@@ -648,7 +684,7 @@ impl Sandbox for BwrapSandbox {
             backend,
             // Isolated only when namespaces, Landlock and seccomp are all active.
             isolated: landlock && seccomp,
-            network: false,
+            network: NetworkAccess::Controlled(self.inner.proxy.policy()),
             jobs: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }
@@ -670,10 +706,16 @@ impl Sandbox for BwrapSandbox {
             _ => (QUICK_TIMEOUT, false),
         };
         let _turn = if foreground { Some(self.inner.foreground.lock().await) } else { None };
+        if foreground {
+            self.inner.proxy.begin_foreground();
+        }
         let reply = self.inner.request(Op::Action { action }, limit).await;
+        let network = if foreground { self.inner.proxy.end_foreground().await } else { Vec::new() };
         let duration_ms = started.elapsed().as_millis() as u64;
         match reply? {
-            Reply::Outcome { outcome, truncated } => Ok(Observation { action_id: id, outcome, duration_ms, truncated }),
+            Reply::Outcome { outcome, truncated } => {
+                Ok(Observation { action_id: id, outcome, duration_ms, truncated, network })
+            }
             Reply::Timeout => Err(SandboxError::Timeout),
             // Stopped by a concurrent `reset`.
             Reply::Cancelled => {
@@ -696,6 +738,27 @@ impl Sandbox for BwrapSandbox {
         let Some(conn) = self.inner.current().await else { return Ok(()) };
         // If the daemon fails, discarding it has killed everything anyway.
         let _ = self.inner.request_on(&conn, Op::Reset, QUICK_TIMEOUT).await;
+        Ok(())
+    }
+
+    async fn set_network(&self, policy: NetworkPolicy) -> Result<(), SandboxError> {
+        let on = policy != NetworkPolicy::Off;
+        if on {
+            self.inner.proxy.usable().map_err(SandboxError::Unavailable)?;
+            self.inner.proxy.serve().map_err(SandboxError::Unavailable)?;
+        } else {
+            // Refuse at once, before the daemon hears of it.
+            self.inner.proxy.set_policy(NetworkPolicy::Off);
+        }
+        // A daemon started later reads it from the handshake.
+        if let Some(conn) = self.inner.current().await {
+            match self.inner.request_on(&conn, Op::Network { on }, QUICK_TIMEOUT).await? {
+                Reply::Done => {}
+                Reply::Error { message } => return Err(SandboxError::Unavailable(message)),
+                other => return Err(SandboxError::Unavailable(format!("unexpected answer: {other:?}"))),
+            }
+        }
+        self.inner.proxy.set_policy(policy);
         Ok(())
     }
 

@@ -125,6 +125,19 @@ struct MemSandbox {
     jobs: bool,
     job_bug: Option<JobBug>,
     job_state: Mutex<MemJobs>,
+    net: Mutex<NetworkPolicy>,
+    net_bug: Option<NetBug>,
+}
+
+/// One way to get the network policy wrong.
+#[derive(Clone, Copy, PartialEq)]
+enum NetBug {
+    /// Starts with the network open.
+    StartsOpen,
+    /// Accepts a policy but keeps reporting the old one.
+    NotReported,
+    /// Claims it can't restrict the network, then accepts a policy anyway.
+    UnrestrictedAcceptsPolicy,
 }
 
 /// One way to get background jobs wrong.
@@ -230,7 +243,11 @@ impl Sandbox for MemSandbox {
         SandboxCapabilities {
             backend: "memory".into(),
             isolated: true,
-            network: false,
+            network: match (self.net_bug, self.net.lock().unwrap().clone()) {
+                (Some(NetBug::UnrestrictedAcceptsPolicy), _) => NetworkAccess::Unrestricted,
+                (Some(NetBug::StartsOpen), NetworkPolicy::Off) => NetworkAccess::Controlled(NetworkPolicy::Open),
+                (_, policy) => NetworkAccess::Controlled(policy),
+            },
             jobs: self.jobs,
             actions: if self.jobs {
                 SandboxActionKind::ALL.to_vec()
@@ -245,6 +262,12 @@ impl Sandbox for MemSandbox {
                 vec![SandboxActionKind::ReadFile, SandboxActionKind::WriteFile, SandboxActionKind::ListDir]
             },
         }
+    }
+    async fn set_network(&self, policy: NetworkPolicy) -> Result<(), SandboxError> {
+        if self.net_bug != Some(NetBug::NotReported) {
+            *self.net.lock().unwrap() = policy;
+        }
+        Ok(())
     }
     fn subscribe(&self) -> futures::stream::BoxStream<'static, SandboxEvent> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
@@ -429,6 +452,35 @@ fn sandbox_suite_catches_an_unknown_job_succeeding() {
 #[should_panic(expected = "reset must stop every job")]
 fn sandbox_suite_catches_reset_leaving_jobs_running() {
     block_on(conformance::sandbox::run(|| with_job_bug(JobBug::ResetKeepsJobs)));
+}
+
+#[test]
+#[should_panic(expected = "the network must start off")]
+fn sandbox_suite_catches_a_network_that_starts_open() {
+    block_on(conformance::sandbox::run(|| MemSandbox { net_bug: Some(NetBug::StartsOpen), ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "must report the policy just set")]
+fn sandbox_suite_catches_a_policy_that_is_not_reported() {
+    block_on(conformance::sandbox::run(|| MemSandbox { net_bug: Some(NetBug::NotReported), ..Default::default() }));
+}
+
+#[test]
+#[should_panic(expected = "can't restrict the network must refuse a policy")]
+fn sandbox_suite_catches_an_unrestricted_sandbox_taking_a_policy() {
+    block_on(conformance::sandbox::run(|| MemSandbox {
+        net_bug: Some(NetBug::UnrestrictedAcceptsPolicy),
+        ..Default::default()
+    }));
+}
+
+#[test]
+fn an_observation_without_requests_serialises_as_before() {
+    let obs = Observation::new(ActionId::new("a"), Outcome::Written { bytes: 1 });
+    let json = serde_json::to_value(&obs).unwrap();
+    assert!(json.get("network").is_none(), "{json}");
+    assert_eq!(serde_json::from_value::<Observation>(json).unwrap(), obs);
 }
 
 #[test]

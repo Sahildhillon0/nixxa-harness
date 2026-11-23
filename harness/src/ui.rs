@@ -1,7 +1,8 @@
 //! Draws [`App`] with ratatui. Layout and visual language follow DESIGN.md §4.
 
 use nixxa_contracts::{
-    Action, ActionRequest, ApprovalMode, KnowledgeAction, Outcome, SandboxAction, SourceStatus, Timestamp,
+    Action, ActionRequest, ApprovalMode, KnowledgeAction, NetResult, NetworkAccess, NetworkPolicy, Outcome,
+    SandboxAction, SourceStatus, Timestamp,
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -10,9 +11,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Speaker};
+use crate::network::{self, Mode};
 use crate::safe;
 use crate::sessions::ago;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
+use nixxa_sandbox::network::PRESETS;
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
 const WIDE: u16 = 100;
@@ -81,6 +84,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     draw_approval(frame, app, theme, if side.area() > 0 { side } else { body });
     draw_setup(frame, app, theme, body);
     draw_sessions(frame, app, theme, body);
+    draw_network(frame, app, theme, body);
     draw_place(frame, app, theme, body);
     safe::scrub(frame.buffer_mut());
 }
@@ -109,6 +113,16 @@ fn status_line(app: &App, theme: Theme) -> Line<'static> {
         }
         Some(caps) => part(&mut spans, format!("{} ○ NOT ISOLATED", safe::line(&caps.backend)), theme.bad()),
         None => {}
+    }
+    if let Some(caps) = &app.sandbox {
+        let style = match &caps.network {
+            NetworkAccess::Controlled(NetworkPolicy::Off) => theme.dim(),
+            NetworkAccess::Controlled(NetworkPolicy::Allow(_)) => theme.ok(),
+            NetworkAccess::Controlled(NetworkPolicy::Open) | NetworkAccess::Unrestricted => {
+                theme.bad().add_modifier(Modifier::BOLD)
+            }
+        };
+        part(&mut spans, network::status(&caps.network), style);
     }
     if !app.sources.is_empty() {
         spans.push(Span::raw(" ─"));
@@ -340,6 +354,10 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         keys
     } else if app.sessions.is_some() {
         "type to search · ↑/↓ choose · enter resume · ctrl-u clear · esc close".to_string()
+    } else if app.network.open && app.network.adding.is_some() {
+        "type a host, *.domain or an IP, with :port if not 443/80 · enter add · esc cancel".to_string()
+    } else if app.network.open {
+        "1 off · 2 allow · 3 open · ↑/↓ choose · space preset on/off · a add host · d remove · esc close".to_string()
     } else if app.approval().is_some() {
         match &app.notice {
             Some(notice) if app.confirming_auto(std::time::Instant::now()) => safe::line(notice),
@@ -350,7 +368,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     } else {
         let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
         format!(
-            "enter send · alt-enter newline · tab focus · shift-tab ask/auto · j/k move · ctrl-s sessions{key} · ctrl-c interrupt (twice: quit)"
+            "enter send · tab focus · shift-tab ask/auto · ctrl-n network · ctrl-s sessions{key} · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
         )
     };
     let auto = app.mode == ApprovalMode::Auto;
@@ -358,6 +376,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     let urgent = app.place.is_some()
         || app.setup.is_some()
         || app.sessions.is_some()
+        || app.network.open
         || app.approval().is_some()
         || app.notice.is_some();
     let style = if urgent { theme.pending() } else { theme.dim() };
@@ -666,6 +685,123 @@ fn draw_sessions(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The network settings (`ctrl+n`), over the panes: the mode, the allowed hosts, and the
+/// requests made so far. Hosts and reasons come from commands: every one goes through
+/// `safe::line`.
+fn draw_network(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
+    let panel = &app.network;
+    if !panel.open {
+        return;
+    }
+    let width = over.width.min(110);
+    let inner = usize::from(width.saturating_sub(2));
+    let mut lines: Vec<Line> = Vec::new();
+    match app.sandbox.as_ref().map(|caps| &caps.network) {
+        None => lines.push(Line::styled("Choose where the agent works first.", theme.dim())),
+        Some(NetworkAccess::Unrestricted) => {
+            lines.push(Line::styled("The network isn't restricted here.", theme.bad().add_modifier(Modifier::BOLD)));
+            lines.push(Line::raw(
+                "This directory isn't isolated: commands reach whatever this machine can. To control the network, \
+                 start Nixxa in a sandbox.",
+            ));
+        }
+        Some(NetworkAccess::Controlled(_)) => {
+            let mode = |n: &str, name: &str, this: Mode| {
+                let on = panel.mode == this;
+                let style = if on { theme.accent().add_modifier(Modifier::BOLD) } else { Style::new() };
+                Span::styled(format!("{} {n} {name}   ", if on { "●" } else { "○" }), style)
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Mode  ", theme.dim()),
+                mode("1", "Off", Mode::Off),
+                mode("2", "Allow", Mode::Allow),
+                mode("3", "Open", Mode::Open),
+            ]));
+            if panel.confirm_open {
+                lines.push(Line::styled(
+                    "Open lets commands reach every public host (still logged; local and private addresses stay \
+                     blocked). Press 3 again to open it.",
+                    theme.pending(),
+                ));
+            }
+            if let Some(why) = &panel.error {
+                lines.push(Line::styled(
+                    format!("✗ {}", truncate(&safe::line(why), inner.saturating_sub(2))),
+                    theme.bad(),
+                ));
+            }
+            lines.push(Line::default());
+            let used = if panel.mode == Mode::Allow { "" } else { "  (used in Allow mode)" };
+            lines.push(Line::styled(format!("Allowed hosts{used}"), theme.dim().add_modifier(Modifier::BOLD)));
+            for (i, (preset, on)) in PRESETS.iter().zip(&panel.presets).enumerate() {
+                let chosen = i == panel.selected;
+                let style = if chosen { theme.accent().add_modifier(Modifier::BOLD) } else { Style::new() };
+                let hosts = truncate(&network::preset_hosts(preset), inner.saturating_sub(22));
+                lines.push(Line::from(vec![
+                    Span::styled(if chosen { "› " } else { "  " }, style),
+                    Span::styled(format!("[{}] {:<10}", if *on { "x" } else { " " }, preset.name), style),
+                    Span::styled(format!("  {hosts}"), theme.dim()),
+                ]));
+            }
+            for (i, rule) in panel.hosts.iter().enumerate() {
+                let chosen = PRESETS.len() + i == panel.selected;
+                let style = if chosen { theme.accent().add_modifier(Modifier::BOLD) } else { Style::new() };
+                let host = truncate(&safe::line(&rule.to_string()), inner.saturating_sub(6));
+                lines.push(Line::styled(format!("{}• {host}", if chosen { "› " } else { "  " }), style));
+            }
+            if let Some(typed) = &panel.adding {
+                lines.push(Line::from(vec![
+                    Span::styled("  Add  ", theme.dim()),
+                    Span::styled(format!("{}▌", safe::line(typed)), theme.accent()),
+                ]));
+            }
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("Recent requests", theme.dim().add_modifier(Modifier::BOLD)));
+    if panel.requests.is_empty() {
+        lines.push(Line::styled("None yet.", theme.dim()));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| Timestamp(u64::try_from(d.as_millis()).unwrap_or(u64::MAX)))
+        .unwrap_or(Timestamp(0));
+    let room = usize::from(over.height.saturating_sub(2)).saturating_sub(lines.len()).max(1);
+    for request in panel.requests.iter().rev().take(room) {
+        let who = request.job.as_ref().map_or_else(|| "agent".to_string(), |job| safe::line(job.as_str()));
+        let target = format!("{}:{}", safe::line(&request.host), request.port);
+        let mut spans =
+            vec![Span::styled(format!("{:<10} {:<6} ", ago(now, request.time), truncate(&who, 6)), theme.dim())];
+        match &request.result {
+            NetResult::Allowed => {
+                spans.push(Span::styled("✓ ", theme.ok()));
+                spans.push(Span::raw(format!("{target}  ")));
+                spans.push(Span::styled(size(request.bytes_down), theme.dim()));
+            }
+            NetResult::Blocked { reason } => {
+                spans.push(Span::styled("✗ ", theme.bad()));
+                spans.push(Span::raw(format!("{target}  ")));
+                let used: usize = spans.iter().map(Span::width).sum();
+                spans.push(Span::styled(truncate(&safe::line(reason), inner.saturating_sub(used)), theme.bad()));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    let area = Rect { x: over.x + (over.width - width) / 2, y: over.y, width, height: over.height };
+    let block = Block::bordered().title(" Network ").border_style(theme.accent());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+}
+
+/// Bytes, briefly.
+fn size(bytes: u64) -> String {
+    match bytes {
+        0..1_000 => format!("{bytes} B"),
+        1_000..1_000_000 => format!("{:.1} kB", bytes as f64 / 1e3),
+        _ => format!("{:.1} MB", bytes as f64 / 1e6),
+    }
+}
+
 /// The status line under a setup form.
 fn state_line(state: &SetupState, idle: &str, checking: &str, theme: Theme) -> Line<'static> {
     match state {
@@ -829,7 +965,7 @@ pub(crate) mod tests {
             capabilities: SandboxCapabilities {
                 backend: "fake".into(),
                 isolated: false,
-                network: false,
+                network: NetworkAccess::Controlled(NetworkPolicy::Off),
                 jobs: false,
                 actions: SandboxActionKind::ALL.to_vec(),
             },
@@ -901,6 +1037,59 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_status_bar_always_shows_the_network() {
+        let mut app = started();
+        assert!(screen(&mut app, 140, 20).lines().next().unwrap().contains("net: off"));
+        let crates = nixxa_sandbox::network::PRESETS[0].rules();
+        let set = |app: &mut App, network| app.sandbox.as_mut().unwrap().network = network;
+        set(&mut app, NetworkAccess::Controlled(NetworkPolicy::Allow(crates)));
+        assert!(screen(&mut app, 140, 20).lines().next().unwrap().contains("net: 3 domains"));
+        set(&mut app, NetworkAccess::Controlled(NetworkPolicy::Open));
+        assert!(screen(&mut app, 140, 20).lines().next().unwrap().contains("net: OPEN"));
+        set(&mut app, NetworkAccess::Unrestricted);
+        assert!(screen(&mut app, 140, 20).lines().next().unwrap().contains("net: not restricted"));
+    }
+
+    #[test]
+    fn the_network_overlay_shows_modes_hosts_and_requests_safely() {
+        let mut app = started();
+        app.network.open = true;
+        app.network.hosts.push(nixxa_contracts::DomainRule::parse("example.org").unwrap());
+        let request = |host: &str, result| nixxa_contracts::NetRequest {
+            time: Timestamp(0),
+            job: Some(nixxa_contracts::JobId::new("j1")),
+            host: host.into(),
+            port: 443,
+            method: None,
+            url: None,
+            bytes_up: 0,
+            bytes_down: 2_500,
+            duration_ms: 1,
+            result,
+        };
+        app.network.record(request("index.crates.io", NetResult::Allowed));
+        app.network.record(request(HOSTILE, NetResult::Blocked { reason: HOSTILE.into() }));
+        let screen = screen(&mut app, 120, 30);
+        for part in ["Network", "● 1 Off", "[ ] crates.io", "registry.npmjs.org", "• example.org", "Recent requests"]
+        {
+            assert!(screen.contains(part), "missing {part:?}:\n{screen}");
+        }
+        assert!(screen.contains("✓ index.crates.io:443  2.5 kB"), "{screen}");
+        assert!(screen.contains("✗ ok^[]0;PWNED-TITLE^G"), "hostile text is shown visibly:\n{screen}");
+        assert!(!screen.contains('\x1b') && !screen.contains('\x07'), "no raw control characters");
+    }
+
+    #[test]
+    fn in_this_directory_the_overlay_says_the_network_is_not_restricted() {
+        let mut app = started();
+        app.sandbox.as_mut().unwrap().network = NetworkAccess::Unrestricted;
+        app.network.open = true;
+        let screen = screen(&mut app, 120, 30);
+        assert!(screen.contains("The network isn't restricted here."), "{screen}");
+        assert!(!screen.contains("Mode"), "no modes to choose from:\n{screen}");
+    }
+
+    #[test]
     fn wide_screens_show_all_panes_and_narrow_ones_collapse() {
         let mut app = started();
         let wide = screen(&mut app, 120, 20);
@@ -937,6 +1126,7 @@ pub(crate) mod tests {
                 outcome: Outcome::Exec { exit_code: Some(0), stdout: "all good".into(), stderr: String::new() },
                 duration_ms: 14,
                 truncated: false,
+                network: Vec::new(),
             },
         });
         let screen = screen(&mut app, 120, 20);
