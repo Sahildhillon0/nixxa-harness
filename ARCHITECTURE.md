@@ -171,7 +171,7 @@ internal is `pub(crate)`.
 | `Content` | What a `Message` carries: text, a proposed `ActionRequest`, an `Observation`, `Reasoning` (opaque provider data such as a signed thinking block) — so the brain can rebuild tool-call history exactly — or `Summary` (a turn's `Done` summary: stored, never sent back to the brain or shown, D-056) |
 | `Intent` | What the brain wants: `Say(text)`, `Act(Action)`, `Done(summary)` |
 | `Action` | `Sandbox(SandboxAction)` or `Knowledge(KnowledgeAction)` — the controller routes on this |
-| `SandboxAction` | `Exec`, `ReadFile`, `WriteFile`, `ListDir`, … |
+| `SandboxAction` | `Exec` (foreground or background), `ReadFile`, `WriteFile`, `ListDir`, `JobStatus`, `JobOutput`, `JobStop`, … |
 | `KnowledgeAction` | `Call { source, tool, args }` (a source's tool; its `ToolSpec.mutating` says whether it writes) or `Record { source, entry }` (structured write-back) |
 | `ToolSpec` | A knowledge tool: source, name, description, JSON-Schema input, `mutating` flag |
 | `Primer` | Context gathered at session start from knowledge sources (recent memory, project note) |
@@ -186,7 +186,7 @@ internal is `pub(crate)`.
 | Trait | Implemented by | Core operations |
 |---|---|---|
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
-| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset() |
+| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); subscribe() → `SandboxEvent`s (job finished, network request) |
 | `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
@@ -232,6 +232,12 @@ that escape the workspace never succeed, `reset` keeps the workspace, an isolate
 supports `Exec` really runs `echo`, and dropping an in-flight `execute` doesn't wedge the
 backend (the next call works).
 
+### Contract changes made in Stage 6
+- **Background jobs (#9):** `Exec { background }` → `Outcome::Started { job: JobId }`; the
+  `JobStatus`, `JobOutput` and `JobStop` actions; `Sandbox::subscribe()` → a stream of
+  `SandboxEvent` (`JobFinished`, and `NetRequest` for the network log); `SandboxCapabilities.jobs`
+  (D-061 to D-063). `Event::JobFinished` for the controller comes with the wake-ups.
+
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
 `feat(contracts)` commit with conformance tests.
@@ -241,7 +247,6 @@ These aren't in `contracts` yet. Each lands with the stage that needs it, as its
 | `SandboxAction::Patch { path, edits, expected_hash }` (search/replace hunks against a known file state) | precise edits, plan diffs, undo (#15, #2) |
 | `Sandbox::checkpoint()` → `CheckpointId`, `Sandbox::restore(CheckpointId)`, `Sandbox::diff(from, to)` | undo (#15), worktree review (#6) |
 | `NetworkPolicy { Off, Allow(domains), Open }`, `Sandbox::set_network(policy)`; `Observation.network: Vec<NetRequest>` (each request made while an action ran, allowed or blocked) | network allowlist (#1), audit (#4) |
-| Background jobs: `Exec { background: true }` → `JobId`; `JobStatus`, `JobOutput`, `JobStop` actions; `Event::JobFinished` | background tasks (#9) |
 | Terminal: `Sandbox::open_terminal(size)` → a PTY stream (input, output, resize) | ctrl+t (#16) |
 | `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
@@ -483,7 +488,9 @@ recorded in the DESIGN.md decision log before it is built.
   stdio. **The trait does not change.**
 - **Stage 6:** the daemon stops being "one command at a time, then kill everything" (D-043).
   It tracks each job (the agent's command, the user's terminal, background jobs, services) as
-  its own process tree with its own limits. Kills target one job, never the user's shell. The
+  its own process tree with its own limits. Kills target one job, never the user's shell.
+  *Done (D-061, D-062):* each job runs under a supervisor that is a child subreaper, so a job is
+  exactly that supervisor's descendants; the daemon is a subreaper too, as a backstop. The
   host side gains the egress proxy, reached from inside through a Unix socket the daemon
   forwards to `127.0.0.1` in the sandbox.
 - **Stage 12:** background sessions. A long-running `nixxa` service hosts the controllers, and
@@ -890,6 +897,9 @@ Every stage ends with something that runs and a checklist that must be true befo
 - **Terminal (#16):** `ctrl+t` replaces the details pane with a terminal in the same place as
   the agent.
 - **In-session background jobs and notifications (#9).**
+- **Progress:**
+  - PR A, the job model and background jobs (D-061 to D-063): done.
+  - PR B (network), PR C (terminal), PR D (wake-ups and notifications): not started.
 - **Exit:**
   - `cargo test` on a fresh project with a crates.io dependency passes inside the sandbox with
     only crates.io allowed, and a request to another host is blocked and logged;

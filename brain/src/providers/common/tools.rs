@@ -6,12 +6,14 @@
 use std::collections::HashMap;
 
 use nixxa_contracts::{
-    Action, BrainError, Context, KnowledgeAction, SandboxAction, SandboxActionKind, SourceId, ToolSpec,
+    Action, BrainError, Context, JobId, KnowledgeAction, SandboxAction, SandboxActionKind, SourceId, ToolSpec,
 };
 use serde_json::{Map, Value, json};
 
 /// Tool names must match `^[a-zA-Z0-9_-]{1,128}$`; we stay well inside that.
 const MAX_NAME: usize = 64;
+/// Bytes of each stream `job_output` shows when the model doesn't say.
+const DEFAULT_TAIL: u64 = 4096;
 
 /// What a tool name stands for.
 #[derive(Debug, Clone, PartialEq)]
@@ -24,6 +26,8 @@ enum Target {
 #[derive(Debug, Default)]
 pub(crate) struct ToolMap {
     by_name: HashMap<String, Target>,
+    /// Whether the sandbox runs background jobs (so `exec` takes `background`).
+    jobs: bool,
 }
 
 /// The name of a sandbox tool.
@@ -33,6 +37,9 @@ pub(crate) fn sandbox_name(kind: SandboxActionKind) -> &'static str {
         SandboxActionKind::ReadFile => "read_file",
         SandboxActionKind::WriteFile => "write_file",
         SandboxActionKind::ListDir => "list_dir",
+        SandboxActionKind::JobStatus => "job_status",
+        SandboxActionKind::JobOutput => "job_output",
+        SandboxActionKind::JobStop => "job_stop",
     }
 }
 
@@ -58,10 +65,11 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// The tool definitions for a context, and the map to read the model's calls back.
 pub(crate) fn build(context: &Context) -> (Vec<Value>, ToolMap) {
     let mut definitions = Vec::new();
-    let mut map = ToolMap::default();
+    let jobs = context.sandbox_actions.contains(&SandboxActionKind::JobStatus);
+    let mut map = ToolMap { jobs, ..ToolMap::default() };
     for kind in SandboxActionKind::ALL {
         if context.sandbox_actions.contains(&kind) {
-            definitions.push(sandbox_definition(kind));
+            definitions.push(sandbox_definition(kind, jobs));
             map.by_name.insert(sandbox_name(kind).to_string(), Target::Sandbox(kind));
         }
     }
@@ -83,19 +91,31 @@ pub(crate) fn build(context: &Context) -> (Vec<Value>, ToolMap) {
     (definitions, map)
 }
 
-fn sandbox_definition(kind: SandboxActionKind) -> Value {
+fn sandbox_definition(kind: SandboxActionKind, jobs: bool) -> Value {
     let path = |what: &str| json!({ "type": "string", "description": what });
+    let job = json!({ "type": "string", "description": "The job id `exec` returned, e.g. `j1`." });
     let (description, properties, required) = match kind {
-        SandboxActionKind::Exec => (
-            "Run a shell command inside the sandbox, a copy of the user's workspace with no network. \
-             Returns the exit code, stdout and stderr. Use it to build, test, search and inspect.",
-            json!({
+        SandboxActionKind::Exec => {
+            let mut properties = json!({
                 "command": { "type": "string", "description": "The command line, run by the sandbox's shell." },
                 "cwd": path("Working directory relative to the workspace root, `/`-separated. Omit for the root."),
                 "timeout_ms": { "type": "integer", "minimum": 1, "description": "Time limit in milliseconds. The sandbox may enforce a lower one." }
-            }),
-            vec!["command"],
-        ),
+            });
+            if jobs {
+                properties["background"] = json!({
+                    "type": "boolean",
+                    "description": "Start it as a background job and return at once with its id, instead of waiting \
+                                    for it. For long builds, test suites and servers. Only a few run at once, each \
+                                    under its own time limit. Follow it with job_status, job_output and job_stop."
+                });
+            }
+            (
+                "Run a shell command inside the sandbox, a copy of the user's workspace with no network. \
+                 Returns the exit code, stdout and stderr. Use it to build, test, search and inspect.",
+                properties,
+                vec!["command"],
+            )
+        }
         SandboxActionKind::ReadFile => (
             "Read a text file from the workspace. Returns its contents.",
             json!({ "path": path("File path relative to the workspace root, `/`-separated.") }),
@@ -114,6 +134,23 @@ fn sandbox_definition(kind: SandboxActionKind) -> Value {
             json!({ "path": path("Directory relative to the workspace root, `/`-separated; `.` is the root.") }),
             vec!["path"],
         ),
+        SandboxActionKind::JobStatus => (
+            "Say whether a background job is still running, or how it ended (its exit code).",
+            json!({ "job": job }),
+            vec!["job"],
+        ),
+        SandboxActionKind::JobOutput => (
+            "Show a background job's status and the last part of its stdout and stderr. It can be read while \
+             the job runs.",
+            json!({
+                "job": job,
+                "tail_bytes": { "type": "integer", "minimum": 1, "description": "Bytes to show from the end of each stream (default 4096)." }
+            }),
+            vec!["job"],
+        ),
+        SandboxActionKind::JobStop => {
+            ("Stop a background job and every process it started.", json!({ "job": job }), vec!["job"])
+        }
     };
     json!({
         "name": sandbox_name(kind),
@@ -140,7 +177,7 @@ pub(crate) fn to_action(map: &ToolMap, name: &str, input: Value) -> Result<Actio
         return Err(invalid(name, "the input is not a JSON object"));
     };
     match target {
-        Target::Sandbox(kind) => sandbox_action(*kind, name, input).map(|action| Action::Sandbox { action }),
+        Target::Sandbox(kind) => sandbox_action(*kind, name, input, map.jobs).map(|action| Action::Sandbox { action }),
         Target::Knowledge { source, tool, schema } => {
             check_against_schema(name, &input, schema)?;
             Ok(Action::Knowledge {
@@ -154,11 +191,19 @@ pub(crate) fn to_action(map: &ToolMap, name: &str, input: Value) -> Result<Actio
     }
 }
 
-fn sandbox_action(kind: SandboxActionKind, name: &str, input: Map<String, Value>) -> Result<SandboxAction, BrainError> {
+fn sandbox_action(
+    kind: SandboxActionKind,
+    name: &str,
+    input: Map<String, Value>,
+    jobs: bool,
+) -> Result<SandboxAction, BrainError> {
     let allowed: &[&str] = match kind {
+        SandboxActionKind::Exec if jobs => &["command", "cwd", "timeout_ms", "background"],
         SandboxActionKind::Exec => &["command", "cwd", "timeout_ms"],
         SandboxActionKind::ReadFile | SandboxActionKind::ListDir => &["path"],
         SandboxActionKind::WriteFile => &["path", "content"],
+        SandboxActionKind::JobStatus | SandboxActionKind::JobStop => &["job"],
+        SandboxActionKind::JobOutput => &["job", "tail_bytes"],
     };
     if let Some(extra) = input.keys().find(|key| !allowed.contains(&key.as_str())) {
         return Err(invalid(name, &format!("unexpected field `{}`", printable(extra))));
@@ -190,8 +235,25 @@ fn sandbox_action(kind: SandboxActionKind, name: &str, input: Map<String, Value>
                     _ => return Err(invalid(name, "`timeout_ms` must be a positive integer")),
                 },
             };
-            SandboxAction::Exec { command, cwd: optional_string("cwd")?, timeout_ms }
+            let background = match input.get("background") {
+                None | Some(Value::Null) => false,
+                Some(Value::Bool(background)) => *background,
+                Some(_) => return Err(invalid(name, "`background` must be true or false")),
+            };
+            SandboxAction::Exec { command, cwd: optional_string("cwd")?, timeout_ms, background }
         }
+        SandboxActionKind::JobStatus => SandboxAction::JobStatus { job: JobId::new(string("job")?) },
+        SandboxActionKind::JobOutput => {
+            let tail_bytes = match input.get("tail_bytes") {
+                None | Some(Value::Null) => DEFAULT_TAIL,
+                Some(value) => match value.as_u64() {
+                    Some(n) if n > 0 => n,
+                    _ => return Err(invalid(name, "`tail_bytes` must be a positive integer")),
+                },
+            };
+            SandboxAction::JobOutput { job: JobId::new(string("job")?), tail_bytes }
+        }
+        SandboxActionKind::JobStop => SandboxAction::JobStop { job: JobId::new(string("job")?) },
         SandboxActionKind::ReadFile => SandboxAction::ReadFile { path: string("path")? },
         SandboxActionKind::WriteFile => SandboxAction::WriteFile { path: string("path")?, content: string("content")? },
         SandboxActionKind::ListDir => SandboxAction::ListDir { path: string("path")? },
@@ -255,7 +317,7 @@ pub(crate) fn tool_use_for(action: &Action) -> (String, Value) {
     match action {
         Action::Sandbox { action } => {
             let input = match action {
-                SandboxAction::Exec { command, cwd, timeout_ms } => {
+                SandboxAction::Exec { command, cwd, timeout_ms, background } => {
                     let mut input = Map::new();
                     input.insert("command".into(), json!(command));
                     if let Some(cwd) = cwd {
@@ -264,10 +326,16 @@ pub(crate) fn tool_use_for(action: &Action) -> (String, Value) {
                     if let Some(ms) = timeout_ms {
                         input.insert("timeout_ms".into(), json!(ms));
                     }
+                    if *background {
+                        input.insert("background".into(), json!(true));
+                    }
                     Value::Object(input)
                 }
                 SandboxAction::ReadFile { path } | SandboxAction::ListDir { path } => json!({ "path": path }),
                 SandboxAction::WriteFile { path, content } => json!({ "path": path, "content": content }),
+                SandboxAction::JobStatus { job } => json!({ "job": job }),
+                SandboxAction::JobOutput { job, tail_bytes } => json!({ "job": job, "tail_bytes": tail_bytes }),
+                SandboxAction::JobStop { job } => json!({ "job": job }),
             };
             (sandbox_name(action.kind()).to_string(), input)
         }
@@ -360,7 +428,14 @@ mod tests {
         let (_, map) = build(&context(SandboxActionKind::ALL.to_vec(), vec![]));
         assert_eq!(
             to_action(&map, "exec", json!({ "command": "ls", "cwd": null, "timeout_ms": 5000 })).unwrap(),
-            Action::Sandbox { action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: Some(5000) } }
+            Action::Sandbox {
+                action: SandboxAction::Exec {
+                    command: "ls".into(),
+                    cwd: None,
+                    timeout_ms: Some(5000),
+                    background: false
+                }
+            }
         );
         for bad in [
             json!({}),
@@ -374,6 +449,35 @@ mod tests {
             assert!(matches!(to_action(&map, "exec", bad.clone()), Err(BrainError::Provider(_))), "{bad}");
         }
         assert!(to_action(&map, "write_file", json!({ "path": "a" })).is_err(), "content is required");
+        assert_eq!(
+            to_action(&map, "exec", json!({ "command": "cargo build", "background": true })).unwrap(),
+            Action::Sandbox {
+                action: SandboxAction::Exec {
+                    command: "cargo build".into(),
+                    cwd: None,
+                    timeout_ms: None,
+                    background: true
+                }
+            }
+        );
+        assert!(to_action(&map, "exec", json!({ "command": "ls", "background": "yes" })).is_err());
+        assert_eq!(
+            to_action(&map, "job_output", json!({ "job": "j1" })).unwrap(),
+            Action::Sandbox { action: SandboxAction::JobOutput { job: JobId::new("j1"), tail_bytes: DEFAULT_TAIL } }
+        );
+        for bad in [json!({ "job": "j1", "tail_bytes": 0 }), json!({ "job": "j1", "tail_bytes": "all" }), json!({})] {
+            assert!(to_action(&map, "job_output", bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn background_is_offered_only_with_jobs() {
+        let (definitions, map) = build(&context(vec![SandboxActionKind::Exec], vec![]));
+        assert!(definitions[0]["input_schema"]["properties"].get("background").is_none());
+        let err = to_action(&map, "exec", json!({ "command": "ls", "background": true })).unwrap_err();
+        assert!(err.to_string().contains("unexpected field `background`"), "{err}");
+        let (definitions, _) = build(&context(SandboxActionKind::ALL.to_vec(), vec![]));
+        assert_eq!(definitions[0]["input_schema"]["properties"]["background"]["type"], "boolean");
     }
 
     #[test]
@@ -402,8 +506,18 @@ mod tests {
         let (_, map) = build(&context(SandboxActionKind::ALL.to_vec(), vec![spec("notes", "search", search_schema())]));
         for action in [
             Action::Sandbox {
-                action: SandboxAction::Exec { command: "ls".into(), cwd: Some("src".into()), timeout_ms: None },
+                action: SandboxAction::Exec {
+                    command: "ls".into(),
+                    cwd: Some("src".into()),
+                    timeout_ms: None,
+                    background: false,
+                },
             },
+            Action::Sandbox {
+                action: SandboxAction::Exec { command: "make".into(), cwd: None, timeout_ms: None, background: true },
+            },
+            Action::Sandbox { action: SandboxAction::JobOutput { job: JobId::new("j2"), tail_bytes: 100 } },
+            Action::Sandbox { action: SandboxAction::JobStop { job: JobId::new("j2") } },
             Action::Sandbox { action: SandboxAction::WriteFile { path: "a".into(), content: "b".into() } },
             Action::Knowledge {
                 action: KnowledgeAction::Call {

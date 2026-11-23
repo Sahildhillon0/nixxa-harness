@@ -1,17 +1,23 @@
-//! `nixxa-sandboxd`: the sandbox daemon. `BwrapSandbox` starts it inside bubblewrap and talks to
-//! it over framed JSON on stdin/stdout (see `protocol.rs`). It runs commands and does file
-//! operations beneath `/workspace`. Its stderr carries metadata-only logs: never command text,
-//! paths, file contents or output.
+//! `nixxa-sandboxd`: the sandbox daemon. It runs inside bubblewrap, speaks the framed protocol
+//! in `protocol.rs` over stdin/stdout, and logs metadata (never output or command text) to
+//! stderr.
+//!
+//! It runs as `--limited` too: that is the supervisor at the top of every job (see `exec.rs`).
 
 #[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
 mod files;
 #[cfg(target_os = "linux")]
+#[path = "../../job.rs"]
+mod job;
+#[cfg(target_os = "linux")]
+mod jobs;
+#[cfg(target_os = "linux")]
 mod landlock;
 #[cfg(target_os = "linux")]
 #[path = "../../protocol.rs"]
-#[allow(dead_code)] // Shared with the client, which uses the other half.
+#[allow(dead_code)]
 mod protocol;
 #[cfg(target_os = "linux")]
 mod seccomp;
@@ -35,10 +41,14 @@ fn main() {
         };
         std::process::exit(code);
     }
-    // Keep the daemon's /proc entry out of reach of the commands it runs: they share a user and
-    // a PID namespace, so without this any command could open /proc/2/fd/{0,1} and forge frames.
+    // No core dumps, and no ptrace by the commands it runs (same user).
     if rustix::process::set_dumpable_behavior(rustix::process::DumpableBehavior::NotDumpable).is_err() {
         eprintln!("nixxa-sandboxd: cannot set the dumpable flag");
+        std::process::exit(1);
+    }
+    // Orphans of a job whose supervisor died come here instead of escaping to PID 1.
+    if rustix::process::set_child_subreaper(Some(rustix::process::getpid())).is_err() {
+        eprintln!("nixxa-sandboxd: cannot become a subreaper");
         std::process::exit(1);
     }
     let code = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
@@ -53,16 +63,23 @@ fn main() {
 
 #[cfg(target_os = "linux")]
 mod daemon {
+    use std::os::fd::OwnedFd;
+    use std::sync::Arc;
+    use std::time::Duration;
+
     use tokio::io::Stdout;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, oneshot};
+    use tokio::task::JoinHandle;
 
-    use nixxa_contracts::SandboxAction;
+    use nixxa_contracts::{Outcome, SandboxAction};
 
-    use crate::exec::{self, Stop};
     use crate::files;
+    use crate::job::{End, Table, no_such_job};
+    use crate::jobs::{self, Capture, Spec, Supervisors};
     use crate::protocol::{FrameError, FromDaemon, Limits, Op, Reply, ToDaemon, VERSION, read_frame, write_frame};
 
-    type Inbox = mpsc::Receiver<Result<ToDaemon, FrameError>>;
+    /// How often orphans of a dead supervisor are looked for.
+    const SWEEP_EVERY: Duration = Duration::from_millis(200);
 
     fn log(line: std::fmt::Arguments<'_>) {
         eprintln!("nixxa-sandboxd: {line}");
@@ -81,7 +98,17 @@ mod daemon {
                 }
             }
         });
-        let mut out = tokio::io::stdout();
+        // One task writes frames, so replies and events never interleave mid-frame. It stops on
+        // the first failed write, which closes `out`.
+        let (out, mut outgoing) = mpsc::unbounded_channel::<FromDaemon>();
+        tokio::spawn(async move {
+            let mut stdout = tokio::io::stdout();
+            while let Some(msg) = outgoing.recv().await {
+                if !write(&mut stdout, msg).await {
+                    break;
+                }
+            }
+        });
 
         let limits = match inbox.recv().await {
             Some(Ok(ToDaemon::Hello { version, limits })) if version == VERSION => limits,
@@ -115,145 +142,62 @@ mod daemon {
         let seccomp_ok = nnp_ok && crate::seccomp::apply();
         log(format_args!("layers: landlock={landlock_ok} seccomp={seccomp_ok}"));
         let layers = crate::protocol::ActiveLayers { landlock: landlock_ok, seccomp: seccomp_ok };
-        if write_frame(&mut out, &FromDaemon::Hello { version: VERSION, layers }).await.is_err() {
+        if out.send(FromDaemon::Hello { version: VERSION, layers }).is_err() {
             return 4;
         }
         log(format_args!("ready"));
 
+        let background =
+            Table::new(limits.max_background_jobs as usize, limits.background_output_cap as usize, &limits.job_prefix);
+        let mut daemon =
+            Daemon { out, limits, root, self_exe, supervisors: Supervisors::default(), background, foreground: None };
+        let output = daemon.out.clone();
+        let mut sweep = tokio::time::interval(SWEEP_EVERY);
         loop {
-            let (id, op) = match inbox.recv().await {
-                Some(Ok(ToDaemon::Request { id, op })) => (id, op),
-                // Nothing is running, so the request it names has already been answered.
-                Some(Ok(ToDaemon::Cancel { .. } | ToDaemon::Hello { .. })) => continue,
-                Some(Err(FrameError::Malformed(why))) => {
-                    log(format_args!("ignored a malformed frame ({} bytes of error)", why.len()));
-                    continue;
-                }
-                Some(Err(err)) => {
-                    log(format_args!("input closed: {}", kind_of(&err)));
+            tokio::select! {
+                msg = inbox.recv() => match msg {
+                    Some(Ok(ToDaemon::Request { id, op })) => daemon.handle(id, op).await,
+                    Some(Ok(ToDaemon::Cancel { id })) => daemon.cancel(id),
+                    Some(Ok(ToDaemon::Hello { .. })) => {}
+                    Some(Err(FrameError::Malformed(why))) => {
+                        log(format_args!("ignored a malformed frame ({} bytes of error)", why.len()));
+                    }
+                    Some(Err(err)) => {
+                        log(format_args!("input closed: {}", kind_of(&err)));
+                        break;
+                    }
+                    None => break,
+                },
+                _ = daemon.foreground_done(), if daemon.foreground.is_some() => daemon.foreground = None,
+                () = output.closed() => {
+                    log(format_args!("output closed"));
                     break;
                 }
-                None => break,
-            };
-            let more = match op {
-                Op::Ping => send(&mut out, id, Reply::Done).await,
-                Op::Reset => {
-                    exec::kill_all().await;
-                    log(format_args!("reset id={id}"));
-                    send(&mut out, id, Reply::Done).await
-                }
-                Op::Action { action: SandboxAction::Exec { command, cwd, timeout_ms } } => {
-                    run_exec(&mut out, &mut inbox, id, &command, cwd.as_deref(), timeout_ms, &limits, &root, &self_exe)
-                        .await
-                }
-                Op::Action { action } => {
-                    let (kind, outcome) = match action {
-                        SandboxAction::ReadFile { path } => ("read", files::read(&root, &path, limits.read_cap)),
-                        SandboxAction::WriteFile { path, content } => {
-                            ("write", files::write(&root, &path, &content, limits.write_cap))
-                        }
-                        SandboxAction::ListDir { path } => ("list", files::list(&root, &path)),
-                        SandboxAction::Exec { .. } => unreachable!("handled above"),
-                    };
-                    let ok = !matches!(outcome, nixxa_contracts::Outcome::Failed { .. });
-                    log(format_args!("{kind} id={id} ok={ok}"));
-                    send(&mut out, id, Reply::Outcome { outcome, truncated: false }).await
-                }
-            };
-            if !more {
-                break;
+                _ = sweep.tick() => jobs::sweep_orphans(&daemon.supervisors),
             }
         }
-        exec::kill_all().await;
+        daemon.stop_all().await;
+        jobs::sweep_orphans(&daemon.supervisors);
         0
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn run_exec(
-        out: &mut Stdout,
-        inbox: &mut Inbox,
-        id: u64,
-        command: &str,
-        cwd: Option<&str>,
-        timeout_ms: Option<u64>,
-        limits: &Limits,
-        root: &std::os::fd::OwnedFd,
-        self_exe: &str,
-    ) -> bool {
-        let dir = match files::working_dir(root, cwd) {
-            Ok(dir) => dir,
-            Err(why) => {
-                let outcome = nixxa_contracts::Outcome::Failed { message: format!("working directory: {why}") };
-                return send(out, id, Reply::Outcome { outcome, truncated: false }).await;
-            }
-        };
-        let started = std::time::Instant::now();
-        let (stop_tx, mut stop_rx) = mpsc::channel(1);
-        let run = exec::run(command, &dir, timeout_ms, limits, self_exe, &mut stop_rx);
-        tokio::pin!(run);
-        let mut reset: Option<u64> = None;
-        let mut client_gone = false;
-        let (reply, exit) = loop {
-            tokio::select! {
-                done = &mut run => break done,
-                msg = inbox.recv(), if !client_gone => match msg {
-                    Some(Ok(ToDaemon::Cancel { id: target })) if target == id => {
-                        let _ = stop_tx.try_send(Stop::Cancelled);
-                    }
-                    Some(Ok(ToDaemon::Request { id: other, op: Op::Reset })) => {
-                        reset = Some(other);
-                        let _ = stop_tx.try_send(Stop::Cancelled);
-                    }
-                    Some(Ok(ToDaemon::Request { id: other, .. })) => {
-                        let busy = Reply::Error { message: "busy: a command is running".into() };
-                        if !send(out, other, busy).await {
-                            client_gone = true;
-                            let _ = stop_tx.try_send(Stop::Cancelled);
-                        }
-                    }
-                    Some(Ok(_)) | Some(Err(FrameError::Malformed(_))) => {}
-                    Some(Err(_)) | None => {
-                        client_gone = true;
-                        let _ = stop_tx.try_send(Stop::Cancelled);
-                    }
-                },
-            }
-        };
-        let (truncated, what) = match &reply {
-            Reply::Outcome { truncated, .. } => (*truncated, "done"),
-            Reply::Timeout => (false, "timeout"),
-            Reply::Cancelled => (false, "cancelled"),
-            _ => (false, "error"),
-        };
-        log(format_args!(
-            "exec id={id} {what} exit={exit:?} ms={} truncated={truncated}",
-            started.elapsed().as_millis()
-        ));
-        if client_gone || !send(out, id, reply).await {
-            return false;
-        }
-        match reset {
-            Some(reset_id) => {
-                exec::kill_all().await;
-                send(out, reset_id, Reply::Done).await
-            }
-            None => true,
-        }
-    }
-
-    async fn send(out: &mut Stdout, id: u64, reply: Reply) -> bool {
-        let result = match write_frame(out, &FromDaemon::Reply { id, reply }).await {
-            // Nothing was written, so the stream is intact: say why instead.
-            Err(FrameError::TooLarge(n)) => {
-                let message = format!("the result ({n} bytes) is too large to send back");
-                write_frame(out, &FromDaemon::Reply { id, reply: Reply::Error { message } }).await
-            }
+    /// Writes one frame. A reply too large to send is replaced by an error saying so (nothing
+    /// was written, so the stream is intact). False once the stream has failed.
+    async fn write(stdout: &mut Stdout, msg: FromDaemon) -> bool {
+        let result = match write_frame(stdout, &msg).await {
+            Err(FrameError::TooLarge(n)) => match msg {
+                FromDaemon::Reply { id, .. } => {
+                    let message = format!("the result ({n} bytes) is too large to send back");
+                    write_frame(stdout, &FromDaemon::Reply { id, reply: Reply::Error { message } }).await
+                }
+                _ => Ok(()),
+            },
             other => other,
         };
         match result {
             Ok(()) => true,
             Err(err) => {
-                log(format_args!("cannot answer id={id}: {}", kind_of(&err)));
+                log(format_args!("cannot write: {}", kind_of(&err)));
                 false
             }
         }
@@ -265,6 +209,199 @@ mod daemon {
             FrameError::TooLarge(_) => "oversized frame",
             FrameError::Malformed(_) => "malformed frame",
             FrameError::Io(_) => "io error",
+        }
+    }
+
+    struct Daemon {
+        out: mpsc::UnboundedSender<FromDaemon>,
+        limits: Limits,
+        root: OwnedFd,
+        self_exe: String,
+        supervisors: Supervisors,
+        background: Table,
+        /// The agent's foreground command, if one is running.
+        foreground: Option<Foreground>,
+    }
+
+    struct Foreground {
+        request: u64,
+        /// Taken once the command has been asked to stop.
+        stop: Option<oneshot::Sender<()>>,
+        task: JoinHandle<()>,
+    }
+
+    impl Daemon {
+        fn reply(&self, id: u64, reply: Reply) {
+            let _ = self.out.send(FromDaemon::Reply { id, reply });
+        }
+
+        fn outcome(&self, id: u64, outcome: Outcome) {
+            self.reply(id, Reply::Outcome { outcome, truncated: false });
+        }
+
+        async fn foreground_done(&mut self) {
+            if let Some(fg) = self.foreground.as_mut() {
+                let _ = (&mut fg.task).await;
+            }
+        }
+
+        fn cancel(&mut self, id: u64) {
+            if let Some(fg) = self.foreground.as_mut().filter(|fg| fg.request == id) {
+                if let Some(stop) = fg.stop.take() {
+                    let _ = stop.send(());
+                }
+            }
+        }
+
+        /// Stops the foreground command and every background job, and waits for them to end.
+        async fn stop_all(&mut self) {
+            if let Some(mut fg) = self.foreground.take() {
+                if let Some(stop) = fg.stop.take() {
+                    let _ = stop.send(());
+                }
+                let _ = fg.task.await;
+            }
+            for job in self.background.stop_all() {
+                job.wait().await;
+            }
+        }
+
+        async fn handle(&mut self, id: u64, op: Op) {
+            match op {
+                Op::Ping => self.reply(id, Reply::Done),
+                Op::Reset => {
+                    self.stop_all().await;
+                    log(format_args!("reset id={id}"));
+                    self.reply(id, Reply::Done);
+                }
+                Op::Action { action } => self.act(id, action).await,
+            }
+        }
+
+        async fn act(&mut self, id: u64, action: SandboxAction) {
+            match action {
+                SandboxAction::Exec { command, cwd, timeout_ms, background } => {
+                    let dir = match files::working_dir(&self.root, cwd.as_deref()) {
+                        Ok(dir) => dir,
+                        Err(why) => {
+                            return self.outcome(id, Outcome::Failed { message: format!("working directory: {why}") });
+                        }
+                    };
+                    if background {
+                        self.start_background(id, command, dir, timeout_ms);
+                    } else {
+                        self.start_foreground(id, command, dir, timeout_ms).await;
+                    }
+                }
+                SandboxAction::JobStatus { job } => self.outcome(id, self.background.answer(&job, None)),
+                SandboxAction::JobOutput { job, tail_bytes } => {
+                    self.outcome(id, self.background.answer(&job, Some(tail_bytes)));
+                }
+                SandboxAction::JobStop { job } => match self.background.find(&job) {
+                    Some(job) => {
+                        // Answered once it has ended, which may take a moment (a fork bomb).
+                        job.stop();
+                        let out = self.out.clone();
+                        tokio::spawn(async move {
+                            job.wait().await;
+                            let outcome = Outcome::Text { content: job.status() };
+                            let _ =
+                                out.send(FromDaemon::Reply { id, reply: Reply::Outcome { outcome, truncated: false } });
+                        });
+                    }
+                    None => self.outcome(id, no_such_job(&job)),
+                },
+                SandboxAction::ReadFile { path } => {
+                    let outcome = files::read(&self.root, &path, self.limits.read_cap);
+                    log(format_args!("read id={id} ok={}", !matches!(outcome, Outcome::Failed { .. })));
+                    self.outcome(id, outcome);
+                }
+                SandboxAction::WriteFile { path, content } => {
+                    let outcome = files::write(&self.root, &path, &content, self.limits.write_cap);
+                    log(format_args!("write id={id} ok={}", !matches!(outcome, Outcome::Failed { .. })));
+                    self.outcome(id, outcome);
+                }
+                SandboxAction::ListDir { path } => {
+                    let outcome = files::list(&self.root, &path);
+                    log(format_args!("list id={id} ok={}", !matches!(outcome, Outcome::Failed { .. })));
+                    self.outcome(id, outcome);
+                }
+            }
+        }
+
+        async fn start_foreground(&mut self, id: u64, command: String, cwd: String, timeout_ms: Option<u64>) {
+            // A command being stopped (its caller went away) is about to end: let it, so the
+            // caller's next command doesn't find the daemon busy.
+            if let Some(fg) = self.foreground.take_if(|fg| fg.stop.is_none()) {
+                let _ = fg.task.await;
+            }
+            // The last command's task ends right after sending its reply, and the main loop may
+            // read the caller's next request before it notices: a finished task is no command.
+            if self.foreground.as_ref().is_some_and(|fg| fg.task.is_finished()) {
+                self.foreground = None;
+            }
+            if self.foreground.is_some() {
+                return self.reply(id, Reply::Error { message: "busy: a command is running".into() });
+            }
+            let limits = &self.limits;
+            let limit = timeout_ms.unwrap_or(limits.default_timeout_ms).min(limits.max_timeout_ms);
+            let spec = Spec {
+                command,
+                cwd,
+                limit: Duration::from_millis(limit),
+                rlimits: limits.rlimits,
+                self_exe: self.self_exe.clone(),
+            };
+            let capture = Capture::First { cap: limits.output_cap as usize };
+            let (stop, stopped) = oneshot::channel();
+            let (supervisors, out) = (self.supervisors.clone(), self.out.clone());
+            let task = tokio::spawn(async move {
+                let ran = jobs::run(spec, capture, &supervisors, stopped).await;
+                let (what, reply) = match ran.end {
+                    End::TimedOut => ("timeout", Reply::Timeout),
+                    End::Stopped => ("cancelled", Reply::Cancelled),
+                    End::Failed(message) => {
+                        ("error", Reply::Outcome { outcome: Outcome::Failed { message }, truncated: false })
+                    }
+                    End::Exited(exit_code) => {
+                        let outcome = Outcome::Exec {
+                            exit_code,
+                            stdout: String::from_utf8_lossy(&ran.stdout).into_owned(),
+                            stderr: String::from_utf8_lossy(&ran.stderr).into_owned(),
+                        };
+                        ("done", Reply::Outcome { outcome, truncated: ran.truncated })
+                    }
+                };
+                log(format_args!("exec id={id} {what} ms={} truncated={}", ran.duration.as_millis(), ran.truncated));
+                let _ = out.send(FromDaemon::Reply { id, reply });
+            });
+            self.foreground = Some(Foreground { request: id, stop: Some(stop), task });
+        }
+
+        fn start_background(&mut self, id: u64, command: String, cwd: String, timeout_ms: Option<u64>) {
+            let (job, handles) = match self.background.add() {
+                Ok(added) => added,
+                Err(message) => return self.outcome(id, Outcome::Failed { message }),
+            };
+            let limits = &self.limits;
+            let limit =
+                timeout_ms.unwrap_or(limits.background_default_timeout_ms).min(limits.background_max_timeout_ms);
+            // A long build may use more CPU time than a foreground command is allowed.
+            let mut rlimits = limits.rlimits;
+            rlimits.cpu_secs = rlimits.cpu_secs.max(limits.background_max_timeout_ms / 1000);
+            let spec =
+                Spec { command, cwd, limit: Duration::from_millis(limit), rlimits, self_exe: self.self_exe.clone() };
+            let capture = Capture::Last { stdout: Arc::clone(&job.stdout), stderr: Arc::clone(&job.stderr) };
+            // The reply goes out before the task runs (one thread, no await in between), so
+            // `Started` always precedes the job's `JobFinished`.
+            self.outcome(id, Outcome::Started { job: job.id.clone() });
+            let (supervisors, out) = (self.supervisors.clone(), self.out.clone());
+            tokio::spawn(async move {
+                let ran = jobs::run(spec, capture, &supervisors, handles.stop).await;
+                log(format_args!("job {} ended: {:?} ms={}", job.id, ran.end, ran.duration.as_millis()));
+                let event = job.finish(handles.done, ran.end, ran.duration);
+                let _ = out.send(FromDaemon::Event { event });
+            });
         }
     }
 }

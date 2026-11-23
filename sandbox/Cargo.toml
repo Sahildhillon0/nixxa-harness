@@ -15,16 +15,21 @@ path = "src/bin/nixxa-sandboxd/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }
+futures = { workspace = true }
 nixxa-contracts = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-std", "io-util", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-std", "io-util", "net", "process", "rt", "sync", "time"] }
 tracing = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+# Linux: the daemon (Landlock prep, rlimits, subreapers, process trees). Every Unix: killing a
+# host background job's process group.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "stdio", "thread"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 libc = "0.2"
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "thread"] }
 seccompiler = "0.5"
 
 [dev-dependencies]

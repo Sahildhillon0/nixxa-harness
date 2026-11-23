@@ -6,19 +6,31 @@
 //! point outside are refused), but a command can do anything the user can, so the controller's
 //! approval prompt is the only guard. [`SandboxCapabilities::isolated`] is `false`, and the TUI
 //! says so.
+//!
+//! Background jobs are real host processes with the same limits as in the sandbox (how many run
+//! at once, a time limit, the last part of their output). On Unix each job is its own process
+//! group, and ending it kills the group; a process that leaves the group (`setsid`) escapes,
+//! which is one more way this mode isn't isolated. On Windows only the shell itself is killed.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
+use tokio::process::{Child, Command};
+use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, DirEntry, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
-    SandboxError,
+    ActionId, DirEntry, JobId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
+    SandboxError, SandboxEvent,
 };
+
+use crate::JobLimits;
+use crate::job::{End, Handles, Job, Table, Tail, no_such_job};
 
 /// The time limit when the action asks for none.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
@@ -28,6 +40,10 @@ const MAX_TIMEOUT: Duration = Duration::from_secs(600);
 const OUTPUT_CAP: usize = 64 * 1024;
 /// The largest file `ReadFile` returns.
 const READ_CAP: u64 = 1024 * 1024;
+/// How long a job's finished shell's pipes may stay open before its leftovers are killed.
+const LINGER: Duration = Duration::from_millis(250);
+/// How long a job's output readers get once it has been killed.
+const DRAIN: Duration = Duration::from_secs(2);
 
 /// Settings for [`HostSandbox`]. The harness fills them in; this module reads no config.
 #[derive(Debug, Clone)]
@@ -36,6 +52,8 @@ pub struct HostConfig {
     pub root: PathBuf,
     /// Environment variables commands must not see (secrets the harness itself reads).
     pub hidden_env: Vec<String>,
+    /// Limits on background jobs.
+    pub jobs: JobLimits,
 }
 
 /// Works on the real files under one host directory. Not isolated.
@@ -44,6 +62,28 @@ pub struct HostSandbox {
     /// Canonical, so containment checks compare like with like.
     root: PathBuf,
     hidden_env: Vec<String>,
+    job_limits: JobLimits,
+    jobs: Mutex<Table>,
+    /// The shell pid of each running job (its process group on Unix), so dropping the sandbox
+    /// can kill them at once, even when the runtime is shutting down and no task runs again.
+    running: Groups,
+    events: broadcast::Sender<SandboxEvent>,
+}
+
+/// Shell pids of the running jobs, by job.
+type Groups = Arc<Mutex<HashMap<JobId, u32>>>;
+
+impl Drop for HostSandbox {
+    /// The session is over: its jobs end with it. The groups are killed here, synchronously:
+    /// when the app quits, the runtime drops the jobs' tasks without running them again, and
+    /// `kill_on_drop` alone would kill only each shell, not what it started.
+    fn drop(&mut self) {
+        if let Ok(jobs) = self.jobs.lock() {
+            jobs.stop_all();
+        }
+        let pids: Vec<u32> = self.running.lock().map(|running| running.values().copied().collect()).unwrap_or_default();
+        pids.into_iter().for_each(kill_group);
+    }
 }
 
 impl HostSandbox {
@@ -56,7 +96,15 @@ impl HostSandbox {
         if !root.is_dir() {
             return Err(SandboxError::Unavailable(format!("{} is not a directory", root.display())));
         }
-        Ok(Self { root, hidden_env: config.hidden_env })
+        let jobs = Table::new(config.jobs.max_running as usize, config.jobs.output_cap as usize, "");
+        Ok(Self {
+            root,
+            hidden_env: config.hidden_env,
+            job_limits: config.jobs,
+            jobs: Mutex::new(jobs),
+            running: Groups::default(),
+            events: broadcast::channel(crate::events::CAPACITY).0,
+        })
     }
 
     /// The host path for a workspace-relative, `/`-separated path, if it stays inside the root.
@@ -152,6 +200,51 @@ impl HostSandbox {
         Outcome::Listing { entries }
     }
 
+    /// Starts `command` as a background job in `cwd`.
+    fn start_job(&self, command: &str, cwd: &Path, timeout_ms: Option<u64>) -> Outcome {
+        if !cwd.is_dir() {
+            return failed("the working directory doesn't exist");
+        }
+        let (job, handles) =
+            match self.jobs.lock().map_err(|_| "jobs unavailable".to_string()).and_then(|mut t| t.add()) {
+                Ok(added) => added,
+                Err(message) => return Outcome::Failed { message },
+            };
+        let limits = &self.job_limits;
+        let limit = timeout_ms.map_or(limits.default_timeout, Duration::from_millis).min(limits.max_timeout);
+        let mut shell = shell(command);
+        shell.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+        #[cfg(unix)]
+        shell.process_group(0);
+        for name in &self.hidden_env {
+            shell.env_remove(name);
+        }
+        let id = job.id.clone();
+        let events = self.events.clone();
+        let running = Arc::clone(&self.running);
+        tokio::spawn(async move {
+            let event = run_job(job, handles, shell, limit, running).await;
+            let _ = events.send(event);
+        });
+        Outcome::Started { job: id }
+    }
+
+    /// Answers `JobStatus` (`tail_bytes: None`) or `JobOutput`.
+    fn answer(&self, id: &JobId, tail_bytes: Option<u64>) -> Outcome {
+        match self.jobs.lock() {
+            Ok(jobs) => jobs.answer(id, tail_bytes),
+            Err(_) => failed("jobs unavailable"),
+        }
+    }
+
+    /// Stops a job and says how it ended.
+    async fn stop_job(&self, id: &JobId) -> Outcome {
+        let Some(job) = self.jobs.lock().ok().and_then(|jobs| jobs.find(id)) else { return no_such_job(id) };
+        job.stop();
+        job.wait().await;
+        Outcome::Text { content: job.status() }
+    }
+
     async fn exec(&self, command: &str, cwd: &Path, timeout_ms: Option<u64>) -> Result<Outcome, SandboxError> {
         if !cwd.is_dir() {
             return Ok(failed("the working directory doesn't exist"));
@@ -199,6 +292,88 @@ fn shell(command: &str) -> Command {
     }
 }
 
+/// Runs a background job to its end: the shell exits (its leftovers get [`LINGER`]), the time
+/// limit passes, or it is stopped. Returns its `JobFinished`.
+async fn run_job(
+    job: Arc<Job>,
+    handles: Handles,
+    mut shell: Command,
+    limit: Duration,
+    running: Groups,
+) -> SandboxEvent {
+    let started = Instant::now();
+    let Handles { mut stop, done } = handles;
+    let mut child = match shell.spawn() {
+        Ok(child) => child,
+        Err(err) => {
+            return job.finish(done, End::Failed(format!("couldn't start the shell: {err}")), started.elapsed());
+        }
+    };
+    if let (Some(pid), Ok(mut running)) = (child.id(), running.lock()) {
+        running.insert(job.id.clone(), pid);
+    }
+    let out = tokio::spawn(keep_last(child.stdout.take(), Arc::clone(&job.stdout)));
+    let err = tokio::spawn(keep_last(child.stderr.take(), Arc::clone(&job.stderr)));
+    let aborts = [out.abort_handle(), err.abort_handle()];
+    let collect = async {
+        let _ = (out.await, err.await);
+    };
+    tokio::pin!(collect);
+    let end = tokio::select! {
+        status = child.wait() => End::Exited(status.ok().and_then(|status| status.code())),
+        _ = tokio::time::sleep(limit) => End::TimedOut,
+        _ = &mut stop => End::Stopped,
+    };
+    let mut drained = false;
+    if matches!(end, End::Exited(_)) {
+        drained = tokio::time::timeout(LINGER, &mut collect).await.is_ok();
+    }
+    kill_job(&mut child);
+    let _ = child.wait().await;
+    if let Ok(mut running) = running.lock() {
+        running.remove(&job.id);
+    }
+    if !drained && tokio::time::timeout(DRAIN, &mut collect).await.is_err() {
+        aborts.iter().for_each(|task| task.abort());
+    }
+    job.finish(done, end, started.elapsed())
+}
+
+/// Kills a job's process group (Unix) or its shell (elsewhere).
+fn kill_job(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        kill_group(pid);
+    }
+    let _ = child.start_kill();
+}
+
+/// Kills the process group led by the shell `pid`. Elsewhere than Unix there is no group to
+/// kill: the shell itself is killed through its `Child` (`kill_on_drop` covers a quit).
+fn kill_group(pid: u32) {
+    #[cfg(unix)]
+    if let Some(group) = rustix::process::Pid::from_raw(pid as i32) {
+        let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pid;
+}
+
+/// Reads a stream to its end into `tail`.
+async fn keep_last(stream: Option<impl AsyncRead + Unpin>, tail: Arc<Mutex<Tail>>) {
+    let Some(mut stream) = stream else { return };
+    let mut chunk = [0u8; 8192];
+    loop {
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if let Ok(mut tail) = tail.lock() {
+                    tail.push(&chunk[..n]);
+                }
+            }
+        }
+    }
+}
+
 /// Reads a stream to its end, keeping the first [`OUTPUT_CAP`] bytes.
 async fn capped(mut stream: impl AsyncRead + Unpin) -> String {
     let mut kept = Vec::new();
@@ -240,17 +415,29 @@ impl Sandbox for HostSandbox {
             backend: "host".into(),
             isolated: false,
             network: true,
+            jobs: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }
+    }
+
+    fn subscribe(&self) -> BoxStream<'static, SandboxEvent> {
+        crate::events::stream(self.events.subscribe())
     }
 
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
         let outside = || Ok(Observation::failed(id.clone(), "path is outside the workspace"));
         let outcome = match action {
-            SandboxAction::Exec { command, cwd, timeout_ms } => {
+            SandboxAction::Exec { command, cwd, timeout_ms, background } => {
                 let Some(dir) = self.resolve(cwd.as_deref().unwrap_or("")) else { return outside() };
-                self.exec(&command, &dir, timeout_ms).await?
+                if background {
+                    self.start_job(&command, &dir, timeout_ms)
+                } else {
+                    self.exec(&command, &dir, timeout_ms).await?
+                }
             }
+            SandboxAction::JobStatus { job } => self.answer(&job, None),
+            SandboxAction::JobOutput { job, tail_bytes } => self.answer(&job, Some(tail_bytes)),
+            SandboxAction::JobStop { job } => self.stop_job(&job).await,
             SandboxAction::ReadFile { path } => {
                 let Some(path) = self.resolve(&path) else { return outside() };
                 self.read(&path).await
@@ -276,7 +463,11 @@ impl Sandbox for HostSandbox {
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
-        // Nothing outlives its action: a running command is killed when its future is dropped.
+        let stopped = self.jobs.lock().map(|jobs| jobs.stop_all()).unwrap_or_default();
+        for job in stopped {
+            job.wait().await;
+        }
+        // A running foreground command is killed when its future is dropped.
         Ok(())
     }
 }
@@ -303,7 +494,8 @@ mod tests {
     }
 
     fn host(root: &Path) -> HostSandbox {
-        HostSandbox::new(HostConfig { root: root.to_path_buf(), hidden_env: Vec::new() }).expect("host sandbox")
+        HostSandbox::new(HostConfig { root: root.to_path_buf(), hidden_env: Vec::new(), jobs: JobLimits::default() })
+            .expect("host sandbox")
     }
 
     async fn run_action(sandbox: &HostSandbox, action: SandboxAction) -> Outcome {
@@ -312,7 +504,7 @@ mod tests {
 
     #[cfg(unix)]
     fn exec(command: &str) -> SandboxAction {
-        SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(10_000) }
+        SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(10_000), background: false }
     }
 
     #[tokio::test]
@@ -330,7 +522,8 @@ mod tests {
     #[test]
     fn a_missing_root_is_unavailable() {
         let missing = scratch().join("not-here");
-        let err = HostSandbox::new(HostConfig { root: missing, hidden_env: Vec::new() }).unwrap_err();
+        let err = HostSandbox::new(HostConfig { root: missing, hidden_env: Vec::new(), jobs: JobLimits::default() })
+            .unwrap_err();
         assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
     }
 
@@ -388,7 +581,7 @@ mod tests {
             SandboxAction::ReadFile { path: "link/secret.txt".into() },
             SandboxAction::WriteFile { path: "link/new.txt".into(), content: "x".into() },
             SandboxAction::ListDir { path: "link".into() },
-            SandboxAction::Exec { command: "ls".into(), cwd: Some("link".into()), timeout_ms: None },
+            SandboxAction::Exec { command: "ls".into(), cwd: Some("link".into()), timeout_ms: None, background: false },
         ] {
             let outcome = run_action(&sandbox, action).await;
             assert_eq!(outcome, failed("path is outside the workspace"));
@@ -407,8 +600,12 @@ mod tests {
         };
         assert_eq!(exit_code, Some(0));
         assert_eq!(stdout.trim(), sandbox.root.display().to_string());
-        let in_sub =
-            SandboxAction::Exec { command: "touch made-here".into(), cwd: Some("sub".into()), timeout_ms: None };
+        let in_sub = SandboxAction::Exec {
+            command: "touch made-here".into(),
+            cwd: Some("sub".into()),
+            timeout_ms: None,
+            background: false,
+        };
         run_action(&sandbox, in_sub).await;
         assert!(root.join("sub").join("made-here").exists());
     }
@@ -426,8 +623,12 @@ mod tests {
     async fn hidden_variables_are_not_passed_on() {
         // HOME is set in any test run; the command must not see it once it is hidden (the
         // harness hides ANTHROPIC_API_KEY this way).
-        let sandbox =
-            HostSandbox::new(HostConfig { root: scratch(), hidden_env: vec!["HOME".into()] }).expect("host sandbox");
+        let sandbox = HostSandbox::new(HostConfig {
+            root: scratch(),
+            hidden_env: vec!["HOME".into()],
+            jobs: JobLimits::default(),
+        })
+        .expect("host sandbox");
         let Outcome::Exec { stdout, .. } = run_action(&sandbox, exec("echo \"[${HOME-unset}]\"")).await else {
             panic!("expected exec")
         };
@@ -438,9 +639,112 @@ mod tests {
     #[tokio::test]
     async fn a_command_past_its_limit_times_out() {
         let sandbox = host(&scratch());
-        let slow = SandboxAction::Exec { command: "sleep 5".into(), cwd: None, timeout_ms: Some(100) };
+        let slow =
+            SandboxAction::Exec { command: "sleep 5".into(), cwd: None, timeout_ms: Some(100), background: false };
         let err = sandbox.execute(ActionId::new("t"), slow).await.unwrap_err();
         assert_eq!(err, SandboxError::Timeout);
+    }
+
+    #[cfg(unix)]
+    fn background(command: &str) -> SandboxAction {
+        SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None, background: true }
+    }
+
+    #[cfg(unix)]
+    async fn stdout_of(sandbox: &HostSandbox, command: &str) -> String {
+        let Outcome::Exec { stdout, .. } = run_action(sandbox, exec(command)).await else { panic!("expected exec") };
+        stdout
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_job_kills_its_process_group() {
+        let root = scratch();
+        let sandbox = host(&root);
+        let Outcome::Started { job } = run_action(&sandbox, background("sleep 4242 & echo $! > child.pid; wait")).await
+        else {
+            panic!("expected Started")
+        };
+        for _ in 0..250 {
+            if std::fs::read_to_string(root.join("child.pid")).is_ok_and(|pid| pid.ends_with('\n')) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let alive = "kill -0 $(cat child.pid) 2>/dev/null && echo alive || echo dead";
+        assert_eq!(stdout_of(&sandbox, alive).await, "alive\n");
+        let Outcome::Text { content } = run_action(&sandbox, SandboxAction::JobStop { job }).await else {
+            panic!("expected text")
+        };
+        assert!(content.contains("was stopped"), "{content}");
+        // A killed child may linger as a zombie for a moment before it is reaped.
+        let mut state = String::new();
+        for _ in 0..100 {
+            state = stdout_of(&sandbox, alive).await;
+            if state == "dead\n" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(state, "dead\n", "the job's child survived its stop");
+    }
+
+    /// What quitting does: the sandbox is dropped inside the runtime, then the runtime is
+    /// dropped, so the job's task never runs again.
+    #[cfg(unix)]
+    #[test]
+    fn jobs_end_when_the_app_quits() {
+        let root = scratch();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let sandbox = host(&root);
+            let start = background("sleep 4243 & echo $! > child.pid; wait");
+            assert!(matches!(run_action(&sandbox, start).await, Outcome::Started { .. }));
+            for _ in 0..250 {
+                if std::fs::read_to_string(root.join("child.pid")).is_ok_and(|pid| pid.ends_with('\n')) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            drop(sandbox);
+        });
+        drop(runtime);
+        let pid: i32 = std::fs::read_to_string(root.join("child.pid")).unwrap().trim().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        // A killed child may linger as a zombie until its new parent reaps it.
+        let gone = (0..100).any(|_| {
+            let alive = rustix::process::test_kill_process(pid).is_ok()
+                && !std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero())).is_ok_and(|stat| {
+                    stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                });
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "the job's child {} outlived the session", pid.as_raw_nonzero());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn jobs_do_not_see_hidden_variables() {
+        let sandbox = HostSandbox::new(HostConfig {
+            root: scratch(),
+            hidden_env: vec!["HOME".into()],
+            jobs: JobLimits::default(),
+        })
+        .expect("host sandbox");
+        let mut events = sandbox.subscribe();
+        let Outcome::Started { job } = run_action(&sandbox, background("echo \"[${HOME-unset}]\"")).await else {
+            panic!("expected Started")
+        };
+        let event = tokio::time::timeout(Duration::from_secs(10), futures::StreamExt::next(&mut events)).await;
+        assert!(matches!(event, Ok(Some(SandboxEvent::JobFinished { exit_code: Some(0), .. }))), "{event:?}");
+        let Outcome::Text { content } = run_action(&sandbox, SandboxAction::JobOutput { job, tail_bytes: 100 }).await
+        else {
+            panic!("expected text")
+        };
+        assert!(content.contains("[unset]"), "{content}");
     }
 
     #[cfg(unix)]

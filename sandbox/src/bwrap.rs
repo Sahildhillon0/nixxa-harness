@@ -11,31 +11,38 @@
 //! runs in a transient scope (`systemd-run --user --scope`) with `MemoryMax`, `MemorySwapMax=0`
 //! and `TasksMax`. Otherwise only the per-process rlimits apply, and the backend name says so.
 //!
-//! Requests are handled one at a time. Dropping an `execute` future cancels its command: the
-//! next user of the connection (a task spawned on drop, or the next call) tells the daemon to
-//! kill it and waits for its answer. If the daemon dies, the call fails with
-//! [`SandboxError::Unavailable`] and the next call starts a new one.
+//! Requests carry ids and may overlap: a writer task sends whole frames, and a reader task
+//! routes each reply to its caller and each event to [`Sandbox::subscribe`]rs. The connection
+//! lock is held only to start a daemon, so `reset`, the job actions and `subscribe` work while
+//! a command runs. Foreground `Exec`s still run one at a time (a second one waits its turn).
+//! Dropping an `execute` future cancels its command: the dropped call queues a `Cancel` for the
+//! daemon, which kills the command and still answers. If the daemon dies, waiting calls fail
+//! with [`SandboxError::Unavailable`], every job it was running is reported as finished, and the
+//! next call starts a new daemon.
 //!
-//! Not yet isolated in the D-008 sense: Landlock and seccomp come next, so
-//! [`SandboxCapabilities::isolated`] is `false`.
+//! Background jobs run in the daemon under the same isolation as foreground commands; see
+//! `nixxa-sandboxd`'s `jobs.rs` for how each job's process tree is tracked and ended.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::Mutex;
+use futures::stream::BoxStream;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use nixxa_contracts::{
-    ActionId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError,
+    ActionId, JobId, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities,
+    SandboxError, SandboxEvent,
 };
 
-use crate::protocol::{FromDaemon, Limits, Op, Reply, Rlimits, ToDaemon, VERSION, read_frame, write_frame};
+use crate::JobLimits;
+use crate::protocol::{FromDaemon, Limits, Op, Reply, Rlimits, ToDaemon, VERSION, encode, read_frame, write_frame};
 
 /// Where the daemon binary is mounted inside the sandbox.
 const DAEMON_INSIDE: &str = "/.nixxa/nixxa-sandboxd";
@@ -89,11 +96,13 @@ pub struct BwrapConfig {
     pub file_size_max: u64,
     /// `RLIMIT_NOFILE` of every command.
     pub open_files_max: u64,
+    /// Limits on background jobs.
+    pub jobs: JobLimits,
 }
 
 impl BwrapConfig {
     /// Defaults for a workspace and daemon binary: 120 s per command (600 s at most), 64 KiB per
-    /// output stream, 1 MiB files, 2 GiB of memory, 512 processes.
+    /// output stream, 1 MiB files, 2 GiB of memory, 512 processes, and [`JobLimits::default`].
     pub fn new(workspace: impl Into<PathBuf>, daemon: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
@@ -111,6 +120,7 @@ impl BwrapConfig {
             data_max: 4 * 1024 * 1024 * 1024,
             file_size_max: 1024 * 1024 * 1024,
             open_files_max: 1024,
+            jobs: JobLimits::default(),
         }
     }
 
@@ -128,17 +138,26 @@ impl BwrapConfig {
                 cpu_secs: self.max_timeout.as_secs().max(1),
                 data: self.data_max,
             },
+            background_default_timeout_ms: self.jobs.default_timeout.as_millis() as u64,
+            background_max_timeout_ms: self.jobs.max_timeout.as_millis() as u64,
+            background_output_cap: self.jobs.output_cap,
+            max_background_jobs: self.jobs.max_running,
+            job_prefix: String::new(),
         }
     }
 }
 
 /// Runs actions in `nixxa-sandboxd` under bubblewrap.
-#[derive(Debug)]
 pub struct BwrapSandbox {
     inner: Arc<Inner>,
 }
 
-#[derive(Debug)]
+impl std::fmt::Debug for BwrapSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BwrapSandbox").field("workspace", &self.inner.workspace).finish_non_exhaustive()
+    }
+}
+
 struct Inner {
     workspace: PathBuf,
     daemon: PathBuf,
@@ -146,28 +165,45 @@ struct Inner {
     /// `systemd-run` and the runtime dir, when the sandbox gets a cgroup scope.
     scope: Option<(PathBuf, Option<PathBuf>)>,
     config: BwrapConfig,
-    conn: Mutex<Option<Conn>>,
-    /// The request being waited for and the pipe to the daemon, so `reset` can cancel it
-    /// without waiting for the connection.
-    in_flight: StdMutex<Option<(Arc<Mutex<ChildStdin>>, u64)>>,
-    /// Whether the daemon reported Landlock as active (defaults to true until the
-    /// first handshake says otherwise).
+    /// The live daemon. Locked only to start or replace it, never while waiting for a reply.
+    conn: Mutex<Option<Arc<Conn>>>,
+    /// Held while a foreground `Exec` runs, so the next one waits its turn.
+    foreground: Mutex<()>,
+    /// Whether the daemon reported Landlock as active.
     landlock: AtomicBool,
     /// Whether the daemon reported seccomp as active.
     seccomp: AtomicBool,
+    /// Events from every daemon this sandbox starts.
+    events: broadcast::Sender<SandboxEvent>,
+    /// Jobs started and not yet finished, with when they started, so they can be reported as
+    /// finished if their daemon dies.
+    jobs: Jobs,
+    /// Daemons started so far. Each one's job ids get a different prefix (`j1`, then `2-j1`, …),
+    /// so a restarted daemon never reuses an id the agent already has.
+    generation: AtomicU64,
 }
 
-#[derive(Debug)]
+type Jobs = Arc<StdMutex<HashMap<JobId, Instant>>>;
+type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Reply>>>>;
+
+/// One running daemon.
 struct Conn {
-    child: Child,
-    stdin: Arc<Mutex<ChildStdin>>,
-    stdout: ChildStdout,
-    next_id: u64,
-    /// A request whose caller went away before its reply arrived.
-    stale: Option<u64>,
-    /// True while a request frame is being written: dropping mid-write must drop the
-    /// connection rather than try to cancel, since a half-written frame can't be recovered.
-    sending: bool,
+    /// bubblewrap (or `systemd-run`); killed when the connection is dropped.
+    child: StdMutex<Child>,
+    /// Encoded frames for the writer task, which writes each one whole.
+    frames: mpsc::UnboundedSender<Vec<u8>>,
+    /// Callers waiting for a reply, by request id.
+    pending: Pending,
+    next_id: AtomicU64,
+    /// False once either pipe has failed.
+    alive: Arc<AtomicBool>,
+    tasks: [tokio::task::AbortHandle; 2],
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.tasks.iter().for_each(|task| task.abort());
+    }
 }
 
 impl BwrapSandbox {
@@ -198,9 +234,12 @@ impl BwrapSandbox {
                 scope,
                 config,
                 conn: Mutex::new(None),
-                in_flight: StdMutex::new(None),
+                foreground: Mutex::new(()),
                 landlock: AtomicBool::new(false),
                 seccomp: AtomicBool::new(false),
+                events: broadcast::channel(crate::events::CAPACITY).0,
+                jobs: Jobs::default(),
+                generation: AtomicU64::new(0),
             }),
         })
     }
@@ -256,12 +295,6 @@ fn scope_properties(config: &BwrapConfig) -> Vec<String> {
 }
 
 impl Inner {
-    fn set_in_flight(&self, value: Option<(Arc<Mutex<ChildStdin>>, u64)>) {
-        if let Ok(mut slot) = self.in_flight.lock() {
-            *slot = value;
-        }
-    }
-
     /// The `bwrap` arguments, up to and including the daemon path.
     fn bwrap_args(&self) -> Vec<String> {
         let mut args: Vec<String> = [
@@ -345,8 +378,11 @@ impl Inner {
         let recent = Arc::new(StdMutex::new(VecDeque::new()));
         tokio::spawn(forward_logs(stderr, Arc::clone(&recent)));
 
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut limits = self.config.limits();
+        limits.job_prefix = if generation == 1 { String::new() } else { format!("{generation}-") };
         let hello = async {
-            write_frame(&mut stdin, &ToDaemon::Hello { version: VERSION, limits: self.config.limits() }).await?;
+            write_frame(&mut stdin, &ToDaemon::Hello { version: VERSION, limits }).await?;
             read_frame::<_, FromDaemon>(&mut stdout).await
         };
         let failure = |why: String| {
@@ -364,94 +400,207 @@ impl Inner {
             }
             Ok(Ok(other)) => return Err(failure(format!("unexpected first message {other:?}"))),
             Ok(Err(err)) => {
-                // Let the log forwarder catch bubblewrap's last words.
                 let _ = tokio::time::timeout(Duration::from_millis(500), child.wait()).await;
                 tokio::time::sleep(Duration::from_millis(20)).await;
                 return Err(failure(err.to_string()));
             }
             Err(_) => return Err(failure("no answer to the handshake".into())),
         }
-        Ok(Conn { child, stdin: Arc::new(Mutex::new(stdin)), stdout, next_id: 1, stale: None, sending: false })
+
+        let pending = Pending::default();
+        let alive = Arc::new(AtomicBool::new(true));
+        let (frames, outgoing) = mpsc::unbounded_channel();
+        let writer = tokio::spawn(write_frames(stdin, outgoing, Arc::clone(&alive)));
+        let reader = tokio::spawn(read_frames(
+            stdout,
+            Arc::clone(&pending),
+            Arc::clone(&alive),
+            self.events.clone(),
+            Arc::clone(&self.jobs),
+        ));
+        Ok(Conn {
+            child: StdMutex::new(child),
+            frames,
+            pending,
+            next_id: AtomicU64::new(1),
+            alive,
+            tasks: [writer.abort_handle(), reader.abort_handle()],
+        })
     }
 
-    /// The live connection, started (or restarted) if needed.
-    async fn connect<'a>(&self, slot: &'a mut Option<Conn>) -> Result<&'a mut Conn, SandboxError> {
-        if let Some(conn) = slot {
-            // A connection that is mid-write, or whose child has exited, can't be reused.
-            if conn.sending || !matches!(conn.child.try_wait(), Ok(None)) {
-                *slot = None;
-            }
+    /// The live daemon, started (or restarted) if needed.
+    async fn connect(&self) -> Result<Arc<Conn>, SandboxError> {
+        let mut slot = self.conn.lock().await;
+        if let Some(conn) = slot.as_ref().filter(|conn| conn.usable()) {
+            return Ok(Arc::clone(conn));
         }
-        if slot.is_none() {
-            *slot = Some(self.spawn().await?);
+        // A dead daemon took its jobs with it.
+        if slot.take().is_some() {
+            report_lost(&self.jobs, &self.events);
         }
-        let conn = slot.as_mut().expect("just set");
-        if let Err(err) = conn.settle().await {
-            *slot = None;
-            return Err(err);
-        }
-        Ok(slot.as_mut().expect("still set"))
+        let conn = Arc::new(self.spawn().await?);
+        *slot = Some(Arc::clone(&conn));
+        Ok(conn)
     }
 
-    /// Sends `op` and waits for its reply. On any failure the connection is dropped (killing the
-    /// daemon), so the next call starts a fresh one.
-    async fn request(&self, slot: &mut Option<Conn>, op: Op, limit: Duration) -> Result<Reply, SandboxError> {
-        let conn = self.connect(slot).await?;
-        let id = conn.next_id;
-        conn.next_id += 1;
-        conn.sending = true;
-        if let Err(err) = conn.send(&ToDaemon::Request { id, op }).await {
-            conn.sending = false;
-            conn.stale = None;
+    /// The live daemon, if there is one; never starts one.
+    async fn current(&self) -> Option<Arc<Conn>> {
+        self.conn.lock().await.as_ref().filter(|conn| conn.usable()).cloned()
+    }
+
+    /// Kills `conn` if it is still the live daemon, so the next call starts a fresh one.
+    async fn discard(&self, conn: &Arc<Conn>) {
+        let mut slot = self.conn.lock().await;
+        if slot.as_ref().is_some_and(|live| Arc::ptr_eq(live, conn)) {
             *slot = None;
-            return Err(err);
+            conn.kill();
+            report_lost(&self.jobs, &self.events);
         }
-        conn.sending = false;
-        conn.stale = Some(id);
-        self.set_in_flight(Some((Arc::clone(&conn.stdin), id)));
-        let reply = conn.await_reply(id, limit).await;
-        self.set_in_flight(None);
+    }
+
+    /// Sends `op` to the live daemon (starting one if needed) and waits up to `limit` for the
+    /// reply.
+    async fn request(&self, op: Op, limit: Duration) -> Result<Reply, SandboxError> {
+        let conn = self.connect().await?;
+        self.request_on(&conn, op, limit).await
+    }
+
+    /// Sends `op` to `conn` and waits up to `limit` for the reply. A daemon that dies or stops
+    /// answering is discarded.
+    async fn request_on(&self, conn: &Arc<Conn>, op: Op, limit: Duration) -> Result<Reply, SandboxError> {
+        let mut call = conn.call(op)?;
+        let reply = tokio::time::timeout(limit, &mut call.reply).await;
+        call.answered = true;
         match reply {
-            Ok(reply) => {
-                conn.stale = None;
-                Ok(reply)
+            Ok(Ok(reply)) => Ok(reply),
+            Ok(Err(_)) => {
+                self.discard(conn).await;
+                Err(SandboxError::Unavailable("the sandbox daemon stopped".into()))
             }
-            Err(err) => {
-                self.set_in_flight(None);
-                *slot = None;
-                Err(err)
+            Err(_) => {
+                self.discard(conn).await;
+                Err(SandboxError::Unavailable("the sandbox daemon stopped answering".into()))
             }
         }
     }
 }
 
 impl Conn {
-    async fn send(&self, msg: &ToDaemon) -> Result<(), SandboxError> {
-        write_frame(&mut *self.stdin.lock().await, msg).await.map_err(gone)
+    fn usable(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+            && self.child.lock().is_ok_and(|mut child| matches!(child.try_wait(), Ok(None)))
     }
 
-    async fn await_reply(&mut self, id: u64, limit: Duration) -> Result<Reply, SandboxError> {
-        let deadline = Instant::now() + limit;
-        loop {
-            let left = deadline.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(left, read_frame::<_, FromDaemon>(&mut self.stdout)).await {
-                Ok(Ok(FromDaemon::Reply { id: got, reply })) if got == id => return Ok(reply),
-                // A late reply to something already given up on.
-                Ok(Ok(_)) => continue,
-                Ok(Err(err)) => return Err(gone(err)),
-                Err(_) => return Err(SandboxError::Unavailable("the sandbox daemon stopped answering".into())),
+    fn kill(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.start_kill();
+        }
+    }
+
+    /// Queues a request; the returned call cancels it if dropped before its reply.
+    fn call(self: &Arc<Self>, op: Op) -> Result<Call, SandboxError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let frame = encode(&ToDaemon::Request { id, op }).map_err(gone)?;
+        let (tx, reply) = oneshot::channel();
+        if let Ok(mut pending) = self.pending.lock() {
+            pending.insert(id, tx);
+        }
+        self.frames.send(frame).map_err(|_| gone("its input is closed"))?;
+        Ok(Call { conn: Arc::clone(self), id, reply, answered: false })
+    }
+}
+
+/// A request waiting for its reply.
+struct Call {
+    conn: Arc<Conn>,
+    id: u64,
+    reply: oneshot::Receiver<Reply>,
+    answered: bool,
+}
+
+impl Drop for Call {
+    /// A caller that went away cancels its request (the daemon still answers it, to no one).
+    /// Synchronous, so it works without a runtime.
+    fn drop(&mut self) {
+        if self.answered {
+            return;
+        }
+        if let Ok(mut pending) = self.conn.pending.lock() {
+            pending.remove(&self.id);
+        }
+        if let Ok(frame) = encode(&ToDaemon::Cancel { id: self.id }) {
+            let _ = self.conn.frames.send(frame);
+        }
+    }
+}
+
+/// Writes queued frames, each one whole.
+async fn write_frames(
+    mut stdin: tokio::process::ChildStdin,
+    mut frames: mpsc::UnboundedReceiver<Vec<u8>>,
+    alive: Arc<AtomicBool>,
+) {
+    while let Some(frame) = frames.recv().await {
+        if stdin.write_all(&frame).await.is_err() || stdin.flush().await.is_err() {
+            break;
+        }
+    }
+    alive.store(false, Ordering::Relaxed);
+}
+
+/// Routes replies to their callers and events to subscribers until the daemon's output ends,
+/// then fails the waiting callers and reports the daemon's jobs as finished.
+async fn read_frames(
+    mut stdout: ChildStdout,
+    pending: Pending,
+    alive: Arc<AtomicBool>,
+    events: broadcast::Sender<SandboxEvent>,
+    jobs: Jobs,
+) {
+    loop {
+        match read_frame::<_, FromDaemon>(&mut stdout).await {
+            Ok(FromDaemon::Reply { id, reply }) => {
+                // Recorded here, in frame order, so the job's `JobFinished` (which the daemon
+                // sends after this reply) always finds it.
+                if let Reply::Outcome { outcome: Outcome::Started { job }, .. } = &reply {
+                    if let Ok(mut jobs) = jobs.lock() {
+                        jobs.insert(job.clone(), Instant::now());
+                    }
+                }
+                let waiting = pending.lock().ok().and_then(|mut pending| pending.remove(&id));
+                if let Some(tx) = waiting {
+                    let _ = tx.send(reply);
+                }
+            }
+            Ok(FromDaemon::Event { event }) => {
+                if let SandboxEvent::JobFinished { job, .. } = &event {
+                    if let Ok(mut jobs) = jobs.lock() {
+                        jobs.remove(job);
+                    }
+                }
+                let _ = events.send(event);
+            }
+            Ok(FromDaemon::Hello { .. }) => {}
+            Err(err) => {
+                tracing::debug!(target: "nixxa_sandbox", "the sandbox daemon's output ended: {err}");
+                break;
             }
         }
     }
+    alive.store(false, Ordering::Relaxed);
+    if let Ok(mut pending) = pending.lock() {
+        pending.clear();
+    }
+    report_lost(&jobs, &events);
+}
 
-    /// If a caller went away mid-request, cancels that request and waits for its reply.
-    async fn settle(&mut self) -> Result<(), SandboxError> {
-        if let Some(id) = self.stale {
-            self.send(&ToDaemon::Cancel { id }).await?;
-            self.await_reply(id, GRACE).await?;
-            self.stale = None;
-        }
-        Ok(())
+/// Reports every job still running as finished (killed): their daemon is gone.
+fn report_lost(jobs: &Jobs, events: &broadcast::Sender<SandboxEvent>) {
+    let lost: Vec<(JobId, Instant)> = jobs.lock().map(|mut jobs| jobs.drain().collect()).unwrap_or_default();
+    for (job, started) in lost {
+        let duration_ms = started.elapsed().as_millis() as u64;
+        let _ = events.send(SandboxEvent::JobFinished { job, exit_code: None, duration_ms, truncated: false });
     }
 }
 
@@ -479,35 +628,6 @@ async fn forward_logs(stderr: tokio::process::ChildStderr, recent: Arc<StdMutex<
     }
 }
 
-/// Cancels the in-flight request if the `execute` future is dropped before it finishes.
-struct CancelOnDrop {
-    inner: Option<Arc<Inner>>,
-}
-
-impl Drop for CancelOnDrop {
-    fn drop(&mut self) {
-        let Some(inner) = self.inner.take() else { return };
-        // Clear the stale in-flight id so a later `reset()` doesn't send a pointless Cancel.
-        inner.set_in_flight(None);
-        // Without a runtime the next call settles it instead.
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                let mut slot = inner.conn.lock().await;
-                if let Some(conn) = slot.as_mut() {
-                    if conn.sending {
-                        // A frame was only partly written: the connection can't be resynchronised.
-                        *slot = None;
-                        return;
-                    }
-                    if conn.settle().await.is_err() {
-                        *slot = None;
-                    }
-                }
-            });
-        }
-    }
-}
-
 #[async_trait]
 impl Sandbox for BwrapSandbox {
     fn capabilities(&self) -> SandboxCapabilities {
@@ -529,31 +649,28 @@ impl Sandbox for BwrapSandbox {
             // Isolated only when namespaces, Landlock and seccomp are all active.
             isolated: landlock && seccomp,
             network: false,
+            jobs: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }
 
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
         let started = Instant::now();
-        let limit = match &action {
-            SandboxAction::Exec { timeout_ms, .. } => {
-                let asked = timeout_ms.map_or(self.inner.config.default_timeout, Duration::from_millis);
-                asked.min(self.inner.config.max_timeout) + GRACE
+        let config = &self.inner.config;
+        let (limit, foreground) = match &action {
+            SandboxAction::Exec { timeout_ms, background: false, .. } => {
+                let asked = timeout_ms.map_or(config.default_timeout, Duration::from_millis);
+                (asked.min(config.max_timeout) + GRACE, true)
             }
-            SandboxAction::WriteFile { content, .. } if content.len() as u64 > self.inner.config.file_cap => {
-                let message = format!(
-                    "the content is too large to write ({} bytes, limit {})",
-                    content.len(),
-                    self.inner.config.file_cap
-                );
+            SandboxAction::WriteFile { content, .. } if content.len() as u64 > config.file_cap => {
+                let message =
+                    format!("the content is too large to write ({} bytes, limit {})", content.len(), config.file_cap);
                 return Ok(Observation::failed(id, message));
             }
-            _ => QUICK_TIMEOUT,
+            _ => (QUICK_TIMEOUT, false),
         };
-        let mut slot = self.inner.conn.lock().await;
-        let mut guard = CancelOnDrop { inner: Some(Arc::clone(&self.inner)) };
-        let reply = self.inner.request(&mut slot, Op::Action { action }, limit).await;
-        guard.inner = None;
+        let _turn = if foreground { Some(self.inner.foreground.lock().await) } else { None };
+        let reply = self.inner.request(Op::Action { action }, limit).await;
         let duration_ms = started.elapsed().as_millis() as u64;
         match reply? {
             Reply::Outcome { outcome, truncated } => Ok(Observation { action_id: id, outcome, duration_ms, truncated }),
@@ -568,25 +685,21 @@ impl Sandbox for BwrapSandbox {
     }
 
     async fn health(&self) -> Result<(), SandboxError> {
-        let mut slot = self.inner.conn.lock().await;
-        match self.inner.request(&mut slot, Op::Ping, QUICK_TIMEOUT).await? {
+        match self.inner.request(Op::Ping, QUICK_TIMEOUT).await? {
             Reply::Done => Ok(()),
             other => Err(SandboxError::Unavailable(format!("unexpected answer to a ping: {other:?}"))),
         }
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
-        // A command may be running under the connection lock: ask the daemon to stop it first.
-        let running = self.inner.in_flight.lock().ok().and_then(|slot| slot.clone());
-        if let Some((stdin, id)) = running {
-            let _ = write_frame(&mut *stdin.lock().await, &ToDaemon::Cancel { id }).await;
-        }
-        let mut slot = self.inner.conn.lock().await;
-        if slot.is_none() {
-            return Ok(()); // Nothing is running.
-        }
-        // If the daemon is gone or fails, dropping it has killed everything anyway.
-        let _ = self.inner.request(&mut slot, Op::Reset, QUICK_TIMEOUT).await;
+        // No daemon: nothing is running.
+        let Some(conn) = self.inner.current().await else { return Ok(()) };
+        // If the daemon fails, discarding it has killed everything anyway.
+        let _ = self.inner.request_on(&conn, Op::Reset, QUICK_TIMEOUT).await;
         Ok(())
+    }
+
+    fn subscribe(&self) -> BoxStream<'static, SandboxEvent> {
+        crate::events::stream(self.inner.events.subscribe())
     }
 }

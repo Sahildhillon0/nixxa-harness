@@ -165,7 +165,9 @@ fn act(id: &str, action: Action) -> Intent {
 }
 
 fn exec(command: &str) -> Action {
-    Action::Sandbox { action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None } }
+    Action::Sandbox {
+        action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None, background: false },
+    }
 }
 
 const LOCAL_USAGE: BrainEvent =
@@ -278,7 +280,10 @@ async fn a_local_request_goes_to_the_account_url_without_auth() {
     assert_eq!(body["messages"][1], json!({ "role": "user", "content": "hello" }));
     let names: Vec<_> =
         body["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["exec", "read_file", "write_file", "list_dir", "notes__search"]);
+    assert_eq!(
+        names,
+        vec!["exec", "read_file", "write_file", "list_dir", "job_status", "job_output", "job_stop", "notes__search"]
+    );
     assert_eq!(body["tools"][0]["type"], "function");
 }
 

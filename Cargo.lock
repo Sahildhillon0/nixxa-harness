@@ -1390,6 +1390,7 @@ name = "nixxa-sandbox"
 version = "0.0.0"
 dependencies = [
  "async-trait",
+ "futures",
  "landlock",
  "libc",
  "nixxa-contracts",

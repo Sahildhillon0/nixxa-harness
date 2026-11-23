@@ -82,7 +82,7 @@ pub async fn run(sandbox: &BwrapSandbox, action: SandboxAction) -> Result<Observ
 }
 
 pub fn exec(command: impl Into<String>) -> SandboxAction {
-    SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(20_000) }
+    SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(20_000), background: false }
 }
 
 /// Runs a command that must complete, returning (exit code, stdout, stderr).

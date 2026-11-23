@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{ActionId, SourceId};
+use crate::{ActionId, JobId, SourceId};
 
 /// An action executed by the [`Sandbox`](crate::Sandbox).
 ///
@@ -19,6 +19,29 @@ pub enum SandboxAction {
         cwd: Option<String>,
         /// Requested time limit. The sandbox may enforce a lower one.
         timeout_ms: Option<u64>,
+        /// Start the command as a background job and return at once with its id (needs
+        /// [`SandboxCapabilities::jobs`](crate::SandboxCapabilities::jobs)). Absent in records
+        /// written before Stage 6, hence the default.
+        #[serde(default)]
+        background: bool,
+    },
+    /// Say whether a background job is still running, and how it ended.
+    JobStatus {
+        /// The job.
+        job: JobId,
+    },
+    /// The last part of a background job's output.
+    JobOutput {
+        /// The job.
+        job: JobId,
+        /// How many bytes to show from the end of each of stdout and stderr. The sandbox may
+        /// show fewer.
+        tail_bytes: u64,
+    },
+    /// Stop a background job and everything it started.
+    JobStop {
+        /// The job.
+        job: JobId,
     },
     /// Read a text file.
     ReadFile {
@@ -51,11 +74,18 @@ pub enum SandboxActionKind {
     WriteFile,
     /// [`SandboxAction::ListDir`]
     ListDir,
+    /// [`SandboxAction::JobStatus`]
+    JobStatus,
+    /// [`SandboxAction::JobOutput`]
+    JobOutput,
+    /// [`SandboxAction::JobStop`]
+    JobStop,
 }
 
 impl SandboxActionKind {
     /// Every kind, in a stable order.
-    pub const ALL: [SandboxActionKind; 4] = [Self::Exec, Self::ReadFile, Self::WriteFile, Self::ListDir];
+    pub const ALL: [SandboxActionKind; 7] =
+        [Self::Exec, Self::ReadFile, Self::WriteFile, Self::ListDir, Self::JobStatus, Self::JobOutput, Self::JobStop];
 }
 
 impl SandboxAction {
@@ -66,6 +96,9 @@ impl SandboxAction {
             Self::ReadFile { .. } => SandboxActionKind::ReadFile,
             Self::WriteFile { .. } => SandboxActionKind::WriteFile,
             Self::ListDir { .. } => SandboxActionKind::ListDir,
+            Self::JobStatus { .. } => SandboxActionKind::JobStatus,
+            Self::JobOutput { .. } => SandboxActionKind::JobOutput,
+            Self::JobStop { .. } => SandboxActionKind::JobStop,
         }
     }
 

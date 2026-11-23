@@ -14,10 +14,16 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 5 — Real memory: done.** Stage 3's Anthropic live checks are still pending.
-**Next: Stage 6 — Working in the sandbox** (network allowlist, `ctrl+t` terminal, background
-jobs). The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each
+**Stage 6 — Working in the sandbox: in progress.** Stage 3's Anthropic live checks are still
+pending. The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each
 new capability lives and the Stages section for the order.
+
+**Stage 6 so far:**
+- PR A, the job model and background jobs: the daemon tracks each job as its own process tree
+  under a subreaper supervisor (D-061, replacing D-043's sweep); protocol v3 with overlapping
+  requests and pushed events (D-062); background jobs in every backend, with `JobLimits`
+  (D-063).
+- Next: PR B (network allowlist), then PR C (terminal) and PR D (wake-ups, notifications).
 
 **Stage 5 — Real memory, done:**
 - `SqliteStore` in `db/` (rusqlite bundled, WAL, forward-only migrations, FTS5 search;

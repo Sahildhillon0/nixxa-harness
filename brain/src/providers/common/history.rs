@@ -63,6 +63,9 @@ pub(crate) fn observation_text(observation: &Observation) -> (String, bool) {
         }
         Outcome::Denied { reason } => (format!("Denied: {reason}"), true),
         Outcome::Failed { message } => (format!("Failed: {message}"), true),
+        Outcome::Started { job } => {
+            (format!("Started background job {job}. Check on it with job_status or job_output."), false)
+        }
     };
     if observation.truncated {
         text.push_str("\n[output truncated]");

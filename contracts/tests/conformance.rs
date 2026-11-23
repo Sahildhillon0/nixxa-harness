@@ -121,6 +121,66 @@ struct MemSandbox {
     echo_exec: bool,      // bug switch: claims isolation but "runs" Exec by echoing the command
     wedge_on_drop: bool,  // bug switch: a dropped Exec leaves the sandbox stuck
     wedged: std::sync::atomic::AtomicBool,
+    /// Runs the tiny shell below, with background jobs. Not a bug.
+    jobs: bool,
+    job_bug: Option<JobBug>,
+    job_state: Mutex<MemJobs>,
+}
+
+/// One way to get background jobs wrong.
+#[derive(Clone, Copy, PartialEq)]
+enum JobBug {
+    /// Without jobs, still runs a background Exec (in the foreground).
+    BackgroundWithoutJobs,
+    /// Never sends `JobFinished`.
+    NoEvents,
+    /// Always reports exit code 0.
+    WrongExitCode,
+    /// Gives every job the same id.
+    ReusedIds,
+    /// Answers for a job it never started.
+    UnknownJobSucceeds,
+    /// `reset` leaves jobs running.
+    ResetKeepsJobs,
+}
+
+#[derive(Default)]
+struct MemJobs {
+    next: u32,
+    /// stdout, and the exit code once it has ended.
+    jobs: HashMap<JobId, (String, Option<Option<i32>>)>,
+    subscribers: Vec<futures::channel::mpsc::UnboundedSender<SandboxEvent>>,
+}
+
+impl MemJobs {
+    fn finish(&mut self, job: &JobId, exit_code: Option<i32>, bug: Option<JobBug>) {
+        if let Some((_, end)) = self.jobs.get_mut(job) {
+            *end = Some(exit_code);
+        }
+        if bug == Some(JobBug::NoEvents) {
+            return;
+        }
+        let event = SandboxEvent::JobFinished { job: job.clone(), exit_code, duration_ms: 0, truncated: false };
+        self.subscribers.retain(|tx| tx.unbounded_send(event.clone()).is_ok());
+    }
+}
+
+/// The tiny shell the job scenarios use: `echo X`, `exit N` and `sleep N`, joined by `;` or `&&`.
+/// Returns stdout, the exit code, and whether it sleeps (a background job then runs until
+/// stopped).
+fn mini_shell(command: &str) -> (String, i32, bool) {
+    let (mut stdout, mut sleeps) = (String::new(), false);
+    for part in command.split([';', '&']).map(str::trim).filter(|part| !part.is_empty()) {
+        if let Some(text) = part.strip_prefix("echo ") {
+            stdout.push_str(text);
+            stdout.push('\n');
+        } else if let Some(code) = part.strip_prefix("exit ") {
+            return (stdout, code.parse().unwrap_or(1), sleeps);
+        } else if part.starts_with("sleep ") {
+            sleeps = true;
+        }
+    }
+    (stdout, 0, sleeps)
 }
 
 /// Pending on its first poll (waking itself), ready on the second; flags `wedged` if dropped
@@ -171,16 +231,36 @@ impl Sandbox for MemSandbox {
             backend: "memory".into(),
             isolated: true,
             network: false,
-            actions: if self.echo_exec || self.wedge_on_drop {
+            jobs: self.jobs,
+            actions: if self.jobs {
                 SandboxActionKind::ALL.to_vec()
+            } else if self.echo_exec || self.wedge_on_drop || self.job_bug.is_some() {
+                vec![
+                    SandboxActionKind::Exec,
+                    SandboxActionKind::ReadFile,
+                    SandboxActionKind::WriteFile,
+                    SandboxActionKind::ListDir,
+                ]
             } else {
                 vec![SandboxActionKind::ReadFile, SandboxActionKind::WriteFile, SandboxActionKind::ListDir]
             },
         }
     }
+    fn subscribe(&self) -> futures::stream::BoxStream<'static, SandboxEvent> {
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        if self.jobs && self.job_bug != Some(JobBug::NoEvents) {
+            self.job_state.lock().unwrap().subscribers.push(tx);
+        }
+        Box::pin(rx)
+    }
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
         if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(SandboxError::Unavailable("wedged".into()));
+        }
+        if self.jobs || self.job_bug.is_some() {
+            if let Some(obs) = self.run_job_action(&id, &action) {
+                return Ok(obs);
+            }
         }
         let path = match &action {
             SandboxAction::Exec { command, .. } if self.echo_exec || self.wedge_on_drop => {
@@ -192,6 +272,9 @@ impl Sandbox for MemSandbox {
                 return Ok(Observation::new(id, Outcome::Exec { exit_code, stdout, stderr: String::new() }));
             }
             SandboxAction::Exec { .. } => return Err(SandboxError::Unsupported("exec".into())),
+            SandboxAction::JobStatus { .. } | SandboxAction::JobOutput { .. } | SandboxAction::JobStop { .. } => {
+                return Err(SandboxError::Unsupported("job".into()));
+            }
             SandboxAction::ReadFile { path }
             | SandboxAction::WriteFile { path, .. }
             | SandboxAction::ListDir { path } => path,
@@ -201,6 +284,9 @@ impl Sandbox for MemSandbox {
         };
         let mut files = self.files.lock().unwrap();
         let outcome = match action {
+            SandboxAction::JobStatus { .. } | SandboxAction::JobOutput { .. } | SandboxAction::JobStop { .. } => {
+                return Err(SandboxError::Unsupported("job".into()));
+            }
             SandboxAction::ReadFile { .. } => match files.get(&path) {
                 Some(c) => Outcome::Text { content: c.clone() },
                 None if self.no_confinement => Outcome::Text { content: "host file".into() },
@@ -238,13 +324,126 @@ impl Sandbox for MemSandbox {
         if self.wipe_on_reset {
             self.files.lock().unwrap().clear();
         }
+        if self.job_bug != Some(JobBug::ResetKeepsJobs) {
+            let mut state = self.job_state.lock().unwrap();
+            let running: Vec<JobId> =
+                state.jobs.iter().filter(|(_, (_, end))| end.is_none()).map(|(job, _)| job.clone()).collect();
+            for job in running {
+                state.finish(&job, None, self.job_bug);
+            }
+        }
         Ok(())
+    }
+}
+
+impl MemSandbox {
+    /// Handles `Exec` and the job actions with the tiny shell; `None` for the file actions.
+    fn run_job_action(&self, id: &ActionId, action: &SandboxAction) -> Option<Observation> {
+        let bug = self.job_bug;
+        let mut state = self.job_state.lock().unwrap();
+        let known =
+            |state: &MemJobs, job: &JobId| state.jobs.contains_key(job) || bug == Some(JobBug::UnknownJobSucceeds);
+        let outcome = match action {
+            SandboxAction::Exec { command, background: true, .. } if self.jobs => {
+                state.next += 1;
+                let job =
+                    JobId::new(if bug == Some(JobBug::ReusedIds) { "j1".into() } else { format!("j{}", state.next) });
+                let (stdout, code, sleeps) = mini_shell(command);
+                state.jobs.insert(job.clone(), (stdout, None));
+                if !sleeps {
+                    let code = if bug == Some(JobBug::WrongExitCode) { 0 } else { code };
+                    state.finish(&job, Some(code), bug);
+                }
+                Outcome::Started { job }
+            }
+            SandboxAction::Exec { command, .. } => {
+                let (stdout, code, _) = mini_shell(command);
+                Outcome::Exec { exit_code: Some(code), stdout, stderr: String::new() }
+            }
+            SandboxAction::JobStatus { job } if self.jobs && known(&state, job) => {
+                Outcome::Text { content: "known".into() }
+            }
+            SandboxAction::JobOutput { job, .. } if self.jobs && known(&state, job) => {
+                Outcome::Text { content: state.jobs.get(job).map(|(out, _)| out.clone()).unwrap_or_default() }
+            }
+            SandboxAction::JobStop { job } if self.jobs && known(&state, job) => {
+                state.finish(job, None, bug);
+                Outcome::Text { content: "stopped".into() }
+            }
+            SandboxAction::JobStatus { .. } | SandboxAction::JobOutput { .. } | SandboxAction::JobStop { .. }
+                if self.jobs =>
+            {
+                Outcome::Failed { message: "no such job".into() }
+            }
+            _ => return None,
+        };
+        Some(Observation::new(id.clone(), outcome))
     }
 }
 
 #[test]
 fn sandbox_reference_passes() {
     block_on(conformance::sandbox::run(MemSandbox::default));
+}
+
+#[test]
+fn sandbox_reference_with_jobs_passes() {
+    block_on(conformance::sandbox::run(|| MemSandbox { jobs: true, ..Default::default() }));
+}
+
+fn with_job_bug(bug: JobBug) -> MemSandbox {
+    MemSandbox { jobs: bug != JobBug::BackgroundWithoutJobs, job_bug: Some(bug), ..Default::default() }
+}
+
+#[test]
+#[should_panic(expected = "without jobs, a background Exec must be Unsupported")]
+fn sandbox_suite_catches_a_background_exec_without_jobs() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::BackgroundWithoutJobs)));
+}
+
+#[test]
+#[should_panic(expected = "must report each job's end")]
+fn sandbox_suite_catches_a_job_that_never_reports_its_end() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::NoEvents)));
+}
+
+#[test]
+#[should_panic(expected = "the shell's exit code")]
+fn sandbox_suite_catches_a_wrong_job_exit_code() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::WrongExitCode)));
+}
+
+#[test]
+#[should_panic(expected = "job ids must be unique")]
+fn sandbox_suite_catches_reused_job_ids() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::ReusedIds)));
+}
+
+#[test]
+#[should_panic(expected = "never started must not succeed")]
+fn sandbox_suite_catches_an_unknown_job_succeeding() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::UnknownJobSucceeds)));
+}
+
+#[test]
+#[should_panic(expected = "reset must stop every job")]
+fn sandbox_suite_catches_reset_leaving_jobs_running() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::ResetKeepsJobs)));
+}
+
+#[test]
+fn an_exec_recorded_before_background_jobs_still_loads() {
+    let old = serde_json::json!({"kind": "exec", "command": "ls", "cwd": null, "timeout_ms": null});
+    let action: SandboxAction = serde_json::from_value(old).unwrap();
+    assert_eq!(action, SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None, background: false });
+}
+
+#[test]
+fn a_blocked_request_serialises() {
+    let result = NetResult::Blocked { reason: "not allowed".into() };
+    let json = serde_json::to_value(&result).unwrap();
+    assert_eq!(json, serde_json::json!({"result": "blocked", "reason": "not allowed"}));
+    assert_eq!(serde_json::from_value::<NetResult>(json).unwrap(), result);
 }
 
 #[test]
