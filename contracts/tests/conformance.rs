@@ -165,12 +165,12 @@ impl MemJobs {
     }
 }
 
-/// The tiny shell the job scenarios use: `echo X`, `exit N` and `sleep N`, joined by `;`.
+/// The tiny shell the job scenarios use: `echo X`, `exit N` and `sleep N`, joined by `;` or `&&`.
 /// Returns stdout, the exit code, and whether it sleeps (a background job then runs until
 /// stopped).
 fn mini_shell(command: &str) -> (String, i32, bool) {
     let (mut stdout, mut sleeps) = (String::new(), false);
-    for part in command.split(';').map(str::trim) {
+    for part in command.split([';', '&']).map(str::trim).filter(|part| !part.is_empty()) {
         if let Some(text) = part.strip_prefix("echo ") {
             stdout.push_str(text);
             stdout.push('\n');

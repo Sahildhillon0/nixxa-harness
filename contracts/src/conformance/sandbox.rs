@@ -245,7 +245,8 @@ async fn background_jobs_report_their_end(sandbox: &dyn Sandbox) {
         return;
     }
     let mut events = sandbox.subscribe();
-    let failing = start(sandbox, 610, "echo nixxa; exit 3").await;
+    // `&&` means the same in `sh` and Windows `cmd`.
+    let failing = start(sandbox, 610, "echo nixxa && exit 3").await;
     let passing = start(sandbox, 611, "echo nixxa").await;
     assert_ne!(failing, passing, "job ids must be unique");
     let both = [failing.clone(), passing.clone()];
