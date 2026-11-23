@@ -24,6 +24,11 @@ Replace one, and the rest never notice.
 > **Stage 5 — Real memory: done.** Sessions are saved as you go, in SQLite. `nixxa --continue`
 > picks up the latest session for this directory; `ctrl-s` lists every session and searches
 > their transcripts. Knowledge is still a fake.
+>
+> **Stage 6 — Working in the sandbox: in progress.** The agent can run long builds and test
+> suites as **background jobs** (up to 4 at once, 30 min each by default) and check on them while
+> it works; each job is its own process tree, so ending one never touches another. The network
+> allowlist, the `ctrl+t` terminal and notifications come next.
 
 ---
 
@@ -110,7 +115,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
-| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **next** |
+| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **in progress** (background jobs done) |
 | 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | planned |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
