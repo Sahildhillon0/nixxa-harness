@@ -154,7 +154,7 @@ mod tests {
         let request = ActionRequest {
             id: ActionId::new(id),
             action: Action::Sandbox {
-                action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None },
+                action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None, background: false },
             },
             reason: None,
         };

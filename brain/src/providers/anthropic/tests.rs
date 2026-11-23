@@ -195,7 +195,9 @@ fn act(id: &str, action: Action) -> BrainEvent {
 }
 
 fn exec(command: &str) -> Action {
-    Action::Sandbox { action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None } }
+    Action::Sandbox {
+        action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None, background: false },
+    }
 }
 
 fn usage_of(events: &[BrainEvent]) -> nixxa_contracts::Usage {
@@ -349,7 +351,10 @@ async fn the_request_carries_key_version_tools_caching_and_fallback() {
     assert_eq!(body["system"][0]["text"], "You are Nixxa.");
     let tools: Vec<_> =
         body["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
-    assert_eq!(tools, vec!["exec", "read_file", "write_file", "list_dir", "notes__search"]);
+    assert_eq!(
+        tools,
+        vec!["exec", "read_file", "write_file", "list_dir", "job_status", "job_output", "job_stop", "notes__search"]
+    );
     assert!(body.get("thinking").is_none(), "Sonnet 5.5 thinks adaptively by default");
     assert!(body.get("temperature").is_none());
 }

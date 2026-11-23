@@ -101,6 +101,7 @@ impl ScriptedBrain {
                     command: "echo hello from the sandbox".into(),
                     cwd: None,
                     timeout_ms: Some(5_000),
+                    background: false,
                 },
             },
             reason: Some("run the command".into()),
@@ -246,7 +247,8 @@ mod tests {
                             action: SandboxAction::Exec {
                                 command: "echo hello from the sandbox".into(),
                                 cwd: None,
-                                timeout_ms: Some(5_000)
+                                timeout_ms: Some(5_000),
+                                background: false
                             },
                         },
                         reason: Some("run the command".into()),
@@ -279,6 +281,7 @@ mod tests {
                         command: "echo hello from the sandbox".into(),
                         cwd: None,
                         timeout_ms: Some(5_000),
+                        background: false,
                     },
                 },
                 reason: Some("run the command".into()),
@@ -325,6 +328,7 @@ mod tests {
                         command: "echo hello from the sandbox".into(),
                         cwd: None,
                         timeout_ms: Some(5_000),
+                        background: false,
                     },
                 },
                 reason: Some("run the command".into()),
@@ -391,6 +395,7 @@ mod tests {
                         command: "echo hello from the sandbox".into(),
                         cwd: None,
                         timeout_ms: Some(5_000),
+                        background: false,
                     },
                 },
                 reason: Some("run the command".into()),
