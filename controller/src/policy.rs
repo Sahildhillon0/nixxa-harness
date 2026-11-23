@@ -11,10 +11,16 @@ pub(crate) fn gate(request: &ActionRequest) -> Verdict {
 pub(crate) fn describe(action: &Action) -> String {
     match action {
         Action::Sandbox { action } => match action {
-            SandboxAction::Exec { command, .. } => format!("run `{command}` in the sandbox"),
+            SandboxAction::Exec { command, background: false, .. } => format!("run `{command}` in the sandbox"),
+            SandboxAction::Exec { command, background: true, .. } => {
+                format!("run `{command}` in the background in the sandbox")
+            }
             SandboxAction::ReadFile { path } => format!("read `{path}`"),
             SandboxAction::WriteFile { path, .. } => format!("write `{path}`"),
             SandboxAction::ListDir { path } => format!("list `{path}`"),
+            SandboxAction::JobStatus { job } => format!("check on job `{job}`"),
+            SandboxAction::JobOutput { job, .. } => format!("read the output of job `{job}`"),
+            SandboxAction::JobStop { job } => format!("stop job `{job}`"),
         },
         Action::Knowledge { action } => match action {
             KnowledgeAction::Call { source, tool, .. } => format!("call `{tool}` on {source}"),
@@ -25,7 +31,7 @@ pub(crate) fn describe(action: &Action) -> String {
 
 #[cfg(test)]
 mod tests {
-    use nixxa_contracts::{ActionId, KnowledgeEntry, SourceId};
+    use nixxa_contracts::{ActionId, JobId, KnowledgeEntry, SourceId};
 
     use super::*;
 
@@ -36,7 +42,15 @@ mod tests {
     #[test]
     fn every_action_asks() {
         let actions = [
-            Action::Sandbox { action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None } },
+            Action::Sandbox {
+                action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None, background: false },
+            },
+            Action::Sandbox {
+                action: SandboxAction::Exec { command: "make".into(), cwd: None, timeout_ms: None, background: true },
+            },
+            Action::Sandbox { action: SandboxAction::JobStatus { job: JobId::new("j1") } },
+            Action::Sandbox { action: SandboxAction::JobOutput { job: JobId::new("j1"), tail_bytes: 10 } },
+            Action::Sandbox { action: SandboxAction::JobStop { job: JobId::new("j1") } },
             Action::Sandbox { action: SandboxAction::ReadFile { path: "a".into() } },
             Action::Sandbox { action: SandboxAction::WriteFile { path: "a".into(), content: String::new() } },
             Action::Sandbox { action: SandboxAction::ListDir { path: ".".into() } },
@@ -61,8 +75,9 @@ mod tests {
 
     #[test]
     fn describes_the_action() {
-        let exec =
-            Action::Sandbox { action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None } };
+        let exec = Action::Sandbox {
+            action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None, background: false },
+        };
         assert_eq!(gate(&request(exec)), Verdict::Ask("approval needed to run `ls` in the sandbox".into()));
     }
 }

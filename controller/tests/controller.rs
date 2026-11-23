@@ -83,6 +83,7 @@ impl Sandbox for EchoSandbox {
             backend: "fake".into(),
             isolated: false,
             network: false,
+            jobs: false,
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }
@@ -444,7 +445,7 @@ fn exec_request(id: &str, command: &str) -> ActionRequest {
     ActionRequest {
         id: ActionId::new(id),
         action: Action::Sandbox {
-            action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None },
+            action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None, background: false },
         },
         reason: Some("run it".into()),
     }
