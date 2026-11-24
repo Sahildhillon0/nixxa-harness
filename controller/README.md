@@ -70,7 +70,13 @@ user's terminal, other sessions' jobs).
   turn; `max_wakes` (3) in a row at most, after which the notes are recorded between turns. Never
   during a turn or an approval. A user message cancels a pending wake; its turn gets the notes.
   Wake-up turns are ordinary turns: the same gate (Ask asks) and step cap.
-- **Resume:** jobs a stored session started and never saw end are said lost, once.
+- **Early ends:** an end that comes before the job's `Started` (it failed at once) is kept, up to
+  32, and taken when the job is known.
+- **Resume:** jobs a stored session started and never saw end are said lost, once; starts and
+  ends are paired in order, since ids start again at `j1` in every launch.
+- **Not covered:** a background `exec` interrupted while it starts may leave a job running that
+  the agent never hears of (the cancel stops only foreground commands); reset and the session's
+  end stop it.
 
 Not yet: secret redaction and `AGENTS.md` policy (Stage 7), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
 

@@ -7,13 +7,15 @@
 //! of a running turn, or, when the agent is idle, in a turn the controller starts for it (a
 //! wake-up) or between turns.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use nixxa_contracts::{Event, JobId, SandboxEvent};
 
 /// How every job note starts, so a resumed session can tell which jobs ended.
 pub(crate) const NOTE: &str = "Background job: ";
+/// Ends of jobs not (yet) known to be the agent's, kept for when its `Started` comes in.
+const EARLY: usize = 32;
 
 /// The watched jobs, shared by the command loop (which hears the sandbox) and the turn (which
 /// starts jobs and gives the agent their notes).
@@ -24,6 +26,10 @@ pub(crate) type Shared = Arc<Mutex<Watch>>;
 pub(crate) struct Watch {
     running: HashMap<JobId, Running>,
     ended: Vec<Ended>,
+    /// Ends of jobs nobody here started yet: a job that fails at once can end before its
+    /// `Started` reaches the controller (the reply and the event arrive together). Ids are
+    /// unique per sandbox (D-063), so an end found here when its job starts is that job's.
+    early: VecDeque<SandboxEvent>,
 }
 
 #[derive(Debug)]
@@ -43,9 +49,16 @@ pub(crate) struct Ended {
 }
 
 impl Watch {
-    /// The agent started `job`. It waits on it from now on.
-    pub(crate) fn started(&mut self, job: JobId, command: String) {
-        self.running.insert(job, Running { command, wakes: true });
+    /// The agent started `job`. It waits on it from now on. If its end already came, it is
+    /// taken now, and its event for the UI returned.
+    pub(crate) fn started(&mut self, job: JobId, command: String) -> Option<Event> {
+        self.running.insert(job.clone(), Running { command, wakes: true });
+        let early = self
+            .early
+            .iter()
+            .position(|event| matches!(event, SandboxEvent::JobFinished { job: done, .. } if *done == job))?;
+        let event = self.early.remove(early)?;
+        self.observe(event)
     }
 
     /// The agent stopped `job` itself: its end is noted but wakes nobody.
@@ -65,8 +78,15 @@ impl Watch {
     /// A sandbox event: the end of a watched job becomes a note (and an event for the UI).
     /// Everything else is ignored.
     pub(crate) fn observe(&mut self, event: SandboxEvent) -> Option<Event> {
-        let SandboxEvent::JobFinished { job, exit_code, duration_ms, status, .. } = event else { return None };
-        let running = self.running.remove(&job)?;
+        let SandboxEvent::JobFinished { job, exit_code, duration_ms, status, .. } = &event else { return None };
+        let (job, exit_code, duration_ms, status) = (job.clone(), *exit_code, *duration_ms, status.clone());
+        let Some(running) = self.running.remove(&job) else {
+            if self.early.len() == EARLY {
+                self.early.pop_front();
+            }
+            self.early.push_back(event);
+            return None;
+        };
         let status = if status.is_empty() { format!("job {job} ended") } else { status };
         self.ended.push(Ended {
             job: job.clone(),
@@ -97,13 +117,39 @@ pub(crate) fn lock(watch: &Shared) -> std::sync::MutexGuard<'_, Watch> {
     watch.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// What a stored session shows about its jobs, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Seen {
+    /// The agent started this job with this command.
+    Started(JobId, String),
+    /// A system message: its job notes end jobs.
+    Note(String),
+}
+
 /// The note for jobs a stored session started that never reported an end (Nixxa quit while
-/// they ran): jobs don't outlive the sandbox they ran in. Said once: the note itself marks them
-/// as ended for the next resume.
-pub(crate) fn lost_on_resume(started: &[(JobId, String)], notes: &[String]) -> Option<String> {
-    let lost: Vec<String> = started
+/// they ran): jobs don't outlive the sandbox they ran in. Starts and ends are paired in order,
+/// because ids start again at `j1` in every new sandbox. Said once: the note itself ends them
+/// for the next resume.
+pub(crate) fn lost_on_resume(history: &[Seen]) -> Option<String> {
+    let mut running: Vec<(JobId, String)> = Vec::new();
+    for seen in history {
+        match seen {
+            Seen::Started(job, command) => running.push((job.clone(), command.clone())),
+            Seen::Note(text) => {
+                for line in text.lines() {
+                    let Some(rest) = line.strip_prefix(NOTE).and_then(|rest| rest.strip_prefix("job ")) else {
+                        continue;
+                    };
+                    let id = rest.split(' ').next().unwrap_or_default();
+                    if let Some(at) = running.iter().position(|(job, _)| job.as_str() == id) {
+                        running.remove(at);
+                    }
+                }
+            }
+        }
+    }
+    let lost: Vec<String> = running
         .iter()
-        .filter(|(job, _)| !notes.iter().any(|note| note.contains(&format!("{NOTE}job {job} "))))
         .map(|(job, command)| format!("{NOTE}job {job} didn't survive: Nixxa quit while it ran (`{command}`)."))
         .collect();
     (!lost.is_empty())
@@ -170,11 +216,46 @@ mod tests {
 
     #[test]
     fn jobs_a_stored_session_left_running_are_said_lost_once() {
-        let started = vec![(JobId::new("j1"), "cargo build".into()), (JobId::new("j2"), "sleep 9".into())];
-        let notes = vec!["Background job: job j1 exited with code 0 after 1.0 s (`cargo build`).".to_string()];
-        let said = lost_on_resume(&started, &notes).expect("j2 is lost");
+        let start = |job: &str, command: &str| Seen::Started(JobId::new(job), command.into());
+        let mut history = vec![
+            start("j1", "cargo build"),
+            start("j2", "sleep 9"),
+            Seen::Note("Background job: job j1 exited with code 0 after 1.0 s (`cargo build`).".into()),
+        ];
+        let said = lost_on_resume(&history).expect("j2 is lost");
         assert!(said.starts_with("Background job: job j2 didn't survive") && !said.contains("job j1"), "{said}");
-        let notes = [notes, vec![said]].concat();
-        assert_eq!(lost_on_resume(&started, &notes), None, "said once");
+        history.push(Seen::Note(said));
+        assert_eq!(lost_on_resume(&history), None, "said once");
+    }
+
+    #[test]
+    fn a_reused_id_in_a_later_run_is_still_said_lost() {
+        // The review's case: each launch's sandbox starts again at j1.
+        let history = vec![
+            Seen::Started(JobId::new("j1"), "cargo build".into()),
+            Seen::Note("Background job: job j1 exited with code 0 after 1.0 s (`cargo build`).".into()),
+            Seen::Started(JobId::new("j1"), "npm test".into()),
+        ];
+        let said = lost_on_resume(&history).expect("the second j1 is lost");
+        assert!(said.contains("job j1 didn't survive") && said.contains("npm test") && !said.contains("cargo build"));
+    }
+
+    #[test]
+    fn an_end_that_comes_before_its_start_is_kept_for_it() {
+        let mut watch = Watch::default();
+        assert_eq!(watch.observe(ended("j1", Some(127), "job j1 exited with code 127 after 0.0 s")), None);
+        let event = watch.started(JobId::new("j1"), "cargo biuld".into());
+        assert!(matches!(event, Some(Event::JobFinished { exit_code: Some(127), .. })), "{event:?}");
+        assert!(watch.wake_due());
+        assert_eq!(
+            watch.take_ended()[0].note,
+            "Background job: job j1 exited with code 127 after 0.0 s (`cargo biuld`)."
+        );
+        // Bounded: only the newest unknown ends are kept.
+        for n in 0..40 {
+            watch.observe(ended(&format!("x{n}"), Some(0), "x"));
+        }
+        assert_eq!(watch.started(JobId::new("x0"), "old".into()), None, "dropped");
+        assert!(watch.started(JobId::new("x39"), "new".into()).is_some());
     }
 }

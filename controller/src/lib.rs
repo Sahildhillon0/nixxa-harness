@@ -245,9 +245,8 @@ impl Controller {
         let mut turn = TurnId::new("turn-0");
         let mut unanswered: Vec<ActionRequest> = Vec::new();
         let mut conversation = Vec::with_capacity(record.messages.len());
-        // Background jobs it started, with their commands, and the job notes it was given.
-        let mut started: Vec<(JobId, String)> = Vec::new();
-        let mut notes: Vec<String> = Vec::new();
+        // Background jobs it started, with their commands, and the job notes it was given, in order.
+        let mut history: Vec<jobs::Seen> = Vec::new();
         let mut commands: Vec<(ActionId, String)> = Vec::new();
         for message in record.messages {
             match &message.content {
@@ -261,11 +260,12 @@ impl Controller {
                 Content::Observation { observation } => {
                     if let Outcome::Started { job } = &observation.outcome {
                         let command = commands.iter().find(|(id, _)| *id == observation.action_id);
-                        started.push((job.clone(), command.map(|(_, c)| c.clone()).unwrap_or_default()));
+                        let command = command.map(|(_, c)| c.clone()).unwrap_or_default();
+                        history.push(jobs::Seen::Started(job.clone(), command));
                     }
                 }
                 Content::Text { text } if message.role == Role::System && text.contains(jobs::NOTE) => {
-                    notes.push(text.clone());
+                    history.push(jobs::Seen::Note(text.clone()));
                 }
                 _ => {}
             }
@@ -304,7 +304,7 @@ impl Controller {
                 record.info.account, self.config.account
             ));
         }
-        if let Some(lost) = jobs::lost_on_resume(&started, &notes) {
+        if let Some(lost) = jobs::lost_on_resume(&history) {
             notice.push('\n');
             notice.push_str(&lost);
         }
@@ -663,14 +663,18 @@ impl Controller {
         flow
     }
 
-    /// Watches a background job the agent just started (D-068).
+    /// Watches a background job the agent just started (D-068); if it has already ended, its
+    /// end is taken now.
     fn watch_started(&self, request: &ActionRequest, observation: &Observation) {
         if let (
             Action::Sandbox { action: SandboxAction::Exec { command, background: true, .. } },
             Outcome::Started { job },
         ) = (&request.action, &observation.outcome)
         {
-            jobs::lock(&self.jobs).started(job.clone(), command.clone());
+            let early = jobs::lock(&self.jobs).started(job.clone(), command.clone());
+            if let Some(event) = early {
+                self.emit(event);
+            }
         }
     }
 

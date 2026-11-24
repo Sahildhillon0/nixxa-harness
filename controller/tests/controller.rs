@@ -1381,6 +1381,9 @@ async fn a_note_is_recorded_between_turns_never_inside_one() {
 /// Runs background jobs that end when the test says; foreground commands echo.
 #[derive(Default)]
 struct JobSandbox {
+    /// Every background job fails at once: its end is sent before its `Started` is returned,
+    /// as when the real client reads the reply and the event together.
+    fails_at_once: bool,
     next: Mutex<u32>,
     commands: Mutex<Vec<(String, String)>>,
     subscribers: Mutex<Vec<mpsc::UnboundedSender<nixxa_contracts::SandboxEvent>>>,
@@ -1423,10 +1426,16 @@ impl Sandbox for JobSandbox {
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
         match action {
             SandboxAction::Exec { command, background: true, .. } => {
-                let mut next = self.next.lock().unwrap();
-                *next += 1;
-                let job = format!("j{next}");
+                let job = {
+                    let mut next = self.next.lock().unwrap();
+                    *next += 1;
+                    format!("j{next}")
+                };
                 self.commands.lock().unwrap().push((job.clone(), command));
+                if self.fails_at_once {
+                    self.finish(&job, 127);
+                    tokio::task::yield_now().await;
+                }
                 Ok(Observation::new(id, Outcome::Started { job: nixxa_contracts::JobId::new(job) }))
             }
             SandboxAction::JobStop { job } => {
@@ -1467,7 +1476,17 @@ async fn job_rig(
     wake_delay: Duration,
     max_steps: u32,
 ) -> (Rig, Arc<JobSandbox>) {
-    let sandbox = Arc::new(JobSandbox::default());
+    job_rig_over(Arc::new(JobSandbox::default()), brain, approvals, max_wakes, wake_delay, max_steps).await
+}
+
+async fn job_rig_over(
+    sandbox: Arc<JobSandbox>,
+    brain: Arc<ScriptedBrain>,
+    approvals: Arc<ScriptedApprovals>,
+    max_wakes: u32,
+    wake_delay: Duration,
+    max_steps: u32,
+) -> (Rig, Arc<JobSandbox>) {
     let store = Arc::new(MemoryStore::default());
     let sink = Arc::new(RecordingSink::default());
     let mut config = ControllerConfig::new(
@@ -1781,4 +1800,40 @@ async fn jobs_that_were_running_are_said_lost_once_on_resume() {
     let again = Rig::resume(ScriptedBrain::new(vec![]), ScriptedApprovals::allowing(), store.clone(), "s1").await;
     assert_eq!(said(&store), 1, "said once, not at every resume");
     drop(again);
+}
+
+#[tokio::test]
+async fn a_job_that_ends_before_its_start_is_heard_is_still_noted() {
+    // The review's probe: the end and the Started reply ready together, 20 times. The end is
+    // kept until the job is known; then the agent is told once, at the turn's next step or, if
+    // the end is heard only after the turn, in a wake-up. Before the fix it was dropped.
+    for run in 0..20 {
+        let brain =
+            ScriptedBrain::new(vec![act(background("a1", "cargo biuld")), done("started"), done("it failed at once")]);
+        let sandbox = Arc::new(JobSandbox { fails_at_once: true, ..JobSandbox::default() });
+        let (rig, _sandbox) = job_rig_over(
+            sandbox,
+            brain,
+            ScriptedApprovals::allowing(),
+            3,
+            Duration::from_millis(10),
+            DEFAULT_MAX_STEPS,
+        )
+        .await;
+        rig.turn("build it in the background").await;
+        let noted = |store: &MemoryStore| {
+            system_texts(store).iter().filter(|t| t.contains("job j1 exited with code 127")).count()
+        };
+        for _ in 0..200 {
+            if noted(&rig.store) > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(noted(&rig.store), 1, "run {run}: the fast end must be noted once");
+        assert_eq!(rig.sink.count(|e| matches!(e, Event::JobFinished { exit_code: Some(127), .. })), 1, "run {run}");
+        let told = rig.brain.contexts().iter().filter(|c| mentions(c, "job j1 exited with code 127") > 0).count();
+        assert!(told >= 1, "run {run}: the agent is told");
+    }
 }
