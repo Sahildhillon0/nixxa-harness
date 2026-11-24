@@ -591,7 +591,8 @@ fn sandbox_suite_catches_a_job_end_without_words() {
 
 #[test]
 fn a_job_end_recorded_before_its_words_still_loads() {
-    let old = serde_json::json!({"event": "job_finished", "job": "j1", "exit_code": 0, "duration_ms": 5, "truncated": false});
+    let old =
+        serde_json::json!({"event": "job_finished", "job": "j1", "exit_code": 0, "duration_ms": 5, "truncated": false});
     let event: SandboxEvent = serde_json::from_value(old).unwrap();
     assert!(matches!(event, SandboxEvent::JobFinished { status, .. } if status.is_empty()));
 }
