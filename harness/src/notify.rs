@@ -159,6 +159,11 @@ pub(crate) fn text(what: &Finished) -> String {
     }
 }
 
+/// `text` with the markup characters notification servers interpret written as entities.
+fn markup_escaped(text: &str) -> String {
+    text.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 /// The real notifier: the terminal bell, and the desktop's own notifications (`notify-send` on
 /// Linux and the BSDs, `osascript` on macOS; Windows has the bell only). The text goes as
 /// separate arguments, never through a shell.
@@ -189,7 +194,8 @@ impl Notifier for SystemNotifier {
             return;
         } else {
             let mut command = std::process::Command::new("notify-send");
-            command.args(["--app-name=Nixxa", "--", title, body]);
+            // Many notification servers read the body as markup (`<b>`, `<a href>`).
+            command.args(["--app-name=Nixxa", "--", &markup_escaped(title), &markup_escaped(body)]);
             command
         };
         let spawned = command
@@ -282,6 +288,14 @@ pub(crate) mod tests {
         assert!(body.starts_with("job j1^[[2J failed (exit 101): cargo build ^[]52;"), "{body}");
         assert!(!body.chars().any(|c| c.is_control() || ('\u{202A}'..='\u{202E}').contains(&c)), "{body:?}");
         assert!(body.ends_with('…') && body.chars().count() < 100, "cut down: {body}");
+    }
+
+    #[test]
+    fn desktop_markup_is_escaped() {
+        assert_eq!(
+            markup_escaped("job j1 finished: <a href=\"x\">a & b</a>"),
+            "job j1 finished: &lt;a href=\"x\"&gt;a &amp; b&lt;/a&gt;"
+        );
     }
 
     #[test]
