@@ -14,7 +14,9 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 6 — Working in the sandbox: in progress.** Stage 3's Anthropic live checks are still
+**Stage 7 — Safe edits: next.** Stage 6 is done.
+
+**Stage 6 — Working in the sandbox: done.** Stage 3's Anthropic live checks are still
 pending. The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each
 new capability lives and the Stages section for the order.
 
@@ -30,7 +32,10 @@ new capability lives and the Stages section for the order.
   or reach (a second Landlock layer for every agent command), the user's shell in This
   directory, protocol v4 with flow control (D-066); the `ctrl+t` pane through a VT100 emulator,
   `ctrl+]` to leave, sharing chosen lines into the message input (D-067).
-- Next: PR D (wake-ups, notifications).
+- PR D, job results and wake-ups: the controller tells the agent when its own background jobs
+  end (once, between steps) and starts a turn when it was waiting on them, three in a row at most
+  (D-068); the harness shows job ends and wake-ups, counts finishes on a badge, and rings the bell
+  and sends a desktop notification when the user is away (`NIXXA_NOTIFY`, D-069).
 
 **Stage 5 — Real memory, done:**
 - `SqliteStore` in `db/` (rusqlite bundled, WAL, forward-only migrations, FTS5 search;

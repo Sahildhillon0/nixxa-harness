@@ -153,7 +153,7 @@ internal is `pub(crate)`.
   - slash commands (#10);
   - network settings (#1; done, D-065);
   - several sessions in tabs, git worktrees and the merge review (#6);
-  - notifications (#9);
+  - notifications (#9; done, D-069);
   - reading `AGENTS.md` and handing its rules to the controller (#5);
   - two more frontends, `nixxa acp` (#11) and `nixxa run --ci` (#12), each implementing
     `ApprovalPort` + `EventSink`.
@@ -180,7 +180,7 @@ internal is `pub(crate)`.
 | `Credential` | A secret wrapper (`ApiKey`, `BearerToken`, `CloudProfile`, `None`) whose `Debug`/`Display` print `***`; zeroised on drop |
 | `Observation` | A result: output, error, timing, truncation flag, source |
 | `Verdict` | The policy gate's answer: `Allow`, `Ask(reason)`, `Deny(reason)` |
-| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, turn done |
+| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, a background job finished, a wake-up, turn done |
 
 ### Traits
 
@@ -241,7 +241,12 @@ closed terminal refuses input; without one, `open_terminal` is `Unsupported`.
 - **Background jobs (#9):** `Exec { background }` → `Outcome::Started { job: JobId }`; the
   `JobStatus`, `JobOutput` and `JobStop` actions; `Sandbox::subscribe()` → a stream of
   `SandboxEvent` (`JobFinished`, and `NetRequest` for the network log); `SandboxCapabilities.jobs`
-  (D-061 to D-063). `Event::JobFinished` for the controller comes with the wake-ups.
+  (D-061 to D-063).
+- **Job results and wake-ups (#9):** `SandboxEvent::JobFinished.status`, how the job ended in the
+  sandbox's own words (serde default, for events recorded before); `Event::JobFinished { job,
+  command, exit_code, duration_ms, status }` for each of the session's own jobs; `Event::WakeUp {
+  turn, jobs }` before a turn the controller starts itself because jobs the agent was waiting on
+  ended (D-068).
 - **Network allowlist (#1):** `NetworkPolicy { Off, Allow(Vec<DomainRule>), Open }`,
   `Sandbox::set_network(policy)`, `SandboxCapabilities.network: NetworkAccess` (the policy, or
   `Unrestricted` for a backend that isn't isolated), `Observation.network: Vec<NetRequest>`, and
@@ -658,9 +663,10 @@ their stage.
   (`Exec { background: true }` → `JobId`), check on it, read its output and stop it. Each job
   has its own limits and output files. When a job ends, the controller tells the agent at its
   next step. If the agent is idle and waiting on that job, the controller starts a turn (within
-  budget).
+  budget). *Done (D-061 to D-063, D-068).*
 - **Notifications** (desktop notification where available, the terminal bell, a status-bar
   badge) fire when a job, a turn or a test loop finishes while the user is away from the pane.
+  *Done for jobs and turns (D-069); the test loop (Stage 8) adds a `Finished` kind.*
 - **Background sessions (Stage 12)** keep whole agent runs going without the TUI open. This
   needs the long-running `nixxa` service (§7).
 
@@ -910,7 +916,7 @@ Every stage ends with something that runs and a checklist that must be true befo
   mid-turn, opens a new store on the same file and resumes, and checks the conversation, the
   activity pane and the brain's history; the same was done by hand with a real model.
 
-### Stage 6 — Working in the sandbox: network, terminal, background jobs
+### Stage 6 — Working in the sandbox: network, terminal, background jobs *(done)*
 - **The daemon moves to per-job tracking:** each job is its own process tree with its own
   limits (the agent's command, the user's terminal, background jobs, services). This replaces
   the "kill everything after each command" sweep (D-043) without loosening isolation.
@@ -928,13 +934,24 @@ Every stage ends with something that runs and a checklist that must be true befo
     job under its own supervisor), which survives the agent's commands, background jobs, timeouts
     and cancels (`tests/terminal.rs`), isn't visible to the agent, and can't be reached by the
     agent's commands (a second Landlock layer without the terminal devices).
-  - PR D (wake-ups and notifications): not started.
-- **Exit:**
+  - PR D, job results, wake-ups and notifications (D-068, D-069): done. The agent is told when
+    its background jobs end, in the sandbox's words, once, between steps; when it is idle and
+    was waiting on a job, the controller starts a turn for it (three in a row at most); the
+    harness shows job ends and wake-ups in the activity pane, counts finishes on a badge, and
+    rings the bell and sends a desktop notification when the user is away.
+- **Exit (all met):**
   - `cargo test` on a fresh project with a crates.io dependency passes inside the sandbox with
-    only crates.io allowed, and a request to another host is blocked and logged;
-  - `ctrl+t` opens a shell in the same sandbox, and it survives the agent's commands;
-  - a long background build notifies when it finishes;
-  - the Stage 4 escape tests still pass.
+    only crates.io allowed, and a request to another host is blocked and logged: met by PR B
+    (`needs_internet_cargo_test_with_only_crates_io_allowed`, and PR C's live run: `cargo add` and
+    `cargo build` through the crates.io preset in the terminal);
+  - `ctrl+t` opens a shell in the same sandbox, and it survives the agent's commands: met by
+    PR C (`tests/terminal.rs`: `the_terminal_runs_in_the_same_sandbox`,
+    `the_terminal_survives_everything_the_agent_does`, and the live run);
+  - a long background build notifies when it finishes: met by PR D (controller tests for each
+    wake-up rule, harness tests for each channel and presence, and the live run: a background
+    `cargo build` woke the agent, and the bell and a desktop notification fired while the window
+    was out of focus, the badge only while it was in focus);
+  - the Stage 4 escape tests still pass: `tests/escape.rs`, on every PR of the stage.
 
 ### Stage 7 — Safe edits: patches, undo, secrets, project policy
 - **Patches and undo (#15):** `SandboxAction::Patch`, checkpoints and `/undo` in every place.

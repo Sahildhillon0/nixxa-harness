@@ -228,6 +228,7 @@ async fn a_restarted_daemon_never_reuses_a_job_id() {
     let scratch = Scratch::new("job-ids");
     let Some(sb) = sandbox(&scratch.workspace()) else { return };
     let mut events = sb.subscribe();
+    let mut words = sb.subscribe();
     let first = start(&sb, "sleep 340").await;
     // PID 2 is the daemon; killing it takes its jobs with it.
     assert!(
@@ -244,6 +245,14 @@ async fn a_restarted_daemon_never_reuses_a_job_id() {
         .is_err()
     );
     assert_eq!(finished(&mut events, &first).await, (None, false), "a dead daemon's job is reported as ended");
+    let status = loop {
+        match words.next().await {
+            Some(SandboxEvent::JobFinished { job, status, .. }) if job == first => break status,
+            Some(_) => {}
+            None => panic!("the events ended"),
+        }
+    };
+    assert!(status.starts_with(&format!("job {first} was lost after")), "{status}");
     let second = start(&sb, "sleep 341").await;
     assert_ne!(second, first, "a restarted daemon reused job id {first}");
     let old = run(&sb, SandboxAction::JobStatus { job: first.clone() }).await.unwrap();

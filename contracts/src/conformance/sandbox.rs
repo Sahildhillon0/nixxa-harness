@@ -233,8 +233,12 @@ async fn wait_finished(
     let mut got = HashMap::new();
     while got.len() < want.len() {
         match futures::future::select(events.next(), &mut deadline).await {
-            Either::Left((Some(SandboxEvent::JobFinished { job, exit_code, .. }), _)) => {
+            Either::Left((Some(SandboxEvent::JobFinished { job, exit_code, status, .. }), _)) => {
                 if want.contains(&job) {
+                    assert!(
+                        status.contains(&format!("job {job} ")),
+                        "JobFinished must say how the job ended in words naming it, got {status:?}"
+                    );
                     let first = got.insert(job.clone(), exit_code).is_none();
                     assert!(first, "job {job} finished twice: a job ends with exactly one JobFinished");
                 }

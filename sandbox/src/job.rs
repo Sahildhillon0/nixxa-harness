@@ -156,6 +156,7 @@ impl Job {
     pub(crate) fn finish(&self, done: Done, end: End, ran: Duration) -> SandboxEvent {
         let exit_code = end.exit_code();
         let truncated = [&self.stdout, &self.stderr].iter().any(|tail| tail.lock().is_ok_and(|tail| tail.cut()));
+        let status = status_line(self.id.as_str(), Some(&end), ran);
         if let Ok(mut slot) = self.end.lock() {
             *slot = Some((end, ran));
         }
@@ -165,6 +166,7 @@ impl Job {
             exit_code,
             duration_ms: u64::try_from(ran.as_millis()).unwrap_or(u64::MAX),
             truncated,
+            status,
         }
     }
 }
@@ -299,7 +301,10 @@ mod tests {
         assert_ne!(first.id, _second.id);
         first.stdout.lock().unwrap().push(b"hello");
         let event = first.finish(handles.done, End::Exited(Some(3)), Duration::from_secs(1));
-        assert!(matches!(event, SandboxEvent::JobFinished { exit_code: Some(3), .. }), "{event:?}");
+        assert!(
+            matches!(&event, SandboxEvent::JobFinished { exit_code: Some(3), status, .. } if status == "job j1 exited with code 3 after 1.0 s"),
+            "{event:?}"
+        );
         first.wait().await;
         assert!(table.add().is_ok(), "an ended job frees its place");
         let Outcome::Text { content } = table.answer(&first.id, Some(100)) else { panic!() };

@@ -3,27 +3,42 @@
 //!
 //! Stage 2: the loop from ARCHITECTURE.md §4 with routing; the policy asks the human before
 //! every action. Budgets beyond the per-turn step cap, retries and write-back come later.
+//!
+//! Stage 6 (D-068): the loop also hears the sandbox. The end of a background job the agent
+//! started is noted for the agent once, at its next think step; if the agent is idle and was
+//! waiting on the job, the controller starts a turn for it (a wake-up), a few at most in a row.
 
 #![warn(missing_docs)]
 
+mod jobs;
 mod network;
 mod policy;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures::StreamExt;
 use tokio::sync::{mpsc, watch};
 
 use nixxa_contracts::{
-    AccountRef, Action, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, Content, Context, Event,
-    EventSink, Intent, Knowledge, KnowledgeAction, Limits, Message, NewSession, Observation, Primer, Role, Sandbox,
-    SessionId, SessionInfo, Store, StoreError, Timestamp, TurnId, Verdict, WorkspaceInfo,
+    AccountRef, Action, ActionId, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, Content, Context,
+    Event, EventSink, Intent, JobId, Knowledge, KnowledgeAction, Limits, Message, NewSession, Observation, Outcome,
+    Primer, Role, Sandbox, SandboxAction, SandboxEvent, SessionId, SessionInfo, Store, StoreError, Timestamp, TurnId,
+    Verdict, WorkspaceInfo,
 };
 
 /// The default hard cap on brain steps per turn.
 pub const DEFAULT_MAX_STEPS: u32 = 8;
+/// The default cap on turns the controller starts in a row without a user message.
+pub const DEFAULT_MAX_WAKES: u32 = 3;
+/// How long the controller waits, once a job it should wake the agent for has ended, for others
+/// ending close behind it: they all go into one turn.
+pub const DEFAULT_WAKE_DELAY: Duration = Duration::from_secs(1);
+
+/// What opens a turn the controller starts itself (D-068). The job notes follow it.
+const WAKE: &str = "This turn started without a message from the user: background jobs you started have ended \
+     (below). The user may be away. Carry on with what you were doing, or say what you found.";
 
 /// What the agent is told when a turn is interrupted.
 const INTERRUPTED: &str = "interrupted by the user";
@@ -67,6 +82,10 @@ pub struct ControllerConfig {
     pub max_steps: u32,
     /// Source of timestamps for messages and records.
     pub clock: fn() -> Timestamp,
+    /// The most turns the controller starts in a row, for ended jobs, without a user message.
+    pub max_wakes: u32,
+    /// How long it waits for other jobs ending close behind one before it starts that turn.
+    pub wake_delay: Duration,
 }
 
 impl ControllerConfig {
@@ -78,6 +97,8 @@ impl ControllerConfig {
             instructions: instructions.into(),
             max_steps: DEFAULT_MAX_STEPS,
             clock: system_clock,
+            max_wakes: DEFAULT_MAX_WAKES,
+            wake_delay: DEFAULT_WAKE_DELAY,
         }
     }
 }
@@ -102,6 +123,20 @@ struct Session {
     primer: Primer,
     /// The conversation the brain sees, across turns.
     conversation: Vec<Message>,
+}
+
+/// What opens a turn.
+enum Opening {
+    /// The user's message.
+    User(String),
+    /// Jobs the agent was waiting on ended; these woke it.
+    Wake(Vec<JobId>),
+}
+
+/// What the idle loop hands back.
+enum Next {
+    Command(Command),
+    Wake,
 }
 
 /// Whether the loop keeps going after an intent or a step.
@@ -146,6 +181,8 @@ pub struct Controller {
     next_turn: u64,
     /// Set to `true` by [`Controller::run`] to cancel the in-flight turn.
     cancel: watch::Receiver<bool>,
+    /// The agent's background jobs (D-068).
+    jobs: jobs::Shared,
 }
 
 impl Controller {
@@ -170,6 +207,7 @@ impl Controller {
             session: None,
             next_turn: 0,
             cancel: watch::channel(false).1,
+            jobs: jobs::Shared::default(),
         }
     }
 
@@ -207,7 +245,30 @@ impl Controller {
         let mut turn = TurnId::new("turn-0");
         let mut unanswered: Vec<ActionRequest> = Vec::new();
         let mut conversation = Vec::with_capacity(record.messages.len());
+        // Background jobs it started, with their commands, and the job notes it was given, in order.
+        let mut history: Vec<jobs::Seen> = Vec::new();
+        let mut commands: Vec<(ActionId, String)> = Vec::new();
         for message in record.messages {
+            match &message.content {
+                Content::Action { request } => {
+                    if let Action::Sandbox { action: SandboxAction::Exec { command, background: true, .. } } =
+                        &request.action
+                    {
+                        commands.push((request.id.clone(), command.clone()));
+                    }
+                }
+                Content::Observation { observation } => {
+                    if let Outcome::Started { job } = &observation.outcome {
+                        let command = commands.iter().find(|(id, _)| *id == observation.action_id);
+                        let command = command.map(|(_, c)| c.clone()).unwrap_or_default();
+                        history.push(jobs::Seen::Started(job.clone(), command));
+                    }
+                }
+                Content::Text { text } if message.role == Role::System && text.contains(jobs::NOTE) => {
+                    history.push(jobs::Seen::Note(text.clone()));
+                }
+                _ => {}
+            }
             match &message.content {
                 // Stored for the record, never shown or replayed (D-029).
                 Content::Summary { .. } => continue,
@@ -243,6 +304,10 @@ impl Controller {
                 record.info.account, self.config.account
             ));
         }
+        if let Some(lost) = jobs::lost_on_resume(&history) {
+            notice.push('\n');
+            notice.push_str(&lost);
+        }
         let message = Message::text(Role::System, notice, self.now());
         self.record_message(&turn, message, true).await;
         Ok(record.info)
@@ -274,25 +339,38 @@ impl Controller {
     ///
     /// Turns run one at a time. While a turn is in flight the loop keeps listening: an interrupt
     /// or shutdown signals the turn to cancel at its next cancellation point (brain stream,
-    /// approval prompt or action), and messages that arrive meanwhile are queued.
+    /// approval prompt or action), and messages that arrive meanwhile are queued. It also hears
+    /// the sandbox throughout: the end of a job the agent started is noted for the agent, and
+    /// while idle may start a turn (D-068).
     pub async fn run(&mut self, mut commands: mpsc::Receiver<Command>) {
         let (cancel_tx, cancel_rx) = watch::channel(false);
         self.cancel = cancel_rx;
+        let mut sandbox = Some(self.sandbox.subscribe());
         let mut queued: VecDeque<Command> = VecDeque::new();
         let mut shutting_down = false;
+        // Turns started for ended jobs since the user last wrote.
+        let mut wakes = 0u32;
         while !shutting_down {
-            let command = match queued.pop_front() {
-                Some(command) => command,
-                None => commands.recv().await.unwrap_or(Command::Shutdown),
+            let next = match queued.pop_front() {
+                Some(command) => Next::Command(command),
+                None => self.idle(&mut commands, &mut sandbox, wakes).await,
             };
-            let text = match command {
-                Command::UserMessage(text) => text,
-                Command::Note(text) => {
+            let opening = match next {
+                Next::Command(Command::UserMessage(text)) => {
+                    jobs::lock(&self.jobs).user_spoke();
+                    wakes = 0;
+                    Opening::User(text)
+                }
+                Next::Command(Command::Note(text)) => {
                     self.note(text).await;
                     continue;
                 }
-                Command::Interrupt => continue,
-                Command::Shutdown => break,
+                Next::Command(Command::Interrupt) => continue,
+                Next::Command(Command::Shutdown) => break,
+                Next::Wake => {
+                    wakes += 1;
+                    Opening::Wake(jobs::lock(&self.jobs).waking())
+                }
             };
             if self.session.is_none() {
                 self.emit(Event::Error { turn: None, message: "no session: start one before sending messages".into() });
@@ -301,8 +379,9 @@ impl Controller {
             let turn = TurnId::new(format!("turn-{}", self.next_turn));
             self.next_turn += 1;
             cancel_tx.send_replace(false);
+            let (watch, sink) = (self.jobs.clone(), self.events.clone());
             {
-                let turn_future = self.run_turn(text, &turn);
+                let turn_future = self.run_turn(opening, &turn);
                 tokio::pin!(turn_future);
                 let mut listening = true;
                 loop {
@@ -319,6 +398,7 @@ impl Controller {
                                 listening = false;
                             }
                         },
+                        event = next_event(&mut sandbox) => observe(&watch, &*sink, event),
                     }
                 }
             }
@@ -327,6 +407,58 @@ impl Controller {
         if let Some(session) = self.session.take() {
             self.emit(Event::SessionEnded { session: session.id });
         }
+    }
+
+    /// Waits, between turns, for the next command or for a turn to start for ended jobs. Ends
+    /// that won't wake the agent (the user spoke since, the agent stopped the job, or the cap of
+    /// turns in a row is reached) are recorded at once, between turns.
+    async fn idle(
+        &mut self,
+        commands: &mut mpsc::Receiver<Command>,
+        sandbox: &mut Option<futures::stream::BoxStream<'static, SandboxEvent>>,
+        wakes: u32,
+    ) -> Next {
+        let mut wake_at: Option<tokio::time::Instant> = None;
+        loop {
+            let due = jobs::lock(&self.jobs).wake_due();
+            if due && wakes < self.config.max_wakes {
+                // Wait a moment for others ending close behind: one turn for all of them.
+                wake_at.get_or_insert_with(|| tokio::time::Instant::now() + self.config.wake_delay);
+            } else {
+                let capped = due.then_some(self.config.max_wakes);
+                self.give_ended(None, capped).await;
+            }
+            let timer = async {
+                match wake_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                command = commands.recv() => return Next::Command(command.unwrap_or(Command::Shutdown)),
+                event = next_event(sandbox) => observe(&self.jobs, &*self.events, event),
+                () = timer => return Next::Wake,
+            }
+        }
+    }
+
+    /// Gives the agent the job ends it hasn't been told about, as one system message: within a
+    /// turn at a step, or between turns (`turn` is `None`). `capped` says no turn was started
+    /// for them because this many already were in a row.
+    async fn give_ended(&mut self, turn: Option<&TurnId>, capped: Option<u32>) {
+        let ended = jobs::lock(&self.jobs).take_ended();
+        if ended.is_empty() {
+            return;
+        }
+        let mut text = ended.iter().map(|ended| ended.note.as_str()).collect::<Vec<_>>().join("\n");
+        if let Some(cap) = capped {
+            text.push_str(&format!(
+                "\nNo turn was started for this: {cap} already were in a row without a message from the user."
+            ));
+        }
+        let turn = turn.cloned().unwrap_or_else(|| TurnId::new(format!("note-{}", self.next_turn)));
+        let message = Message::text(Role::System, text, self.now());
+        self.record_message(&turn, message, true).await;
     }
 
     /// Records a notice between turns. Without a session there is nothing to record it in.
@@ -339,11 +471,22 @@ impl Controller {
         self.record_message(&turn, message, true).await;
     }
 
-    /// Runs one user turn until the brain is done, something fails, the step budget runs out
-    /// or the turn is cancelled. The caller emits [`Event::TurnDone`].
-    async fn run_turn(&mut self, text: String, turn: &TurnId) {
-        self.emit(Event::TurnStarted { turn: turn.clone() });
-        let message = Message::text(Role::User, text, self.now());
+    /// Runs one turn until the brain is done, something fails, the step budget runs out or the
+    /// turn is cancelled. The caller emits [`Event::TurnDone`]. A wake-up turn opens with a
+    /// system message saying so (recorded, so a resumed session reads naturally); the job notes
+    /// follow at its first step.
+    async fn run_turn(&mut self, opening: Opening, turn: &TurnId) {
+        let message = match opening {
+            Opening::User(text) => {
+                self.emit(Event::TurnStarted { turn: turn.clone() });
+                Message::text(Role::User, text, self.now())
+            }
+            Opening::Wake(jobs) => {
+                self.emit(Event::WakeUp { turn: turn.clone(), jobs });
+                self.emit(Event::TurnStarted { turn: turn.clone() });
+                Message::text(Role::System, WAKE, self.now())
+            }
+        };
         self.record_message(turn, message, true).await;
         for _ in 0..self.config.max_steps {
             match self.step(turn).await {
@@ -368,6 +511,8 @@ impl Controller {
     /// follow together. That keeps the model's message whole in the history, which providers
     /// that sign their reasoning require (D-028).
     async fn step(&mut self, turn: &TurnId) -> Flow {
+        // Between steps, never between an action and its result: jobs that ended meanwhile.
+        self.give_ended(Some(turn), None).await;
         let context = self.build_context().await;
         let mut stream = match cancellable(&self.cancel, self.brain.think(context)).await {
             None => return Flow::Cancelled,
@@ -495,9 +640,15 @@ impl Controller {
         let (observation, flow) = match &verdict {
             Verdict::Allow => {
                 self.emit(Event::ActionStarted { turn: turn.clone(), action_id: request.id.clone() });
+                if let Action::Sandbox { action: SandboxAction::JobStop { job } } = &request.action {
+                    jobs::lock(&self.jobs).stopping(job);
+                }
                 match cancellable(&self.cancel, self.route(&request)).await {
                     None => (Observation::failed(request.id.clone(), INTERRUPTED), Flow::Cancelled),
-                    Some(Ok(observation)) => (observation, Flow::Continue),
+                    Some(Ok(observation)) => {
+                        self.watch_started(&request, &observation);
+                        (observation, Flow::Continue)
+                    }
                     Some(Err(message)) => {
                         self.emit(Event::Error { turn: Some(turn.clone()), message: message.clone() });
                         (Observation::failed(request.id.clone(), message), Flow::Finish)
@@ -510,6 +661,21 @@ impl Controller {
         };
         self.finish_action(turn, request, verdict, observation).await;
         flow
+    }
+
+    /// Watches a background job the agent just started (D-068); if it has already ended, its
+    /// end is taken now.
+    fn watch_started(&self, request: &ActionRequest, observation: &Observation) {
+        if let (
+            Action::Sandbox { action: SandboxAction::Exec { command, background: true, .. } },
+            Outcome::Started { job },
+        ) = (&request.action, &observation.outcome)
+        {
+            let early = jobs::lock(&self.jobs).started(job.clone(), command.clone());
+            if let Some(event) = early {
+                self.emit(event);
+            }
+        }
     }
 
     /// Sends an action to its executor. `Err` is an infrastructure failure, already in words.
@@ -602,5 +768,27 @@ impl Controller {
 
     fn emit(&self, event: Event) {
         self.events.emit(event);
+    }
+}
+
+/// The next sandbox event, or never once the stream has ended.
+async fn next_event(sandbox: &mut Option<futures::stream::BoxStream<'static, SandboxEvent>>) -> Option<SandboxEvent> {
+    match sandbox.as_mut() {
+        Some(stream) => match stream.next().await {
+            Some(event) => Some(event),
+            None => {
+                *sandbox = None;
+                None
+            }
+        },
+        None => std::future::pending().await,
+    }
+}
+
+/// Notes the end of a job the agent started, and tells the UI.
+fn observe(watch: &jobs::Shared, sink: &dyn EventSink, event: Option<SandboxEvent>) {
+    let Some(event) = event else { return };
+    if let Some(event) = jobs::lock(watch).observe(event) {
+        sink.emit(event);
     }
 }

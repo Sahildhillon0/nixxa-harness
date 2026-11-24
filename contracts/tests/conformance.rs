@@ -261,6 +261,8 @@ enum JobBug {
     UnknownJobSucceeds,
     /// `reset` leaves jobs running.
     ResetKeepsJobs,
+    /// `JobFinished` doesn't say how the job ended.
+    NoStatus,
 }
 
 #[derive(Default)]
@@ -279,7 +281,8 @@ impl MemJobs {
         if bug == Some(JobBug::NoEvents) {
             return;
         }
-        let event = SandboxEvent::JobFinished { job: job.clone(), exit_code, duration_ms: 0, truncated: false };
+        let status = if bug == Some(JobBug::NoStatus) { String::new() } else { format!("job {job} ended") };
+        let event = SandboxEvent::JobFinished { job: job.clone(), exit_code, duration_ms: 0, truncated: false, status };
         self.subscribers.retain(|tx| tx.unbounded_send(event.clone()).is_ok());
     }
 }
@@ -578,6 +581,37 @@ fn sandbox_suite_catches_reused_job_ids() {
 #[should_panic(expected = "never started must not succeed")]
 fn sandbox_suite_catches_an_unknown_job_succeeding() {
     block_on(conformance::sandbox::run(|| with_job_bug(JobBug::UnknownJobSucceeds)));
+}
+
+#[test]
+#[should_panic(expected = "say how the job ended")]
+fn sandbox_suite_catches_a_job_end_without_words() {
+    block_on(conformance::sandbox::run(|| with_job_bug(JobBug::NoStatus)));
+}
+
+#[test]
+fn a_job_end_recorded_before_its_words_still_loads() {
+    let old =
+        serde_json::json!({"event": "job_finished", "job": "j1", "exit_code": 0, "duration_ms": 5, "truncated": false});
+    let event: SandboxEvent = serde_json::from_value(old).unwrap();
+    assert!(matches!(event, SandboxEvent::JobFinished { status, .. } if status.is_empty()));
+}
+
+#[test]
+fn the_controllers_job_and_wake_up_events_round_trip() {
+    for event in [
+        Event::JobFinished {
+            job: JobId::new("j1"),
+            command: "cargo build".into(),
+            exit_code: None,
+            duration_ms: 3100,
+            status: "job j1 was lost: the sandbox stopped".into(),
+        },
+        Event::WakeUp { turn: TurnId::new("turn-3"), jobs: vec![JobId::new("j1"), JobId::new("j2")] },
+    ] {
+        let json = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&json).unwrap(), event, "{json}");
+    }
 }
 
 #[test]

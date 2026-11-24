@@ -1373,3 +1373,467 @@ async fn a_note_is_recorded_between_turns_never_inside_one() {
     let second = roles.iter().position(|(role, text)| *role == Role::User && text == "second");
     assert!(observation < note && note < second, "the note sits after the first turn: {roles:?}");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Background jobs: their ends told to the agent, and wake-ups (D-068)
+// ---------------------------------------------------------------------------------------------
+
+/// Runs background jobs that end when the test says; foreground commands echo.
+#[derive(Default)]
+struct JobSandbox {
+    /// Every background job fails at once: its end is sent before its `Started` is returned,
+    /// as when the real client reads the reply and the event together.
+    fails_at_once: bool,
+    next: Mutex<u32>,
+    commands: Mutex<Vec<(String, String)>>,
+    subscribers: Mutex<Vec<mpsc::UnboundedSender<nixxa_contracts::SandboxEvent>>>,
+}
+
+impl JobSandbox {
+    fn send(&self, event: nixxa_contracts::SandboxEvent) {
+        self.subscribers.lock().unwrap().retain(|tx| tx.send(event.clone()).is_ok());
+    }
+
+    /// Job `job` exits with `code`.
+    fn finish(&self, job: &str, code: i32) {
+        self.send(nixxa_contracts::SandboxEvent::JobFinished {
+            job: nixxa_contracts::JobId::new(job),
+            exit_code: Some(code),
+            duration_ms: 3100,
+            truncated: false,
+            status: format!("job {job} exited with code {code} after 3.1 s"),
+        });
+    }
+
+    /// Job `job` is lost with its sandbox.
+    fn lose(&self, job: &str) {
+        self.send(nixxa_contracts::SandboxEvent::JobFinished {
+            job: nixxa_contracts::JobId::new(job),
+            exit_code: None,
+            duration_ms: 1000,
+            truncated: false,
+            status: format!("job {job} was lost after 1.0 s: the sandbox stopped"),
+        });
+    }
+}
+
+#[async_trait]
+impl Sandbox for JobSandbox {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities { jobs: true, ..EchoSandbox.capabilities() }
+    }
+
+    async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
+        match action {
+            SandboxAction::Exec { command, background: true, .. } => {
+                let job = {
+                    let mut next = self.next.lock().unwrap();
+                    *next += 1;
+                    format!("j{next}")
+                };
+                self.commands.lock().unwrap().push((job.clone(), command));
+                if self.fails_at_once {
+                    self.finish(&job, 127);
+                    tokio::task::yield_now().await;
+                }
+                Ok(Observation::new(id, Outcome::Started { job: nixxa_contracts::JobId::new(job) }))
+            }
+            SandboxAction::JobStop { job } => {
+                self.send(nixxa_contracts::SandboxEvent::JobFinished {
+                    job: job.clone(),
+                    exit_code: None,
+                    duration_ms: 10,
+                    truncated: false,
+                    status: format!("job {job} was stopped after 0.0 s"),
+                });
+                Ok(Observation::new(id, Outcome::Text { content: format!("job {job} was stopped") }))
+            }
+            other => EchoSandbox.execute(id, other).await,
+        }
+    }
+
+    async fn health(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    fn subscribe(&self) -> futures::stream::BoxStream<'static, nixxa_contracts::SandboxEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.subscribers.lock().unwrap().push(tx);
+        Box::pin(futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|event| (event, rx)) }))
+    }
+}
+
+/// A controller over a [`JobSandbox`], waking at most `max_wakes` times in a row after
+/// `wake_delay`.
+async fn job_rig(
+    brain: Arc<ScriptedBrain>,
+    approvals: Arc<ScriptedApprovals>,
+    max_wakes: u32,
+    wake_delay: Duration,
+    max_steps: u32,
+) -> (Rig, Arc<JobSandbox>) {
+    job_rig_over(Arc::new(JobSandbox::default()), brain, approvals, max_wakes, wake_delay, max_steps).await
+}
+
+async fn job_rig_over(
+    sandbox: Arc<JobSandbox>,
+    brain: Arc<ScriptedBrain>,
+    approvals: Arc<ScriptedApprovals>,
+    max_wakes: u32,
+    wake_delay: Duration,
+    max_steps: u32,
+) -> (Rig, Arc<JobSandbox>) {
+    let store = Arc::new(MemoryStore::default());
+    let sink = Arc::new(RecordingSink::default());
+    let mut config = ControllerConfig::new(
+        WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir().join("nixxa-controller-test") },
+        AccountRef::new("scripted", "default"),
+        "Reply briefly.",
+    );
+    config.clock = || Timestamp(0);
+    config.max_wakes = max_wakes;
+    config.max_steps = max_steps;
+    config.wake_delay = wake_delay;
+    let mut controller = Controller::new(
+        brain.clone(),
+        sandbox.clone(),
+        store.clone(),
+        Arc::new(FakeKnowledge),
+        approvals.clone(),
+        sink.clone(),
+        config,
+    );
+    controller.start_session().await.expect("start session");
+    let (tx, rx) = mpsc::channel(8);
+    let task = tokio::spawn(async move { controller.run(rx).await });
+    (Rig { brain, approvals, store, sink, tx, task }, sandbox)
+}
+
+fn background(id: &str, command: &str) -> ActionRequest {
+    ActionRequest {
+        id: ActionId::new(id),
+        action: Action::Sandbox {
+            action: SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: None, background: true },
+        },
+        reason: None,
+    }
+}
+
+fn act(request: ActionRequest) -> Step {
+    step(vec![intent(Intent::Act { request })])
+}
+
+fn done(text: &str) -> Step {
+    step(vec![intent(Intent::Say { text: text.into() }), intent(Intent::Done { summary: text.into() })])
+}
+
+fn wake_ups(sink: &RecordingSink) -> Vec<Vec<nixxa_contracts::JobId>> {
+    sink.all()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::WakeUp { jobs, .. } => Some(jobs),
+            _ => None,
+        })
+        .collect()
+}
+
+/// System texts in the stored session, in order.
+fn system_texts(store: &MemoryStore) -> Vec<String> {
+    store
+        .record("s1")
+        .messages
+        .into_iter()
+        .filter_map(|m| match (m.role, m.content) {
+            (Role::System, Content::Text { text }) => Some(text),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How often `needle` appears in the messages of `context`.
+fn mentions(context: &Context, needle: &str) -> usize {
+    context.messages.iter().filter(|m| matches!(&m.content, Content::Text { text } if text.contains(needle))).count()
+}
+
+const J1_NOTE: &str = "Background job: job j1 exited with code 0 after 3.1 s (`cargo build`).";
+
+#[tokio::test]
+async fn a_job_the_agent_waits_on_wakes_it_once_with_the_sandboxs_words() {
+    let brain = ScriptedBrain::new(vec![act(background("a1", "cargo build")), done("building"), done("it built")]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(50), DEFAULT_MAX_STEPS).await;
+    rig.turn("build it in the background").await;
+    sandbox.finish("j1", 0);
+    rig.sink.wait(2, turn_done).await;
+    assert_eq!(wake_ups(&rig.sink), vec![vec![nixxa_contracts::JobId::new("j1")]]);
+    let finished = rig.sink.count(
+        |e| matches!(e, Event::JobFinished { job, command, exit_code: Some(0), .. } if job.as_str() == "j1" && command == "cargo build"),
+    );
+    assert_eq!(finished, 1, "the UI hears of it once");
+    // The wake turn's context: the opening, then the note, once.
+    let contexts = rig.brain.contexts();
+    let wake = contexts.last().unwrap();
+    assert_eq!(mentions(wake, "started without a message from the user"), 1);
+    assert_eq!(mentions(wake, J1_NOTE), 1, "{:#?}", wake.messages);
+    // Recorded as such, for a resumed session.
+    let texts = system_texts(&rig.store);
+    assert_eq!(texts.iter().filter(|t| t.contains("started without a message from the user")).count(), 1);
+    assert_eq!(texts.iter().filter(|t| t.contains(J1_NOTE)).count(), 1);
+    // Exactly once: no second wake.
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(wake_ups(&rig.sink).len(), 1);
+}
+
+#[tokio::test]
+async fn an_end_during_a_turn_goes_between_steps_never_between_an_action_and_its_result() {
+    let brain =
+        ScriptedBrain::new(vec![act(background("a1", "cargo build")), act(exec_request("a2", "echo hi")), done("ok")]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::holding(), 3, Duration::from_millis(50), DEFAULT_MAX_STEPS).await;
+    rig.say("build, then echo").await;
+    rig.approvals.wait_asked(1).await;
+    rig.approvals.release(Verdict::Allow);
+    rig.approvals.wait_asked(2).await;
+    // The job the agent is waiting on ends while the prompt for a2 is open: no wake, the turn
+    // goes on, nothing recorded yet.
+    sandbox.finish("j1", 0);
+    sleep(Duration::from_millis(150)).await;
+    assert!(wake_ups(&rig.sink).is_empty(), "never wake during a turn or an open approval");
+    assert_eq!(rig.sink.count(turn_done), 0, "the turn wasn't cut short");
+    rig.approvals.release(Verdict::Allow);
+    rig.sink.wait(1, turn_done).await;
+    let messages = rig.store.record("s1").messages;
+    let at = |want: &dyn Fn(&Message) -> bool| messages.iter().position(want).expect("in the history");
+    let action = at(&|m| matches!(&m.content, Content::Action { request } if request.id.as_str() == "a2"));
+    let result =
+        at(&|m| matches!(&m.content, Content::Observation { observation } if observation.action_id.as_str() == "a2"));
+    let note = at(&|m| matches!(&m.content, Content::Text { text } if text.contains("job j1 exited")));
+    assert_eq!(result, action + 1, "nothing between an action and its result");
+    assert!(note > result, "the note comes at the next step");
+    assert_eq!(mentions(rig.brain.contexts().last().unwrap(), "job j1 exited"), 1);
+    sleep(Duration::from_millis(150)).await;
+    assert!(wake_ups(&rig.sink).is_empty(), "told within the turn: no wake");
+}
+
+#[tokio::test]
+async fn net_requests_and_jobs_the_agent_did_not_start_never_wake_it() {
+    let brain = ScriptedBrain::new(vec![act(background("a1", "sleep 99")), done("started")]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(20), DEFAULT_MAX_STEPS).await;
+    rig.turn("start it").await;
+    let mut request = blocked_request();
+    request.job = Some(nixxa_contracts::JobId::new("j1"));
+    sandbox.send(nixxa_contracts::SandboxEvent::NetRequest(request));
+    // Another session's job, or a job nobody here started.
+    sandbox.finish("j7", 0);
+    sandbox.finish("2-j1", 0);
+    sleep(Duration::from_millis(200)).await;
+    assert!(wake_ups(&rig.sink).is_empty());
+    assert_eq!(rig.sink.count(|e| matches!(e, Event::JobFinished { .. })), 0);
+    assert!(system_texts(&rig.store).iter().all(|t| !t.contains("Background job")), "nothing noted");
+}
+
+#[tokio::test]
+async fn jobs_ending_close_together_give_one_wake_up() {
+    let brain = ScriptedBrain::new(vec![
+        step(vec![
+            intent(Intent::Act { request: background("a1", "cargo build") }),
+            intent(Intent::Act { request: background("a2", "cargo test") }),
+        ]),
+        done("both started"),
+        done("both done"),
+    ]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(150), DEFAULT_MAX_STEPS).await;
+    rig.turn("build and test").await;
+    sandbox.finish("j1", 0);
+    sleep(Duration::from_millis(40)).await;
+    sandbox.finish("j2", 1);
+    rig.sink.wait(2, turn_done).await;
+    sleep(Duration::from_millis(250)).await;
+    let ids = |names: &[&str]| names.iter().map(|n| nixxa_contracts::JobId::new(*n)).collect::<Vec<_>>();
+    assert_eq!(wake_ups(&rig.sink), vec![ids(&["j1", "j2"])], "one turn for both");
+    let wake = rig.brain.contexts().last().unwrap().clone();
+    assert_eq!(mentions(&wake, "job j1 exited with code 0"), 1);
+    assert_eq!(mentions(&wake, "job j2 exited with code 1"), 1);
+}
+
+#[tokio::test]
+async fn wake_ups_in_a_row_are_capped_until_the_user_writes() {
+    let brain = ScriptedBrain::new(vec![
+        act(background("a1", "step 1")),
+        done("1"),
+        act(background("a2", "step 2")),
+        done("2"),
+        act(background("a3", "step 3")),
+        done("3"),
+        done("after the user"),
+    ]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 2, Duration::from_millis(20), DEFAULT_MAX_STEPS).await;
+    rig.turn("loop").await;
+    sandbox.finish("j1", 0);
+    rig.sink.wait(2, turn_done).await;
+    sandbox.finish("j2", 0);
+    rig.sink.wait(3, turn_done).await;
+    sandbox.finish("j3", 0);
+    sleep(Duration::from_millis(200)).await;
+    assert_eq!(wake_ups(&rig.sink).len(), 2, "two in a row, no third");
+    assert_eq!(rig.sink.count(turn_done), 3);
+    let capped = system_texts(&rig.store);
+    let capped = capped.last().unwrap();
+    assert!(
+        capped.contains("job j3 exited") && capped.contains("No turn was started for this: 2 already were"),
+        "{capped}"
+    );
+    // The user writing resets the count.
+    rig.turn("carry on").await;
+    assert_eq!(rig.sink.count(turn_done), 4);
+}
+
+#[tokio::test]
+async fn a_user_message_cancels_a_pending_wake_and_the_note_goes_into_its_turn() {
+    let brain = ScriptedBrain::new(vec![act(background("a1", "cargo build")), done("started"), done("I see it built")]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(400), DEFAULT_MAX_STEPS).await;
+    rig.turn("build").await;
+    sandbox.finish("j1", 0);
+    sleep(Duration::from_millis(50)).await;
+    rig.turn("how did it go?").await;
+    sleep(Duration::from_millis(500)).await;
+    assert!(wake_ups(&rig.sink).is_empty(), "the user's message replaced the wake");
+    let context = rig.brain.contexts().last().unwrap().clone();
+    let user = context
+        .messages
+        .iter()
+        .position(|m| matches!(&m.content, Content::Text { text } if text == "how did it go?"))
+        .unwrap();
+    let note = context
+        .messages
+        .iter()
+        .position(|m| matches!(&m.content, Content::Text { text } if text.contains(J1_NOTE)))
+        .unwrap();
+    assert!(note > user, "the note goes into the user's turn, after their message");
+    assert_eq!(mentions(&context, J1_NOTE), 1);
+}
+
+#[tokio::test]
+async fn a_wake_up_turn_still_asks_and_keeps_to_the_step_cap() {
+    let brain = ScriptedBrain::new(vec![
+        act(background("a1", "cargo build")),
+        done("started"),
+        act(exec_request("a2", "cargo test")),
+        act(exec_request("a3", "cargo test")),
+        act(exec_request("a4", "never asked: past the step cap")),
+    ]);
+    let approvals = ScriptedApprovals::allowing();
+    let (rig, sandbox) = job_rig(brain, approvals.clone(), 3, Duration::from_millis(20), 2).await;
+    rig.turn("build").await;
+    let asked_before = approvals.asked.lock().unwrap().len();
+    sandbox.finish("j1", 0);
+    rig.sink.wait(2, turn_done).await;
+    let asked = approvals.asked.lock().unwrap().len() - asked_before;
+    assert_eq!(asked, 2, "Ask mode asks in a wake-up turn too, for each action within the step cap");
+    assert!(system_texts(&rig.store).iter().any(|t| t.contains("step budget")), "the per-turn cap holds");
+}
+
+#[tokio::test]
+async fn a_lost_job_wakes_the_agent_saying_so() {
+    let brain = ScriptedBrain::new(vec![act(background("a1", "cargo build")), done("started"), done("it was lost")]);
+    let (rig, sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(20), DEFAULT_MAX_STEPS).await;
+    rig.turn("build").await;
+    sandbox.lose("j1");
+    rig.sink.wait(2, turn_done).await;
+    assert_eq!(wake_ups(&rig.sink).len(), 1);
+    assert!(
+        rig.sink
+            .count(|e| matches!(e, Event::JobFinished { exit_code: None, status, .. } if status.contains("was lost")))
+            == 1
+    );
+    assert_eq!(mentions(rig.brain.contexts().last().unwrap(), "job j1 was lost after 1.0 s: the sandbox stopped"), 1);
+}
+
+#[tokio::test]
+async fn a_job_the_agent_stops_itself_never_wakes_it() {
+    let stop = ActionRequest {
+        id: ActionId::new("a2"),
+        action: Action::Sandbox { action: SandboxAction::JobStop { job: nixxa_contracts::JobId::new("j1") } },
+        reason: None,
+    };
+    let brain = ScriptedBrain::new(vec![act(background("a1", "sleep 99")), act(stop), done("stopped it")]);
+    let (rig, _sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(20), DEFAULT_MAX_STEPS).await;
+    rig.turn("start and stop").await;
+    sleep(Duration::from_millis(200)).await;
+    assert!(wake_ups(&rig.sink).is_empty());
+    assert_eq!(
+        system_texts(&rig.store).iter().filter(|t| t.contains("job j1 was stopped")).count(),
+        1,
+        "still noted once"
+    );
+}
+
+#[tokio::test]
+async fn jobs_that_were_running_are_said_lost_once_on_resume() {
+    let brain = ScriptedBrain::new(vec![act(background("a1", "cargo build")), done("started")]);
+    let (rig, _sandbox) =
+        job_rig(brain, ScriptedApprovals::allowing(), 3, Duration::from_millis(20), DEFAULT_MAX_STEPS).await;
+    rig.turn("build").await;
+    rig.tx.send(Command::Shutdown).await.unwrap();
+    rig.task.await.unwrap();
+    let store = rig.store.clone();
+    let resumed = Rig::resume(ScriptedBrain::new(vec![]), ScriptedApprovals::allowing(), store.clone(), "s1").await;
+    let said = |store: &MemoryStore| {
+        system_texts(store)
+            .iter()
+            .filter(|t| t.contains("job j1 didn't survive: Nixxa quit while it ran (`cargo build`)"))
+            .count()
+    };
+    assert_eq!(said(&store), 1);
+    resumed.tx.send(Command::Shutdown).await.unwrap();
+    resumed.task.await.unwrap();
+    let again = Rig::resume(ScriptedBrain::new(vec![]), ScriptedApprovals::allowing(), store.clone(), "s1").await;
+    assert_eq!(said(&store), 1, "said once, not at every resume");
+    drop(again);
+}
+
+#[tokio::test]
+async fn a_job_that_ends_before_its_start_is_heard_is_still_noted() {
+    // The review's probe: the end and the Started reply ready together, 20 times. The end is
+    // kept until the job is known; then the agent is told once, at the turn's next step or, if
+    // the end is heard only after the turn, in a wake-up. Before the fix it was dropped.
+    for run in 0..20 {
+        let brain =
+            ScriptedBrain::new(vec![act(background("a1", "cargo biuld")), done("started"), done("it failed at once")]);
+        let sandbox = Arc::new(JobSandbox { fails_at_once: true, ..JobSandbox::default() });
+        let (rig, _sandbox) = job_rig_over(
+            sandbox,
+            brain,
+            ScriptedApprovals::allowing(),
+            3,
+            Duration::from_millis(10),
+            DEFAULT_MAX_STEPS,
+        )
+        .await;
+        rig.turn("build it in the background").await;
+        let noted = |store: &MemoryStore| {
+            system_texts(store).iter().filter(|t| t.contains("job j1 exited with code 127")).count()
+        };
+        for _ in 0..200 {
+            if noted(&rig.store) > 0 {
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        sleep(Duration::from_millis(100)).await;
+        assert_eq!(noted(&rig.store), 1, "run {run}: the fast end must be noted once");
+        assert_eq!(rig.sink.count(|e| matches!(e, Event::JobFinished { exit_code: Some(127), .. })), 1, "run {run}");
+        let told = rig.brain.contexts().iter().filter(|c| mentions(c, "job j1 exited with code 127") > 0).count();
+        assert!(told >= 1, "run {run}: the agent is told");
+    }
+}

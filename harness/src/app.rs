@@ -18,6 +18,7 @@ use nixxa_brain::ModelInfo;
 use nixxa_contracts::{AccountInfo, AuthMethod, NetworkAccess, NetworkPolicy, SandboxEvent, Secret};
 
 use crate::network::{self, Mode, NetworkPanel, PanelKey};
+use crate::notify::{Alert, Channels, Finished, Notifications};
 use crate::place::{Place, PlacePicker};
 use crate::sessions::{ListKey, SessionList};
 use crate::setup::Setup;
@@ -86,6 +87,15 @@ pub(crate) struct Activity {
     pub(crate) observation: Option<Observation>,
     /// Approved by Auto mode rather than by the user.
     pub(crate) auto_approved: bool,
+}
+
+/// Something the activity pane shows between actions: not an action of the agent's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Happening {
+    /// A background job of the agent's ended.
+    JobEnded { job: nixxa_contracts::JobId, command: String, exit_code: Option<i32>, status: String },
+    /// The controller started a turn for these ended jobs.
+    WakeUp { jobs: Vec<nixxa_contracts::JobId> },
 }
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
@@ -184,6 +194,13 @@ pub(crate) struct App {
     pub(crate) network: NetworkPanel,
     /// The user's terminal (`ctrl+t`).
     pub(crate) terminal: TerminalPane,
+    /// Job ends and wake-ups, each with how many actions came before it (where it goes in the
+    /// activity pane).
+    pub(crate) happenings: Vec<(usize, Happening)>,
+    /// The badge, presence and alerts (D-069).
+    pub(crate) notifications: Notifications,
+    /// Whether the running turn was started by the controller for ended jobs.
+    woken: bool,
 }
 
 impl App {
@@ -221,7 +238,26 @@ impl App {
             sessions: None,
             network: NetworkPanel::default(),
             terminal: TerminalPane::default(),
+            happenings: Vec::new(),
+            notifications: Notifications::new(Channels::default(), Instant::now()),
+            woken: false,
         }
+    }
+
+    /// The host terminal window gained or lost focus.
+    pub(crate) fn focus_changed(&mut self, focused: bool) {
+        self.notifications.focus(focused);
+    }
+
+    /// Bells and desktop notifications to deliver now.
+    pub(crate) fn take_alerts(&mut self) -> Vec<Alert> {
+        self.notifications.take_alerts()
+    }
+
+    /// Something finished: the badge counts it; if the user is away, it alerts them.
+    fn finished(&mut self, what: Finished) {
+        let in_terminal = self.typing_in_terminal();
+        self.notifications.finished(&what, Instant::now(), in_terminal);
     }
 
     /// Asks where the agent should work. The places in `blocked` are shown with the reason and
@@ -445,6 +481,8 @@ impl App {
         self.streaming = None;
         self.queued.clear();
         self.activity.clear();
+        self.happenings.clear();
+        self.woken = false;
         self.selected = None;
         self.scroll_back = 0;
         self.approvals.clear();
@@ -460,6 +498,11 @@ impl App {
     /// Queues an approval prompt.
     pub(crate) fn ask(&mut self, prompt: PendingApproval) {
         self.approvals.push_back(prompt);
+    }
+
+    /// Whether the user chose an activity line (else the pane follows the newest).
+    pub(crate) fn selected_explicitly(&self) -> bool {
+        self.selected.is_some()
     }
 
     /// The index of the selected activity line.
@@ -537,7 +580,18 @@ impl App {
                 }
                 self.conversation.push(Entry { speaker: Speaker::Error, text: message });
             }
+            Event::JobFinished { job, command, exit_code, status, .. } => {
+                let what = Finished::Job { job: job.to_string(), exit_code, command: command.clone() };
+                self.happenings.push((self.activity.len(), Happening::JobEnded { job, command, exit_code, status }));
+                self.finished(what);
+            }
+            Event::WakeUp { jobs, .. } => {
+                self.woken = true;
+                self.happenings.push((self.activity.len(), Happening::WakeUp { jobs }));
+            }
             Event::TurnDone { .. } => {
+                let woken = std::mem::take(&mut self.woken);
+                self.finished(Finished::Turn { woken });
                 self.busy = false;
                 // Text streamed by a turn that never finished its message (interrupt, error).
                 if let Some(text) = self.streaming.take().filter(|t| !t.is_empty()) {
@@ -559,6 +613,7 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Vec::new();
         }
+        self.notifications.key(Instant::now());
         // Typing in the terminal: every key is the shell's (ctrl+c and ctrl+t too) but ctrl+],
         // which leaves it. Nothing typed there is approved or seen by the agent.
         if self.typing_in_terminal() && self.place.is_none() && self.setup.is_none() {
@@ -853,6 +908,67 @@ pub(crate) mod tests {
             "{noted:?}"
         );
         app
+    }
+
+    fn job_finished(job: &str, exit_code: Option<i32>, command: &str) -> Event {
+        Event::JobFinished {
+            job: nixxa_contracts::JobId::new(job),
+            command: command.into(),
+            exit_code,
+            duration_ms: 3100,
+            status: format!("job {job} exited after 3.1 s"),
+        }
+    }
+
+    fn delivered(app: &mut App) -> crate::notify::tests::FakeNotifier {
+        let mut fake = crate::notify::tests::FakeNotifier::default();
+        crate::notify::deliver(app.take_alerts(), &mut fake);
+        fake
+    }
+
+    #[test]
+    fn a_job_ending_while_the_user_is_here_only_counts_on_the_badge() {
+        let mut app = App::new(true);
+        app.apply(job_finished("j1", Some(0), "cargo build"));
+        let fake = delivered(&mut app);
+        assert_eq!((fake.bells, fake.desktop.len()), (0, 0), "present: no bell, no desktop");
+        assert_eq!(app.notifications.unseen, 1);
+        assert!(matches!(&app.happenings[..], [(0, Happening::JobEnded { exit_code: Some(0), .. })]));
+        app.handle_key(key(KeyCode::Char('x')));
+        assert_eq!(app.notifications.unseen, 0, "seen once the user presses a key");
+    }
+
+    #[test]
+    fn away_the_channels_fire_and_a_wake_up_turn_says_so() {
+        let mut app = App::new(true);
+        app.focus_changed(false);
+        app.apply(job_finished("j1", Some(2), "cargo test \u{1b}]0;x\u{7}"));
+        let fake = delivered(&mut app);
+        assert_eq!(
+            fake.desktop,
+            vec![("Nixxa".to_string(), "job j1 failed (exit 2): cargo test ^[]0;x^G".to_string())]
+        );
+        assert_eq!(fake.bells, 1);
+        app.apply(Event::WakeUp { turn: turn(), jobs: vec![nixxa_contracts::JobId::new("j1")] });
+        app.apply(Event::TurnStarted { turn: turn() });
+        app.apply(Event::TurnDone { turn: turn() });
+        let fake = delivered(&mut app);
+        assert_eq!(fake.desktop[0].1, "the agent finished the turn a job woke it for");
+        app.apply(Event::TurnStarted { turn: turn() });
+        app.apply(Event::TurnDone { turn: turn() });
+        assert_eq!(delivered(&mut app).desktop[0].1, "the agent finished its turn", "only that turn was a wake-up");
+        assert_eq!(app.notifications.unseen, 3);
+        assert!(matches!(app.happenings[1].1, Happening::WakeUp { .. }));
+    }
+
+    #[test]
+    fn typing_in_the_terminal_counts_as_away() {
+        let mut app = typing();
+        app.apply(job_finished("j1", Some(0), "cargo build"));
+        assert_eq!(delivered(&mut app).desktop.len(), 1);
+        app.handle_key(ctrl(']'));
+        app.apply(job_finished("j2", Some(0), "cargo build"));
+        assert_eq!(delivered(&mut app).desktop.len(), 0, "back in the app: present");
     }
 
     #[test]

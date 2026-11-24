@@ -4,7 +4,9 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event as TermEvent, EventStream,
+};
 use futures::StreamExt;
 use nixxa_contracts::{
     AccountRef, Brain, OpenTerminal, Sandbox, SessionId, Store, TerminalEvent, TerminalSize, WorkspaceInfo,
@@ -244,6 +246,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     let workspace = wiring::workspace(&std::env::current_dir()?);
     let color = std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
     let mut app = App::new(color);
+    app.notifications.channels = settings.notify;
     // Asked on every launch; no session starts until it is answered.
     app.directory = workspace.root.display().to_string();
     app.root = workspace.root.clone();
@@ -314,7 +317,10 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
 
     // `init` enters raw mode and the alternate screen and restores them on panic.
     let mut terminal = ratatui::init();
-    let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
+    // Focus reporting tells whether the user is looking (D-069); terminals without it never say
+    // they lost focus, and then only the idle time counts.
+    let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    let mut notifier = crate::notify::SystemNotifier;
     let mut keys = EventStream::new();
     let result = loop {
         if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
@@ -328,6 +334,14 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
             input = keys.next() => match input {
                 Some(Ok(TermEvent::Key(key))) => app.handle_key(key),
                 Some(Ok(TermEvent::Paste(text))) => app.paste(&text),
+                Some(Ok(TermEvent::FocusGained)) => {
+                    app.focus_changed(true);
+                    Vec::new()
+                }
+                Some(Ok(TermEvent::FocusLost)) => {
+                    app.focus_changed(false);
+                    Vec::new()
+                }
                 Some(Ok(_)) => Vec::new(),
                 Some(Err(err)) => break Err(err),
                 None => break Ok(()),
@@ -433,6 +447,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                 produced
             }
         };
+        crate::notify::deliver(app.take_alerts(), &mut notifier);
         let mut quit = false;
         for effect in effects {
             match effect {
@@ -655,7 +670,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
             logging::event(&event);
         }
     }
-    let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste);
+    let _ = crossterm::execute!(io::stdout(), DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
     if let Some(copy) = workplace.as_ref().and_then(|w| w.copy.as_ref()) {
         println!("nixxa: the copy the agent worked on is at {}", copy.display());

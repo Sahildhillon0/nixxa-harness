@@ -126,6 +126,10 @@ pub enum SandboxEvent {
         duration_ms: u64,
         /// Whether output was dropped (only the last part of each stream is kept).
         truncated: bool,
+        /// How it ended, in the sandbox's words, the same the job actions answer with, e.g.
+        /// "job j1 exited with code 0 after 3.1 s" or "job j1 was lost: the sandbox stopped".
+        #[serde(default)]
+        status: String,
     },
     /// A command made a network request through the sandbox's proxy.
     NetRequest(NetRequest),
