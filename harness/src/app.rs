@@ -21,6 +21,8 @@ use crate::network::{self, Mode, NetworkPanel, PanelKey};
 use crate::place::{Place, PlacePicker};
 use crate::sessions::{ListKey, SessionList};
 use crate::setup::Setup;
+use crate::terminal::{self, PaneKey, TerminalPane};
+use nixxa_contracts::TerminalSize;
 
 /// How long a first ctrl-c waits for a second one to quit.
 const QUIT_WINDOW: Duration = Duration::from_secs(2);
@@ -33,14 +35,18 @@ pub(crate) enum Focus {
     Input,
     Conversation,
     Activity,
+    /// The terminal pane (`ctrl+t`): typing into the shell, or its own keys after `ctrl+]`.
+    Terminal,
 }
 
 impl Focus {
-    fn next(self) -> Self {
+    /// The next pane `tab` goes to; the terminal only while it is shown.
+    fn next(self, terminal: bool) -> Self {
         match self {
             Self::Input => Self::Conversation,
             Self::Conversation => Self::Activity,
-            Self::Activity => Self::Input,
+            Self::Activity if terminal => Self::Terminal,
+            Self::Activity | Self::Terminal => Self::Input,
         }
     }
 }
@@ -120,6 +126,11 @@ pub(crate) enum Effect {
     SetNetwork(nixxa_contracts::NetworkPolicy),
     /// End the running session (it is already saved) and continue this stored one.
     Resume(SessionId),
+    /// Open the user's terminal in the sandbox, at this size (`ctrl+t`).
+    OpenTerminal(TerminalSize),
+    /// Bytes for the terminal's shell: what the user typed or pasted there. Never approved,
+    /// never sent to the agent.
+    TerminalInput(Vec<u8>),
 }
 
 /// Everything the TUI shows.
@@ -171,6 +182,8 @@ pub(crate) struct App {
     pub(crate) sessions: Option<SessionList>,
     /// The network settings (`ctrl+n`) and the recent requests.
     pub(crate) network: NetworkPanel,
+    /// The user's terminal (`ctrl+t`).
+    pub(crate) terminal: TerminalPane,
 }
 
 impl App {
@@ -207,6 +220,7 @@ impl App {
             root: PathBuf::new(),
             sessions: None,
             network: NetworkPanel::default(),
+            terminal: TerminalPane::default(),
         }
     }
 
@@ -300,15 +314,106 @@ impl App {
         }
     }
 
-    /// Pasted text (bracketed paste): into the setup screen when it is open, else the input.
-    pub(crate) fn paste(&mut self, text: &str) {
+    /// Pasted text (bracketed paste): into the setup screen when it is open, the terminal while
+    /// the user types in it, else the input.
+    pub(crate) fn paste(&mut self, text: &str) -> Vec<Effect> {
         if self.place.is_some() {
-            return;
+            return Vec::new();
         }
         if let Some(setup) = self.setup.as_mut() {
             setup.paste(text);
+        } else if self.typing_in_terminal() {
+            if self.terminal.state == terminal::State::Open {
+                return vec![Effect::TerminalInput(self.terminal.paste_bytes(text))];
+            }
         } else if self.approvals.is_empty() && self.focus == Focus::Input {
             self.input.push_str(&text.replace("\r\n", "\n").replace('\r', "\n"));
+        }
+        Vec::new()
+    }
+
+    /// Whether keys go to the terminal's shell.
+    pub(crate) fn typing_in_terminal(&self) -> bool {
+        self.focus == Focus::Terminal && self.terminal.shown && self.terminal.typing
+    }
+
+    /// `ctrl+t`: shows the terminal (opening one if none is running) and types into it, or puts
+    /// the details pane back. The terminal keeps running while hidden.
+    fn toggle_terminal(&mut self) -> Vec<Effect> {
+        if self.terminal.shown {
+            self.terminal.shown = false;
+            self.terminal.share = None;
+            if self.focus == Focus::Terminal {
+                self.focus = Focus::Input;
+            }
+            // The next ctrl+t opens a new one.
+            if matches!(self.terminal.state, terminal::State::Ended(_)) {
+                self.terminal.state = terminal::State::Closed;
+            }
+            return Vec::new();
+        }
+        self.terminal.shown = true;
+        self.focus = Focus::Terminal;
+        self.terminal.scroll_to_bottom();
+        if self.terminal.is_live() {
+            self.terminal.typing = self.terminal.state == terminal::State::Open;
+            return Vec::new();
+        }
+        self.terminal.typing = true;
+        vec![Effect::OpenTerminal(self.terminal.opening())]
+    }
+
+    /// The terminal opened, or why not (said, never worked around: D-051).
+    pub(crate) fn terminal_opened(&mut self, result: Result<(), String>) -> Vec<Effect> {
+        match result {
+            Ok(()) => {
+                self.terminal.opened();
+                let place = if self.here { "in this directory" } else { "in the sandbox" };
+                vec![Effect::Send(Command::Note(format!(
+                    "The user opened a terminal {place}: their own shell, in the same place as your commands. \
+                     You don't see it unless they share part of it."
+                )))]
+            }
+            Err(why) => {
+                self.terminal.ended(format!("it couldn't open: {why}"));
+                self.notice = Some(format!("The terminal couldn't open: {why}"));
+                Vec::new()
+            }
+        }
+    }
+
+    /// Output from the terminal's shell.
+    pub(crate) fn terminal_output(&mut self, bytes: &[u8]) {
+        self.terminal.feed(bytes);
+    }
+
+    /// The terminal ended. Recorded in the session (that it closed, never what was in it).
+    pub(crate) fn terminal_closed(&mut self, reason: String) -> Vec<Effect> {
+        let was_open = self.terminal.state == terminal::State::Open;
+        self.terminal.ended(reason.clone());
+        if was_open {
+            self.notice = Some(format!("The terminal closed: {reason}. ctrl+t hides it; then ctrl+t opens a new one."));
+            vec![Effect::Send(Command::Note(format!("The user's terminal closed ({reason}).")))]
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// The terminal pane's own keys (focused, not typing).
+    fn terminal_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match self.terminal.pane_key(key) {
+            PaneKey::Send(bytes) => vec![Effect::TerminalInput(bytes)],
+            PaneKey::Share(text) => {
+                if !self.input.is_empty() && !self.input.ends_with('\n') {
+                    self.input.push('\n');
+                }
+                self.input.push_str(&text);
+                self.focus = Focus::Input;
+                self.notice =
+                    Some("The terminal's lines are in your message: edit it as you like; enter sends it.".into());
+                Vec::new()
+            }
+            PaneKey::Nothing | PaneKey::NotMine => Vec::new(),
         }
     }
 
@@ -454,6 +559,19 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Vec::new();
         }
+        // Typing in the terminal: every key is the shell's (ctrl+c and ctrl+t too) but ctrl+],
+        // which leaves it. Nothing typed there is approved or seen by the agent.
+        if self.typing_in_terminal() && self.place.is_none() && self.setup.is_none() {
+            self.last_ctrl_c = None;
+            if terminal::is_leave(key) {
+                self.terminal.typing = false;
+                return Vec::new();
+            }
+            if self.terminal.state != terminal::State::Open {
+                return Vec::new();
+            }
+            return self.terminal.key_bytes(key).map(|bytes| vec![Effect::TerminalInput(bytes)]).unwrap_or_default();
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             return self.ctrl_c();
         }
@@ -483,6 +601,11 @@ impl App {
             self.network.error = None;
             return Vec::new();
         }
+        // Over an approval prompt too: the terminal may be where the user checks before
+        // answering. Its keys never answer the prompt.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            return self.toggle_terminal();
+        }
         if self.approval().is_some() {
             if key.code == KeyCode::BackTab {
                 self.toggle_mode(Instant::now());
@@ -501,12 +624,18 @@ impl App {
             return vec![Effect::ListSessions];
         }
         match key.code {
-            KeyCode::Tab => self.focus = self.focus.next(),
+            KeyCode::Tab if self.terminal.share.is_none() => {
+                self.focus = self.focus.next(self.terminal.shown);
+                if self.focus == Focus::Terminal {
+                    self.terminal.typing = false;
+                }
+            }
             KeyCode::BackTab => self.toggle_mode(Instant::now()),
             _ => match self.focus {
                 Focus::Input => return self.edit_input(key),
                 Focus::Conversation => self.scroll_conversation(key.code),
                 Focus::Activity => self.move_selection(key.code),
+                Focus::Terminal => return self.terminal_key(key),
             },
         }
         Vec::new()
@@ -701,6 +830,140 @@ pub(crate) mod tests {
 
     fn ctrl(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn input(effects: &[Effect]) -> Vec<u8> {
+        effects
+            .iter()
+            .flat_map(|effect| match effect {
+                Effect::TerminalInput(bytes) => bytes.clone(),
+                other => panic!("only terminal input expected, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// An app with an open terminal the user is typing in.
+    fn typing() -> App {
+        let mut app = App::new(true);
+        let opened = app.handle_key(ctrl('t'));
+        assert!(matches!(opened.as_slice(), [Effect::OpenTerminal(_)]), "{opened:?}");
+        let noted = app.terminal_opened(Ok(()));
+        assert!(
+            matches!(noted.as_slice(), [Effect::Send(Command::Note(note))] if note.contains("opened a terminal")),
+            "{noted:?}"
+        );
+        app
+    }
+
+    #[test]
+    fn in_the_terminal_every_key_goes_to_the_shell_but_ctrl_bracket() {
+        let mut app = App::new(true);
+        assert_eq!(app.handle_key(ctrl('t')), vec![Effect::OpenTerminal(TerminalSize { cols: 80, rows: 24 })]);
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.handle_key(key(KeyCode::Char('a'))).is_empty(), "nothing goes anywhere before it is open");
+        app.terminal_opened(Ok(()));
+        let keys = [
+            key(KeyCode::Char('l')),
+            ctrl('c'),
+            ctrl('c'),
+            ctrl('t'),
+            ctrl('n'),
+            ctrl('s'),
+            ctrl('a'),
+            key(KeyCode::Tab),
+            key(KeyCode::BackTab),
+            key(KeyCode::Esc),
+            key(KeyCode::Enter),
+        ];
+        let mut sent = Vec::new();
+        for k in keys {
+            sent.extend(input(&app.handle_key(k)));
+        }
+        assert_eq!(sent, b"l\x03\x03\x14\x0e\x13\x01\t\x1b[Z\x1b\r");
+        assert!(!app.network.open && app.sessions.is_none() && app.setup.is_none(), "no shortcut fired");
+        assert_eq!(app.mode, ApprovalMode::Ask, "shift-tab went to the shell");
+        assert_eq!(app.focus, Focus::Terminal);
+        assert!(app.input.is_empty() && app.conversation.is_empty(), "nothing typed reached the conversation");
+        assert_eq!(input(&app.paste("ls\nls -a")), b"ls\rls -a");
+
+        // ctrl+] leaves; the pane's own keys and the app's shortcuts work again.
+        assert!(app.handle_key(ctrl(']')).is_empty());
+        assert!(!app.terminal.typing);
+        assert!(app.handle_key(key(KeyCode::Char('x'))).is_empty());
+        assert!(app.paste("not for the shell").is_empty());
+        assert!(app.handle_key(ctrl('t')).is_empty(), "hides it; it keeps running");
+        assert!(!app.terminal.shown && app.focus == Focus::Input);
+        assert!(app.handle_key(ctrl('t')).is_empty(), "shows it again: no second terminal");
+        assert!(app.terminal.typing && app.focus == Focus::Terminal);
+        // ctrl+] twice sends ctrl+] (vim's tag jump).
+        app.handle_key(ctrl(']'));
+        assert_eq!(input(&app.handle_key(ctrl(']'))), vec![0x1d]);
+        assert!(app.terminal.typing);
+    }
+
+    #[test]
+    fn typing_in_the_terminal_never_answers_an_approval() {
+        let mut app = typing();
+        let (prompt, mut answer) = PendingApproval::for_test(request("a1"), "exec asks first");
+        app.ask(prompt);
+        for c in ['y', 'Y', 'n'] {
+            assert_eq!(input(&app.handle_key(key(KeyCode::Char(c)))), c.to_string().into_bytes());
+        }
+        assert!(answer.try_recv().is_err(), "the prompt is still waiting");
+        app.handle_key(ctrl(']'));
+        app.handle_key(key(KeyCode::Char('y')));
+        assert_eq!(answer.try_recv(), Ok(Verdict::Allow), "answered once the user left the terminal");
+    }
+
+    #[test]
+    fn tab_reaches_the_terminal_only_while_it_is_shown() {
+        let mut app = App::new(true);
+        for want in [Focus::Conversation, Focus::Activity, Focus::Input] {
+            app.handle_key(key(KeyCode::Tab));
+            assert_eq!(app.focus, want);
+        }
+        let mut app = typing();
+        app.handle_key(ctrl(']'));
+        for want in [Focus::Input, Focus::Conversation, Focus::Activity, Focus::Terminal] {
+            app.handle_key(key(KeyCode::Tab));
+            assert_eq!(app.focus, want);
+        }
+        assert!(!app.terminal.typing, "tab into the pane, not into the shell");
+        app.handle_key(key(KeyCode::Char('i')));
+        assert!(app.typing_in_terminal());
+    }
+
+    #[test]
+    fn the_terminal_ending_is_recorded_and_ctrl_t_then_opens_a_new_one() {
+        let mut app = typing();
+        let closed = app.terminal_closed("the shell exited".into());
+        assert_eq!(closed, vec![Effect::Send(Command::Note("The user's terminal closed (the shell exited).".into()))]);
+        assert!(!app.terminal.typing);
+        assert!(app.handle_key(key(KeyCode::Char('l'))).is_empty(), "nothing to type into");
+        assert!(app.handle_key(ctrl('t')).is_empty(), "hides the closed one");
+        assert!(matches!(app.handle_key(ctrl('t')).as_slice(), [Effect::OpenTerminal(_)]), "then opens a new one");
+    }
+
+    #[test]
+    fn a_terminal_that_cannot_open_says_why() {
+        let mut app = App::new(true);
+        app.handle_key(ctrl('t'));
+        assert!(app.terminal_opened(Err("this sandbox has no terminal".into())).is_empty());
+        assert!(app.notice.as_deref().is_some_and(|n| n.contains("this sandbox has no terminal")), "{:?}", app.notice);
+        assert!(matches!(&app.terminal.state, crate::terminal::State::Ended(why) if why.contains("no terminal")));
+        assert!(app.terminal_closed("late".into()).is_empty(), "nothing to record: it never opened");
+    }
+
+    #[test]
+    fn sharing_puts_the_lines_in_the_message_and_sends_nothing() {
+        let mut app = typing();
+        app.terminal_output(b"$ cargo test\r\nerror: 1 failed\r\n$ ");
+        app.input = "why does this fail?".into();
+        app.handle_key(ctrl(']'));
+        assert!(app.handle_key(key(KeyCode::Char('s'))).is_empty());
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "nothing is sent");
+        assert_eq!(app.input, "why does this fail?\nFrom my terminal:\n```\n$ cargo test\nerror: 1 failed\n```\n");
+        assert_eq!(app.focus, Focus::Input, "the user edits it, then sends it");
     }
 
     #[test]
@@ -1053,6 +1316,7 @@ pub(crate) mod tests {
                 isolated: false,
                 network: NetworkAccess::default(),
                 jobs: false,
+                terminal: true,
                 actions: Vec::new(),
             },
         });
@@ -1077,6 +1341,7 @@ pub(crate) mod tests {
                 isolated: true,
                 network: NetworkAccess::default(),
                 jobs: true,
+                terminal: true,
                 actions: Vec::new(),
             },
         });

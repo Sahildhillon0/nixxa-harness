@@ -17,6 +17,7 @@ mod safe;
 mod sessions;
 mod settings;
 mod setup;
+mod terminal;
 mod tui;
 mod ui;
 mod wiring;

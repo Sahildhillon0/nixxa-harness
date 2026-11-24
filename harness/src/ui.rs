@@ -15,6 +15,7 @@ use crate::network::{self, Mode};
 use crate::safe;
 use crate::sessions::ago;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
+use crate::terminal::State as TermState;
 use nixxa_sandbox::network::PRESETS;
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
@@ -63,25 +64,47 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
 
     frame.render_widget(Paragraph::new(status_line(app, theme)), status);
 
-    let side = if body.width >= WIDE {
+    let wide = body.width >= WIDE;
+    let terminal_focused = app.focus == Focus::Terminal && app.terminal.shown;
+    let (left, side) = if wide {
         let [left, right] = Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(body);
         draw_conversation(frame, app, theme, left);
-        right
-    } else if app.focus == Focus::Activity {
-        body
+        (left, right)
+    } else if app.focus == Focus::Activity || terminal_focused {
+        (Rect::default(), body)
     } else {
         draw_conversation(frame, app, theme, body);
-        Rect::default()
+        (body, Rect::default())
     };
     if side.area() > 0 {
-        let [list, detail] = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(side);
-        draw_activity(frame, app, theme, list);
-        draw_detail(frame, app, theme, detail);
+        if !wide && terminal_focused {
+            // One column: the terminal gets all of it.
+            draw_terminal(frame, app, theme, side);
+        } else if app.terminal.shown {
+            // The terminal replaces the details pane, with more room than it had.
+            let [list, lower] = Layout::vertical([Constraint::Percentage(30), Constraint::Percentage(70)]).areas(side);
+            draw_activity(frame, app, theme, list);
+            draw_terminal(frame, app, theme, lower);
+        } else {
+            let [list, detail] = Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(side);
+            draw_activity(frame, app, theme, list);
+            draw_detail(frame, app, theme, detail);
+        }
     }
 
     draw_input(frame, app, theme, input);
     frame.render_widget(Paragraph::new(hint_line(app, theme, hints.width)), hints);
-    draw_approval(frame, app, theme, if side.area() > 0 { side } else { body });
+    // An approval prompt never covers the terminal the user is in: over the conversation when
+    // there is one beside it, else only in the hint bar.
+    let prompt_over = match (terminal_focused, wide) {
+        (true, true) => left,
+        (true, false) => Rect::default(),
+        (false, _) if side.area() > 0 => side,
+        (false, _) => body,
+    };
+    if prompt_over.area() > 0 {
+        draw_approval(frame, app, theme, prompt_over);
+    }
     draw_setup(frame, app, theme, body);
     draw_sessions(frame, app, theme, body);
     draw_network(frame, app, theme, body);
@@ -123,6 +146,11 @@ fn status_line(app: &App, theme: Theme) -> Line<'static> {
             }
         };
         part(&mut spans, network::status(&caps.network), style);
+    }
+    match app.terminal.state {
+        TermState::Open => part(&mut spans, "terminal ●".into(), theme.ok()),
+        TermState::Opening => part(&mut spans, "terminal …".into(), theme.pending()),
+        TermState::Closed | TermState::Ended(_) => {}
     }
     if !app.sources.is_empty() {
         spans.push(Span::raw(" ─"));
@@ -310,6 +338,35 @@ fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }).block(block), area);
 }
 
+/// The user's terminal, in place of the details pane: the emulator's cells, sized to the pane.
+fn draw_terminal(frame: &mut Frame, app: &mut App, theme: Theme, area: Rect) {
+    let focused = app.focus == Focus::Terminal;
+    let title = match &app.terminal.state {
+        TermState::Opening => "Terminal: starting…".to_string(),
+        TermState::Ended(why) => format!("Terminal: closed: {}", safe::line(why)),
+        _ if app.terminal.share.is_some() => "Terminal: choose the lines to share".to_string(),
+        _ if focused && app.terminal.typing => "Terminal: typing · ctrl+] leaves".to_string(),
+        _ => "Terminal".to_string(),
+    };
+    let block = pane(&title, focused, theme);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    app.terminal.layout(inner);
+    app.terminal.render(frame.buffer_mut(), inner, theme.color);
+    let back = app.terminal.scrolled();
+    if back > 0 && inner.width > 0 {
+        let note = format!(" ↑ {back} lines back · End returns ");
+        let width = u16::try_from(note.chars().count()).unwrap_or(u16::MAX).min(inner.width);
+        let corner = Rect { x: inner.right() - width, y: inner.y, width, height: 1 };
+        frame.render_widget(Paragraph::new(Line::styled(note, theme.pending())), corner);
+    }
+    if focused {
+        if let Some(position) = app.terminal.cursor(inner) {
+            frame.set_cursor_position(position);
+        }
+    }
+}
+
 fn draw_input(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     let block = pane("Message", app.focus == Focus::Input, theme);
     let inner = block.inner(area);
@@ -358,6 +415,14 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         "type a host, *.domain or an IP, with :port if not 443/80 · enter add · esc cancel".to_string()
     } else if app.network.open {
         "1 off · 2 allow · 3 open · ↑/↓ choose · space preset on/off · a add host · d remove · esc close".to_string()
+    } else if app.typing_in_terminal() {
+        if app.approval().is_some() {
+            "an action waits for you: ctrl+] then y/n · until then every key goes to the shell".to_string()
+        } else {
+            "typing in the terminal: every key goes to the shell · ctrl+] leaves".to_string()
+        }
+    } else if app.focus == Focus::Terminal && app.terminal.share.is_some() {
+        "↑/↓ first line · shift-↑/↓ last line · a all · enter put in the message · esc cancel".to_string()
     } else if app.approval().is_some() {
         match &app.notice {
             Some(notice) if app.confirming_auto(std::time::Instant::now()) => safe::line(notice),
@@ -365,10 +430,13 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         }
     } else if let Some(notice) = &app.notice {
         safe::line(notice)
+    } else if app.focus == Focus::Terminal {
+        "i type · ↑/↓ pgup/pgdn scroll · s share with the agent · ctrl-t details · tab focus · ctrl+] twice sends ctrl+]"
+            .to_string()
     } else {
         let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
         format!(
-            "enter send · tab focus · shift-tab ask/auto · ctrl-n network · ctrl-s sessions{key} · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
+            "enter send · tab focus · shift-tab ask/auto · ctrl-t terminal · ctrl-n network · ctrl-s sessions{key} · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
         )
     };
     let auto = app.mode == ApprovalMode::Auto;
@@ -902,7 +970,7 @@ fn truncate(text: &str, max: usize) -> String {
 pub(crate) mod tests {
     use nixxa_contracts::{
         AccountRef, ActionId, BrainInfo, Event, Message, Observation, ProviderId, Role, SandboxActionKind,
-        SandboxCapabilities, SessionId, SourceId, SourceInfo, Timestamp, TurnId,
+        SandboxCapabilities, SessionId, SourceId, SourceInfo, TerminalSize, Timestamp, TurnId,
     };
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -967,6 +1035,7 @@ pub(crate) mod tests {
                 isolated: false,
                 network: NetworkAccess::Controlled(NetworkPolicy::Off),
                 jobs: false,
+                terminal: true,
                 actions: SandboxActionKind::ALL.to_vec(),
             },
         });
@@ -1087,6 +1156,78 @@ pub(crate) mod tests {
         let screen = screen(&mut app, 120, 30);
         assert!(screen.contains("The network isn't restricted here."), "{screen}");
         assert!(!screen.contains("Mode"), "no modes to choose from:\n{screen}");
+    }
+
+    fn ctrl(c: char) -> crossterm::event::KeyEvent {
+        crossterm::event::KeyEvent::new(KeyCode::Char(c), crossterm::event::KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn the_terminal_replaces_the_details_and_is_resized_with_every_layout() {
+        let mut app = started();
+        app.handle_key(ctrl('t'));
+        app.terminal_opened(Ok(()));
+        app.terminal_output(b"sandbox:/workspace$ ");
+        let wide = screen(&mut app, 150, 40);
+        assert!(wide.contains("Terminal: typing") && wide.contains("sandbox:/workspace$"), "{wide}");
+        assert!(!wide.contains("Detail") && wide.contains("terminal ●"), "{wide}");
+        // The right column (45%), the lower 70% of it, inside the borders.
+        assert_eq!(app.terminal.take_resize(), Some(TerminalSize { cols: 65, rows: 22 }));
+        screen(&mut app, 150, 40);
+        assert_eq!(app.terminal.take_resize(), None, "unchanged");
+        // One column: the terminal takes the whole body while it has focus.
+        let narrow = screen(&mut app, 90, 30);
+        assert!(narrow.contains("Terminal") && !narrow.contains("Conversation"), "{narrow}");
+        assert_eq!(app.terminal.take_resize(), Some(TerminalSize { cols: 88, rows: 23 }));
+        // Without focus it isn't drawn there, and keeps its size.
+        app.handle_key(ctrl(']'));
+        app.handle_key(key(KeyCode::Tab));
+        screen(&mut app, 90, 30);
+        assert_eq!(app.terminal.take_resize(), None);
+    }
+
+    #[test]
+    fn terminal_output_reaches_the_screen_only_as_safe_cells() {
+        let mut app = started();
+        app.handle_key(ctrl('t'));
+        app.terminal_opened(Ok(()));
+        app.terminal_output(b"\x1b]52;c;c2VjcmV0\x07\x1b]0;pwned\x07\x07\x1b[?1049h\x1b[2J");
+        app.terminal_output("shown \u{202E}txt.exe\r\n\x1b]8;;http://x.example/\x1b\\click\x1b]8;;\x1b\\".as_bytes());
+        let shown = screen(&mut app, 150, 40);
+        assert!(shown.contains("shown") && shown.contains("click"), "{shown}");
+        for hidden in ["c2VjcmV0", "pwned", "x.example", "\u{202E}", "\u{1b}", "\u{7}"] {
+            assert!(!shown.contains(hidden), "{hidden:?} reached the screen");
+        }
+    }
+
+    #[test]
+    fn an_approval_never_covers_the_terminal_being_typed_in() {
+        let mut app = started();
+        app.handle_key(ctrl('t'));
+        app.terminal_opened(Ok(()));
+        app.terminal_output(b"prompt$ ");
+        let (prompt, _answer) = crate::ports::PendingApproval::for_test(
+            nixxa_contracts::ActionRequest {
+                id: ActionId::new("a"),
+                action: nixxa_contracts::Action::Sandbox {
+                    action: nixxa_contracts::SandboxAction::Exec {
+                        command: "rm -rf build".into(),
+                        cwd: None,
+                        timeout_ms: None,
+                        background: false,
+                    },
+                },
+                reason: None,
+            },
+            "exec asks first",
+        );
+        app.ask(prompt);
+        let wide = screen(&mut app, 150, 40);
+        assert!(wide.contains("Approve action?") && wide.contains("prompt$"), "{wide}");
+        assert!(wide.contains("an action waits for you"), "{wide}");
+        let narrow = screen(&mut app, 90, 30);
+        assert!(!narrow.contains("Approve action?") && narrow.contains("prompt$"), "{narrow}");
+        assert!(narrow.contains("an action waits for you"), "{narrow}");
     }
 
     #[test]

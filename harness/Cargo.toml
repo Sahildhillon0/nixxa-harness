@@ -25,6 +25,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "sync", "time"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true }
+# The terminal pane's emulator: the shell's output becomes a grid of cells (D-066).
+vt100 = "0.15"
 zeroize = { workspace = true }
 
 [dev-dependencies]
