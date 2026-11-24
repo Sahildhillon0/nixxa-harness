@@ -10,6 +10,7 @@ mod browser;
 mod copy;
 mod logging;
 mod network;
+mod notify;
 mod paths;
 mod place;
 mod ports;

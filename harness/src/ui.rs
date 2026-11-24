@@ -10,7 +10,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::app::{Activity, ActivityState, App, Focus, Speaker};
+use crate::app::{Activity, ActivityState, App, Focus, Happening, Speaker};
 use crate::network::{self, Mode};
 use crate::safe;
 use crate::sessions::ago;
@@ -147,6 +147,9 @@ fn status_line(app: &App, theme: Theme) -> Line<'static> {
         };
         part(&mut spans, network::status(&caps.network), style);
     }
+    if app.notifications.unseen > 0 {
+        part(&mut spans, format!("● {} new", app.notifications.unseen), theme.pending().add_modifier(Modifier::BOLD));
+    }
     match app.terminal.state {
         TermState::Open => part(&mut spans, "terminal ●".into(), theme.ok()),
         TermState::Opening => part(&mut spans, "terminal …".into(), theme.pending()),
@@ -217,20 +220,63 @@ fn draw_activity(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let height = usize::from(inner.height);
+    let width = usize::from(inner.width);
     let selected = app.selected();
-    let first = selected.map_or(0, |s| (s + 1).saturating_sub(height));
-    let lines: Vec<Line> = app
-        .activity
-        .iter()
-        .enumerate()
+    // Actions, with job ends and wake-ups where they happened; the selection is an action's.
+    let mut rows: Vec<(Line<'static>, bool)> = Vec::new();
+    let mut happenings = app.happenings.iter().peekable();
+    for (i, activity) in app.activity.iter().enumerate() {
+        while let Some((_, happening)) = happenings.next_if(|(at, _)| *at <= i) {
+            rows.push((happening_line(happening, theme, width), false));
+        }
+        rows.push((activity_line(activity, theme, width), Some(i) == selected));
+    }
+    rows.extend(happenings.map(|(_, happening)| (happening_line(happening, theme, width), false)));
+    let chosen = rows.iter().position(|(_, chosen)| *chosen);
+    let first = match (chosen, app.selected_explicitly()) {
+        (Some(row), true) => (row + 1).saturating_sub(height),
+        _ => rows.len().saturating_sub(height),
+    };
+    let lines: Vec<Line> = rows
+        .into_iter()
         .skip(first)
         .take(height)
-        .map(|(i, activity)| {
-            let line = activity_line(activity, theme, usize::from(inner.width));
-            if Some(i) == selected { line.patch_style(Style::new().add_modifier(Modifier::REVERSED)) } else { line }
-        })
+        .map(
+            |(line, chosen)| {
+                if chosen { line.patch_style(Style::new().add_modifier(Modifier::REVERSED)) } else { line }
+            },
+        )
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// A job end or a wake-up, as an activity line. Safe to draw.
+fn happening_line(happening: &Happening, theme: Theme, width: usize) -> Line<'static> {
+    let (icon, style, kind, target, how) = match happening {
+        Happening::JobEnded { job, command, exit_code, status } => {
+            let (icon, style) = if *exit_code == Some(0) { ("✓", theme.ok()) } else { ("✗", theme.bad()) };
+            let how = match exit_code {
+                Some(code) => format!("exit {code}"),
+                None if status.contains("was lost") => "lost".to_string(),
+                None if status.contains("time limit") => "timed out".to_string(),
+                None if status.contains("stopped") => "stopped".to_string(),
+                None => "killed".to_string(),
+            };
+            (icon, style, "job", format!("{job} ended: {command}"), how)
+        }
+        Happening::WakeUp { jobs } => {
+            let jobs: Vec<&str> = jobs.iter().map(|job| job.as_str()).collect();
+            ("↻", theme.accent(), "wake", format!("{} ended: the agent carries on", jobs.join(", ")), String::new())
+        }
+    };
+    let target = safe::line(&target);
+    let room = width.saturating_sub(2 + 7 + 1 + how.chars().count());
+    Line::from(vec![
+        Span::styled(format!("{icon} "), style),
+        Span::raw(format!("{kind:<6} ")),
+        Span::raw(format!("{:<room$} ", truncate(&target, room))),
+        Span::styled(how, style),
+    ])
 }
 
 fn activity_line(activity: &Activity, theme: Theme, width: usize) -> Line<'static> {
@@ -1228,6 +1274,23 @@ pub(crate) mod tests {
         let narrow = screen(&mut app, 90, 30);
         assert!(!narrow.contains("Approve action?") && narrow.contains("prompt$"), "{narrow}");
         assert!(narrow.contains("an action waits for you"), "{narrow}");
+    }
+
+    #[test]
+    fn job_ends_wake_ups_and_the_badge_are_drawn_safely() {
+        let mut app = started();
+        app.apply(Event::JobFinished {
+            job: nixxa_contracts::JobId::new("j1"),
+            command: "cargo build \u{202E}evil".into(),
+            exit_code: None,
+            duration_ms: 1000,
+            status: "job j1 was lost after 1.0 s: the sandbox stopped".into(),
+        });
+        app.apply(Event::WakeUp { turn: TurnId::new("turn-1"), jobs: vec![nixxa_contracts::JobId::new("j1")] });
+        let shown = screen(&mut app, 150, 30);
+        assert!(shown.contains("job    j1 ended: cargo build <U+202E>evil") && shown.contains("lost"), "{shown}");
+        assert!(shown.contains("wake   j1 ended: the agent carries on"), "{shown}");
+        assert!(shown.contains("● 1 new"), "{shown}");
     }
 
     #[test]

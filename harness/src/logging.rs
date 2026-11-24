@@ -45,6 +45,14 @@ pub(crate) fn event(event: &Event) {
         Event::SessionEnded { session } => tracing::info!(session = %safe::line(session.as_str()), "session ended"),
         Event::TurnStarted { turn } => tracing::debug!(%turn, "turn started"),
         Event::TurnDone { turn } => tracing::debug!(%turn, "turn done"),
+        // Metadata only: the job and how it exited, never its command or output.
+        Event::JobFinished { job, exit_code, duration_ms, .. } => {
+            tracing::info!(job = %safe::line(job.as_str()), ?exit_code, duration_ms, "background job finished");
+        }
+        Event::WakeUp { turn, jobs } => {
+            let jobs: Vec<String> = jobs.iter().map(|job| safe::line(job.as_str())).collect();
+            tracing::info!(%turn, ?jobs, "turn started for ended jobs");
+        }
         Event::ActionProposed { turn, request } => {
             tracing::info!(%turn, action = %safe::line(request.id.as_str()), kind = action_kind(&request.action), "action proposed");
         }

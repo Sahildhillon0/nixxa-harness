@@ -20,6 +20,9 @@ Environment:
   NIXXA_MODEL         Model to use (default: claude-sonnet-5-5).
   NIXXA_EFFORT        low | medium | high | xhigh | max (default: the model's own).
   NIXXA_LOG           Log level: error | warn | info | debug | trace (default: info).
+  NIXXA_NOTIFY        When a job or a turn finishes while you're away: desktop (a desktop
+                      notification and the bell; the default) | bell | off (the status bar's
+                      badge only).
   NO_COLOR            Turn colour off.";
 
 /// Settings for one run.
@@ -35,6 +38,8 @@ pub(crate) struct Settings {
     pub(crate) effort: Option<Effort>,
     /// `ANTHROPIC_API_KEY`, trimmed (a pasted trailing newline is common).
     pub(crate) env_key: Option<Secret>,
+    /// What fires when a job or turn finishes while the user is away (`NIXXA_NOTIFY`).
+    pub(crate) notify: crate::notify::Channels,
 }
 
 /// What the command line asks for.
@@ -72,6 +77,9 @@ pub(crate) fn parse(
         Some(other) => return Err(format!("NIXXA_EFFORT must be low, medium, high, xhigh or max, not `{other}`")),
     };
     settings.env_key = var("ANTHROPIC_API_KEY").map(Secret::new);
+    if let Some(notify) = var("NIXXA_NOTIFY") {
+        settings.notify = crate::notify::Channels::parse(&notify)?;
+    }
     Ok(Parsed::Run(settings))
 }
 
@@ -89,6 +97,15 @@ mod tests {
             Parsed::Run(settings) => Ok(settings),
             other => Err(format!("{other:?}")),
         }
+    }
+
+    #[test]
+    fn notifications_default_to_desktop_and_can_be_turned_down() {
+        use crate::notify::Channels;
+        assert_eq!(run(&[], &[]).unwrap().notify, Channels::Desktop);
+        assert_eq!(run(&[], &[("NIXXA_NOTIFY", "bell")]).unwrap().notify, Channels::Bell);
+        assert_eq!(run(&[], &[("NIXXA_NOTIFY", "off")]).unwrap().notify, Channels::Off);
+        assert!(run(&[], &[("NIXXA_NOTIFY", "loud")]).unwrap_err().contains("off, bell or desktop"));
     }
 
     #[test]
