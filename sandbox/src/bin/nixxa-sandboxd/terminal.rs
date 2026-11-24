@@ -72,6 +72,9 @@ fn shell() -> &'static str {
 /// The variables the terminal's shell gets beyond the commands' own.
 fn terminal_env(mut env: Vec<(String, String)>) -> Vec<(String, String)> {
     env.push(("TERM".into(), "xterm-256color".into()));
+    // A home of its own: a login shell sources start-up files from it and writes its history
+    // there, and the commands' home (`/tmp`) is the agent's to write and read.
+    env.push(("HOME".into(), crate::landlock::TERMINAL_HOME.into()));
     // Says where the shell is, in every prompt.
     env.push(("PS1".into(), "sandbox:\\w\\$ ".into()));
     env

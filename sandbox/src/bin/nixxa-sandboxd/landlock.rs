@@ -17,6 +17,8 @@ const SYSTEM: [&str; 8] = ["/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", 
 const DEVICES: [&str; 6] = ["/dev/null", "/dev/zero", "/dev/full", "/dev/random", "/dev/urandom", "/dev/tty"];
 /// Full access.
 const WORK: [&str; 3] = ["/workspace", "/tmp", "/dev/shm"];
+/// The user's terminal's home (start-up files, history): theirs only.
+pub(crate) const TERMINAL_HOME: &str = "/nixxa-home";
 /// The PTY multiplexer and the terminals it makes (bubblewrap's `--dev` gives the sandbox its
 /// own `devpts` instance; `/dev/ptmx` links to `/dev/pts/ptmx`).
 const PTY: [&str; 2] = ["/dev/ptmx", "/dev/pts"];
@@ -28,7 +30,7 @@ pub(crate) fn apply() -> bool {
 }
 
 /// Adds the layer for one of the agent's commands: the daemon's rules without the terminal
-/// devices, and `/dev` itself listable but not readable as a tree. So no command of the
+/// devices or the terminal's home, and `/dev` itself listable but not readable as a tree. So no command of the
 /// agent's can open the user's terminal (`/dev/pts/N`) to read what is typed or write into it,
 /// or make a terminal of its own. Being a nested domain also keeps it from `ptrace`-level
 /// access (`/proc/<pid>/fd`, `environ`) to processes outside it, the user's shell included.
@@ -50,6 +52,7 @@ fn restrict(pty: bool) -> Result<RulesetStatus, RulesetError> {
         created = created.add_rules(path_beneath_rules(["/dev"], AccessFs::from_read(ABI)))?;
         let terminal: BitFlags<AccessFs> = AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::IoctlDev;
         created = created.add_rules(path_beneath_rules(PTY, terminal))?;
+        created = created.add_rules(path_beneath_rules([TERMINAL_HOME], AccessFs::from_all(ABI)))?;
     } else {
         created = created.add_rules(path_beneath_rules(["/dev"], AccessFs::ReadDir))?;
     }

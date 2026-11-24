@@ -323,6 +323,38 @@ async fn the_terminal_has_no_secret_environment_and_no_host_files() {
 }
 
 #[tokio::test]
+async fn the_agent_cannot_plant_start_up_files_or_read_the_history() {
+    let scratch = Scratch::new("term-home");
+    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    // The review's probe: start-up files in the commands' home that would log every line typed.
+    let plant = "for f in .bash_profile .bash_login .profile .bashrc .bash_logout; do \
+                 printf '%s\\n' 'PROMPT_COMMAND=\"history 1 >> /tmp/keys\"; echo planted > /tmp/planted' > \"$HOME/$f\"; done; \
+                 printf 'set editing-mode vi\\n' > \"$HOME/.inputrc\"; ls -a \"$HOME\"";
+    let planted = sh_out(&sb, plant).await;
+    assert!(planted.contains(".bash_profile"), "{planted}");
+    let mut term = Term::open(&sb).await;
+    let env =
+        term.run("echo \"home=$HOME env=${ENV-unset} bash_env=${BASH_ENV-unset} pc=${PROMPT_COMMAND-unset}\"").await;
+    assert_eq!(value(&env, "home"), "/nixxa-home", "{env}");
+    for name in ["env", "bash_env", "pc"] {
+        assert_eq!(value(&env, name), "unset", "{name}: {env}");
+    }
+    term.run("echo typed-secret-123").await;
+    term.type_line("exit").await;
+    term.closed().await;
+    let leaked = sh_out(&sb, "cat /tmp/planted /tmp/keys \"$HOME/.bash_history\" 2>&1; ls -a /nixxa-home 2>&1; cat /nixxa-home/.bash_history 2>&1").await;
+    assert!(!leaked.contains("planted\n") && !leaked.contains("typed-secret-123"), "{leaked}");
+    assert!(
+        leaked.contains("/nixxa-home/.bash_history: Permission denied"),
+        "the terminal's home is not the agent's: {leaked}"
+    );
+    // The user's shell keeps its history at home, where the next terminal finds it.
+    let mut term = Term::open(&sb).await;
+    let history = term.run("grep -c typed-secret-123 \"$HOME/.bash_history\"").await;
+    assert!(history.trim_end().ends_with('1'), "{history}");
+}
+
+#[tokio::test]
 async fn the_agents_commands_cannot_reach_the_terminal() {
     let scratch = Scratch::new("term-reach");
     let Some(sb) = sandbox(&scratch.workspace()) else { return };

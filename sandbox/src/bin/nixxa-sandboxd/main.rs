@@ -372,6 +372,11 @@ mod daemon {
 
         /// Opens the user's terminal: one at a time.
         fn open_terminal(&mut self, id: u64, terminal: u64, size: TerminalSize) {
+            // Without the agent's own Landlock layer, its commands could open the terminal.
+            if !self.confine {
+                let message = "no terminal without Landlock: the agent's commands couldn't be kept away from it".into();
+                return self.reply(id, Reply::Error { message });
+            }
             if self.terminal.as_ref().is_some_and(|open| !open.is_finished()) {
                 return self.reply(id, Reply::Error { message: "a terminal is already open".into() });
             }

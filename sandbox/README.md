@@ -55,10 +55,13 @@ supervisor starts a session and takes the PTY as its controlling terminal in `ex
 for rlimits, cgroup and tree tracking, but not the agent's (no time limit or output cap, not in
 the job table, no `JobFinished`, untouched by the agent's commands); `close`, `reset` and the
 daemon ending stop it, one at a time. Output is flow-controlled (64 KiB ahead of the client's
-acknowledgements). The daemon's Landlock layer allows `/dev/ptmx` and `/dev/pts`; each agent
+acknowledgements). The daemon's Landlock layer allows `/dev/ptmx`, `/dev/pts` and the terminal's home
+`/nixxa-home` (a tmpfs, so its start-up files and history aren't the agent's); each agent
 command's supervisor adds a second layer without them (`landlock.rs`), so the agent's commands
-can't open the user's terminal or reach its shell's `/proc` entries; TIOCSTI stays refused by
-seccomp. `HostSandbox` runs the user's `$SHELL` on a PTY (`src/host_terminal.rs`, `portable-pty`,
+can't open the user's terminal, plant files its shell runs, read its history, or reach its
+shell's `/proc/<pid>/fd` and `environ` (they can still see command lines and send signals; and
+what the user runs from the workspace is code the agent may have written). TIOCSTI stays refused
+by seccomp. Without Landlock there is no terminal. `HostSandbox` runs the user's `$SHELL` on a PTY (`src/host_terminal.rs`, `portable-pty`,
 Unix only; Windows says it needs ConPTY), without the hidden variables, killed in `Drop`.
 `FakeSandbox` has a scripted one.
 

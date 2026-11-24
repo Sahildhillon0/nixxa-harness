@@ -53,6 +53,8 @@ use crate::proxy::Proxy;
 
 /// Where the network proxy's directory is mounted inside the sandbox.
 const PROXY_INSIDE: &str = "/run/nixxa";
+/// The home of the user's terminal inside the sandbox; agent commands can't reach it.
+const TERMINAL_HOME: &str = "/nixxa-home";
 /// Where the daemon binary is mounted inside the sandbox.
 const DAEMON_INSIDE: &str = "/.nixxa/nixxa-sandboxd";
 /// The few `/etc` entries commands need (user names, the dynamic linker cache, the time zone,
@@ -200,6 +202,8 @@ struct Inner {
     landlock: AtomicBool,
     /// Whether the daemon reported seccomp as active.
     seccomp: AtomicBool,
+    /// Whether a daemon has answered the handshake (so `landlock` is known).
+    started: AtomicBool,
     /// Events from every daemon this sandbox starts.
     events: broadcast::Sender<SandboxEvent>,
     /// Jobs started and not yet finished, with when they started, so they can be reported as
@@ -276,6 +280,7 @@ impl BwrapSandbox {
                 foreground: Mutex::new(()),
                 landlock: AtomicBool::new(false),
                 seccomp: AtomicBool::new(false),
+                started: AtomicBool::new(false),
                 events,
                 jobs: Jobs::default(),
                 proxy,
@@ -380,7 +385,10 @@ impl Inner {
             let path = format!("/etc/{name}");
             args.extend(["--ro-bind-try".into(), path.clone(), path]);
         }
-        args.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp", "--bind"].map(str::to_owned));
+        args.extend(["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"].map(str::to_owned));
+        // The terminal's home (D-066): only the user's shell may read or write it, so the agent
+        // can't plant start-up files there or read its history.
+        args.extend(["--tmpfs".into(), TERMINAL_HOME.into(), "--bind".into()]);
         args.extend([host_str(&self.workspace), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
         args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into()]);
         if let Some(dir) = self.proxy.dir() {
@@ -443,6 +451,7 @@ impl Inner {
             Ok(Ok(FromDaemon::Hello { version, layers })) if version == VERSION => {
                 self.landlock.store(layers.landlock, Ordering::Relaxed);
                 self.seccomp.store(layers.seccomp, Ordering::Relaxed);
+                self.started.store(true, Ordering::Relaxed);
             }
             Ok(Ok(FromDaemon::Hello { version, .. })) => {
                 return Err(failure(format!("daemon speaks version {version}")));
@@ -808,7 +817,9 @@ impl Sandbox for BwrapSandbox {
             isolated: landlock && seccomp,
             network: NetworkAccess::Controlled(self.inner.proxy.policy()),
             jobs: true,
-            terminal: true,
+            // Not once the daemon has said Landlock isn't there: the agent's commands couldn't be
+            // kept away from the terminal (D-066).
+            terminal: landlock || !self.inner.started.load(Ordering::Relaxed),
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }
@@ -891,6 +902,11 @@ impl Sandbox for BwrapSandbox {
 
     async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
         let conn = self.inner.connect().await?;
+        if !self.inner.landlock.load(Ordering::Relaxed) {
+            return Err(SandboxError::Unsupported(
+                "no terminal without Landlock: the agent's commands couldn't be kept away from it".into(),
+            ));
+        }
         let id = self.inner.terminals.fetch_add(1, Ordering::Relaxed) + 1;
         // Registered first, so no output can arrive before its stream exists.
         let (tx, rx) = mpsc::unbounded_channel();
