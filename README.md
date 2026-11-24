@@ -25,13 +25,15 @@ Replace one, and the rest never notice.
 > picks up the latest session for this directory; `ctrl-s` lists every session and searches
 > their transcripts. Knowledge is still a fake.
 >
-> **Stage 6 — Working in the sandbox: in progress.** The agent can run long builds and test
+> **Stage 6 — Working in the sandbox: done.** The agent can run long builds and test
 > suites as **background jobs** (up to 4 at once, 30 min each by default) and check on them while
 > it works; each job is its own process tree, so ending one never touches another. The network
 > is **off** until you allow it: `ctrl+n` lets you allow crates.io, npm, PyPI or GitHub (or your
 > own hosts), or open it; every request is logged, and the status bar always shows `net: …`.
 > **`ctrl+t` opens a terminal** in the same place as the agent, for you: the agent can't see it or
-> reach it, and it survives everything the agent runs. Notifications come next.
+> reach it, and it survives everything the agent runs. When a background job the agent started
+> finishes, the agent is told, and if it was waiting it carries on by itself; if you're away, a
+> desktop notification and the bell say so.
 
 ---
 
@@ -118,7 +120,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
-| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **in progress** (background jobs, the network allowlist and the terminal done) |
+| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **done** |
 | 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | planned |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
@@ -185,7 +187,8 @@ Nixxa starts with whichever account you set up last, and remembers it across res
 another one switches to it right away, in a new session.
 
 Other settings: `NIXXA_MODEL` (the Claude model; default `claude-sonnet-5-5`), `NIXXA_EFFORT`
-(`low`…`max`, Claude), `NIXXA_LOG` (log level), `NO_COLOR`. See `nixxa --help`. Logs go to
+(`low`…`max`, Claude), `NIXXA_LOG` (log level), `NIXXA_NOTIFY` (`desktop`, `bell` or `off`: what
+happens when a job or turn finishes while you're away), `NO_COLOR`. See `nixxa --help`. Logs go to
 `<data dir>/nixxa/logs/` and contain metadata only, never your key or messages.
 
 ## The network

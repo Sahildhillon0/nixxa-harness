@@ -16,7 +16,8 @@ directory", D-039); it refuses paths that leave the directory, hides the secrets
 names from commands, and caps time (120 s default, 600 s max) and output (64 KiB per stream).
 
 Every backend runs **background jobs** (`Exec { background: true }`, then `JobStatus`,
-`JobOutput`, `JobStop`, and `SandboxEvent::JobFinished` through `subscribe()`), with the limits in
+`JobOutput`, `JobStop`, and `SandboxEvent::JobFinished` through `subscribe()`, which says how the
+job ended in the same words `JobStatus` uses, or that it was lost with its sandbox), with the limits in
 `JobLimits` (4 at once, 30 min default and 2 h max each, the last 1 MiB of each stream; D-063).
 The job table and the words the agent reads live in `src/job.rs`, shared by the daemon,
 `HostSandbox` (host processes, one process group per job) and `FakeSandbox` (jobs end at once).

@@ -8,7 +8,7 @@ Runs the agent loop and is the only orchestrator: asks the brain, gates every ac
 | **Does not own** | How thinking, execution, storage or rendering work |
 | **Contract** | Consumes `Brain`, `Sandbox`, `Store`, `Knowledge`, `ApprovalPort`, `EventSink` |
 | **Depends on** | `contracts` only |
-| **Comes alive** | Minimal in Stage 2; redaction and project policy in Stage 7; plan mode and the verify loop in Stage 8; full policy and budgets in Stage 14 |
+| **Comes alive** | Minimal in Stage 2; job results and wake-ups in Stage 6; redaction and project policy in Stage 7; plan mode and the verify loop in Stage 8; full policy and budgets in Stage 14 |
 
 See [ARCHITECTURE.md](../ARCHITECTURE.md) for how this module fits the whole.
 
@@ -53,6 +53,24 @@ messages are appended to it.
   that the workspace may have changed (the place isn't stored: it is chosen at every launch).
   When the session was recorded with another account, it says so and continues with the current
   one; a missing or different account never fails the resume.
+
+## Stage 6: job results and wake-ups (D-068)
+
+The loop subscribes to the sandbox's events. Jobs are watched from the `Started` observation of
+the agent's own background `exec` (`src/jobs.rs`); nothing else counts (network requests, the
+user's terminal, other sessions' jobs).
+
+- **The note:** a watched job's end is emitted as `Event::JobFinished` and given to the agent
+  once, as a system message in the sandbox's words (`Background job: job j1 exited with code 0
+  after 3.1 s (\`cargo build\`).`), at the next think step: never between an action and its
+  result.
+- **Wake-ups:** idle, and the agent was waiting on the job (it started it, and the user hasn't
+  written since; not if the agent stopped it), the controller starts a turn: `Event::WakeUp`, a
+  recorded system message saying so, then the notes. Ends within `wake_delay` (1 s) share one
+  turn; `max_wakes` (3) in a row at most, after which the notes are recorded between turns. Never
+  during a turn or an approval. A user message cancels a pending wake; its turn gets the notes.
+  Wake-up turns are ordinary turns: the same gate (Ask asks) and step cap.
+- **Resume:** jobs a stored session started and never saw end are said lost, once.
 
 Not yet: secret redaction and `AGENTS.md` policy (Stage 7), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
 

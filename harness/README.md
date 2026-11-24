@@ -108,6 +108,7 @@ its fake (scripted brain, fake sandbox, in-memory store, fake knowledge).
 | `src/workplace.rs` | Builds the chosen place's sandbox and instructions; the workspace guard; finding the daemon |
 | `src/sessions.rs` | The session list (`ctrl-s`): rows, grouping, filtering, keys |
 | `src/network.rs` | The network settings (`ctrl+n`): modes, presets, hosts, recent requests, keys (D-065) |
+| `src/notify.rs` | Notifications (D-069): presence, the badge, the bell and desktop notifications, their safe text |
 | `src/terminal.rs` | The terminal pane (`ctrl+t`): the VT100 emulator, safe cells, key encoding, scrollback, sharing (D-067) |
 | `src/copy.rs` | Scratch folders and the copy for "Work on a copy" (Linux) |
 | `src/safe.rs` | Makes untrusted text safe to draw (control, C1 and bidi characters made visible) and scrubs each frame |
@@ -140,6 +141,14 @@ shell keeps running. Its output is drawn only as emulator cells (`terminal.rs`),
 to your terminal; keys typed there never answer an approval. `tui.rs` runs it on a task that
 waits while the UI is behind, so the sandbox holds the shell instead of output piling up. The
 session gets a note when it opens and closes, never its content.
+
+**Job ends and notifications (D-068, D-069):** the activity pane shows each of the agent's
+background jobs ending and each wake-up (a turn the controller starts for ended jobs). Each job
+or turn that finishes counts on the status bar's `● N new` badge until the next key; when you're
+away (the window lost focus, you're typing in the `ctrl+t` terminal, or no key for 60 s),
+`NIXXA_NOTIFY` decides what else happens: `desktop` (default: a desktop notification through
+`notify-send` or `osascript`, and the bell), `bell`, or `off`. The text is one line, never output
+or model text, and safe.
 
 Not yet: plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
 knowledge panel (Stage 10), slash commands (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.
