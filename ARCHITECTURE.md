@@ -105,9 +105,10 @@ internal is `pub(crate)`.
 - **Does not own:** deciding what to run. It enforces its own hard limits and does not trust
   the controller to have been strict enough.
 - **Planned (§11):**
-  - the host-side egress proxy behind the network allowlist (#1);
-  - PTY sessions for the user's terminal (#16);
-  - background jobs (#9) and long-running services (language servers, sandboxed MCP servers);
+  - the host-side egress proxy behind the network allowlist (#1; done, D-064);
+  - PTY sessions for the user's terminal (#16; done, D-066);
+  - background jobs (#9; done, D-061 to D-063) and long-running services (language servers,
+    sandboxed MCP servers);
   - workspace checkpoints and the `Patch` action behind undo (#15);
   - LSP queries and the repo map as built-in actions (#8);
   - read-only mounts for paths the project policy protects (#5).
@@ -148,9 +149,9 @@ internal is `pub(crate)`.
 - **Does not own:** any agent logic. If the harness contains an `if` about what the agent
   should do, it belongs in the controller.
 - **Planned (§11):**
-  - the ctrl+t terminal pane (#16);
+  - the ctrl+t terminal pane (#16; done, D-067);
   - slash commands (#10);
-  - network settings (#1);
+  - network settings (#1; done, D-065);
   - several sessions in tabs, git worktrees and the merge review (#6);
   - notifications (#9);
   - reading `AGENTS.md` and handing its rules to the controller (#5);
@@ -504,10 +505,12 @@ recorded in the DESIGN.md decision log before it is built.
   its own process tree with its own limits. Kills target one job, never the user's shell.
   *Done (D-061, D-062):* each job runs under a supervisor that is a child subreaper, so a job is
   exactly that supervisor's descendants; the daemon is a subreaper too, as a backstop. *Done
-  (D-064):* the egress proxy, a Unix socket mounted at `/run/nixxa` and forwarded from
-  `127.0.0.1:3128`. The
-  host side gains the egress proxy, reached from inside through a Unix socket the daemon
-  forwards to `127.0.0.1` in the sandbox.
+  (D-064):* the egress proxy on the host side, a Unix socket mounted at `/run/nixxa` and
+  forwarded from `127.0.0.1:3128`. *Done (D-066):* the user's terminal is a PTY job in the
+  daemon. The daemon's Landlock layer allows the terminal devices; every agent command's
+  supervisor adds a second layer without them, so the agent's commands can't open the user's
+  terminal or reach its shell's `/proc` entries. Its output has its own flow-controlled stream
+  in protocol version 4.
 - **Stage 12:** background sessions. A long-running `nixxa` service hosts the controllers, and
   the TUI becomes a client that can detach and re-attach. Until then, background work lives
   inside a running TUI.
@@ -645,6 +648,10 @@ their stage.
   action sends a chosen part of its output as a message.
 - **Daemon change:** it can't kill the user's shell when the agent's command ends, which is why
   Stage 6 moves the daemon to per-job tracking (§7).
+- **Done (D-066, D-067):** `Sandbox::open_terminal`; a PTY job in the daemon, the user's
+  `$SHELL` in This directory (Unix), a scripted one in the fake; the pane renders through a
+  VT100 emulator into cells, `ctrl+]` leaves it, and `s` puts chosen lines in the message input
+  for the user to edit and send.
 
 ### #9 Background tasks and notifications (sandbox + controller + harness)
 - **In-session jobs (Stage 6):** the agent can start a long command in the background
@@ -917,7 +924,11 @@ Every stage ends with something that runs and a checklist that must be true befo
   - PR B, the network allowlist (D-064, D-065): done. `cargo test` with a crates.io dependency
     passes inside the sandbox with only the crates.io preset allowed, and another host is
     blocked and logged (`needs_internet_cargo_test_with_only_crates_io_allowed`).
-  - PR C (terminal), PR D (wake-ups and notifications): not started.
+  - PR C, the terminal (D-066, D-067): done. `ctrl+t` opens a shell in the same sandbox (a PTY
+    job under its own supervisor), which survives the agent's commands, background jobs, timeouts
+    and cancels (`tests/terminal.rs`), isn't visible to the agent, and can't be reached by the
+    agent's commands (a second Landlock layer without the terminal devices).
+  - PR D (wake-ups and notifications): not started.
 - **Exit:**
   - `cargo test` on a fresh project with a crates.io dependency passes inside the sandbox with
     only crates.io allowed, and a request to another host is blocked and logged;
