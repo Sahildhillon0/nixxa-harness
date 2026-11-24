@@ -766,8 +766,10 @@ fn terminal_events(
 fn report_lost(jobs: &Jobs, events: &broadcast::Sender<SandboxEvent>) {
     let lost: Vec<(JobId, Instant)> = jobs.lock().map(|mut jobs| jobs.drain().collect()).unwrap_or_default();
     for (job, started) in lost {
-        let duration_ms = started.elapsed().as_millis() as u64;
-        let _ = events.send(SandboxEvent::JobFinished { job, exit_code: None, duration_ms, truncated: false });
+        let ran = started.elapsed();
+        let status = format!("job {job} was lost after {:.1} s: the sandbox stopped", ran.as_secs_f64());
+        let duration_ms = ran.as_millis() as u64;
+        let _ = events.send(SandboxEvent::JobFinished { job, exit_code: None, duration_ms, truncated: false, status });
     }
 }
 
