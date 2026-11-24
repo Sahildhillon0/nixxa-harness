@@ -23,9 +23,12 @@ tokio = { workspace = true, features = ["fs", "io-std", "io-util", "net", "proce
 tracing = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# Linux: the daemon (Landlock prep, rlimits, subreapers, process trees). Every Unix: killing a
-# host background job's process group.
-rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "stdio", "thread"] }
+# The user's terminal in This directory: a PTY and the user's shell on it (the crate does the
+# session and controlling-terminal setup, so there is no unsafe here).
+portable-pty = "0.9"
+# Linux: the daemon (Landlock prep, rlimits, subreapers, process trees, the terminal's PTY).
+# Every Unix: killing a host background job's or terminal's process group.
+rustix = { version = "1.1", default-features = false, features = ["std", "fs", "process", "pty", "stdio", "termios", "thread"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"

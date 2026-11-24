@@ -22,12 +22,18 @@
 //!
 //! Background jobs run in the daemon under the same isolation as foreground commands; see
 //! `nixxa-sandboxd`'s `jobs.rs` for how each job's process tree is tracked and ended.
+//!
+//! The user's terminal (D-066) is a PTY job in the daemon. Its output arrives as frames routed
+//! to its own stream (never the shared event broadcast, where a flood would make other
+//! subscribers skip events); each chunk is acknowledged as the stream yields it, and the daemon
+//! sends at most a window of unacknowledged output, so a slow reader makes the shell wait
+//! instead of losing output or growing memory.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, Mutex as StdMutex, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -37,8 +43,8 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use nixxa_contracts::{
-    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind,
-    SandboxCapabilities, SandboxError, SandboxEvent,
+    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, Outcome, Sandbox, SandboxAction,
+    SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal, TerminalEvent, TerminalSize,
 };
 
 use crate::JobLimits;
@@ -204,10 +210,14 @@ struct Inner {
     /// Daemons started so far. Each one's job ids get a different prefix (`j1`, then `2-j1`, …),
     /// so a restarted daemon never reuses an id the agent already has.
     generation: AtomicU64,
+    /// The last id given to a terminal.
+    terminals: AtomicU64,
 }
 
 type Jobs = Arc<StdMutex<HashMap<JobId, Instant>>>;
 type Pending = Arc<StdMutex<HashMap<u64, oneshot::Sender<Reply>>>>;
+/// The open terminals' streams, by id.
+type Terminals = Arc<StdMutex<HashMap<u64, mpsc::UnboundedSender<TerminalEvent>>>>;
 
 /// One running daemon.
 struct Conn {
@@ -217,6 +227,8 @@ struct Conn {
     frames: mpsc::UnboundedSender<Vec<u8>>,
     /// Callers waiting for a reply, by request id.
     pending: Pending,
+    /// Where each open terminal's output goes.
+    terminals: Terminals,
     next_id: AtomicU64,
     /// False once either pipe has failed.
     alive: Arc<AtomicBool>,
@@ -268,6 +280,7 @@ impl BwrapSandbox {
                 jobs: Jobs::default(),
                 proxy,
                 generation: AtomicU64::new(0),
+                terminals: AtomicU64::new(0),
             }),
         })
     }
@@ -444,6 +457,7 @@ impl Inner {
         }
 
         let pending = Pending::default();
+        let terminals = Terminals::default();
         let alive = Arc::new(AtomicBool::new(true));
         let (frames, outgoing) = mpsc::unbounded_channel();
         let writer = tokio::spawn(write_frames(stdin, outgoing, Arc::clone(&alive)));
@@ -453,11 +467,13 @@ impl Inner {
             Arc::clone(&alive),
             self.events.clone(),
             Arc::clone(&self.jobs),
+            Arc::clone(&terminals),
         ));
         Ok(Conn {
             child: StdMutex::new(child),
             frames,
             pending,
+            terminals,
             next_id: AtomicU64::new(1),
             alive,
             tasks: [writer.abort_handle(), reader.abort_handle()],
@@ -545,6 +561,14 @@ impl Conn {
         self.frames.send(frame).map_err(|_| gone("its input is closed"))?;
         Ok(Call { conn: Arc::clone(self), id, reply, answered: false })
     }
+
+    /// Queues a request nobody waits for (its answer is dropped). Synchronous.
+    fn send_only(&self, op: Op) {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if let Ok(frame) = encode(&ToDaemon::Request { id, op }) {
+            let _ = self.frames.send(frame);
+        }
+    }
 }
 
 /// A request waiting for its reply.
@@ -593,6 +617,7 @@ async fn read_frames(
     alive: Arc<AtomicBool>,
     events: broadcast::Sender<SandboxEvent>,
     jobs: Jobs,
+    terminals: Terminals,
 ) {
     loop {
         match read_frame::<_, FromDaemon>(&mut stdout).await {
@@ -617,6 +642,16 @@ async fn read_frames(
                 }
                 let _ = events.send(event);
             }
+            Ok(FromDaemon::TerminalOutput { terminal, data }) => {
+                if let Some(tx) = terminals.lock().ok().and_then(|open| open.get(&terminal).cloned()) {
+                    let _ = tx.send(TerminalEvent::Output(data));
+                }
+            }
+            Ok(FromDaemon::TerminalClosed { terminal, reason }) => {
+                if let Some(tx) = terminals.lock().ok().and_then(|mut open| open.remove(&terminal)) {
+                    let _ = tx.send(TerminalEvent::Closed { reason });
+                }
+            }
             Ok(FromDaemon::Hello { .. }) => {}
             Err(err) => {
                 tracing::debug!(target: "nixxa_sandbox", "the sandbox daemon's output ended: {err}");
@@ -629,6 +664,93 @@ async fn read_frames(
         pending.clear();
     }
     report_lost(&jobs, &events);
+    // A terminal can't outlive its daemon.
+    let open: Vec<_> = terminals.lock().map(|mut open| open.drain().collect()).unwrap_or_default();
+    for (_, tx) in open {
+        let _ = tx.send(TerminalEvent::Closed { reason: "the sandbox stopped".into() });
+    }
+}
+
+/// The user's terminal in the daemon (D-066).
+struct BwrapTerminal {
+    /// The daemon it runs in. Weak: an open terminal doesn't keep a discarded daemon alive.
+    conn: Weak<Conn>,
+    id: u64,
+    /// Set once `close` was called, so dropping it doesn't ask again.
+    closed: AtomicBool,
+}
+
+impl BwrapTerminal {
+    /// Sends `op` and waits for the answer (up to `limit`). A terminal that doesn't answer in
+    /// time isn't a reason to discard the daemon.
+    async fn ask(&self, op: Op, limit: Option<Duration>) -> Result<(), SandboxError> {
+        let ended = || SandboxError::Unavailable("the terminal has ended".into());
+        let conn = self.conn.upgrade().ok_or_else(ended)?;
+        let mut call = conn.call(op)?;
+        let reply = match limit {
+            Some(limit) => tokio::time::timeout(limit, &mut call.reply)
+                .await
+                .map_err(|_| SandboxError::Unavailable("the terminal didn't answer".into()))?,
+            None => (&mut call.reply).await,
+        };
+        call.answered = true;
+        match reply.map_err(|_| ended())? {
+            Reply::Done => Ok(()),
+            Reply::Error { message } => Err(SandboxError::Unavailable(message)),
+            other => Err(SandboxError::Unavailable(format!("unexpected answer: {other:?}"))),
+        }
+    }
+}
+
+#[async_trait]
+impl Terminal for BwrapTerminal {
+    async fn write(&self, input: &[u8]) -> Result<(), SandboxError> {
+        // Answered once the PTY took it, which waits while the shell isn't reading.
+        self.ask(Op::TerminalInput { terminal: self.id, data: input.to_vec() }, None).await
+    }
+
+    async fn resize(&self, size: TerminalSize) -> Result<(), SandboxError> {
+        self.ask(Op::TerminalResize { terminal: self.id, size }, Some(QUICK_TIMEOUT)).await
+    }
+
+    async fn close(&self) -> Result<(), SandboxError> {
+        self.closed.store(true, Ordering::Relaxed);
+        match self.ask(Op::TerminalClose { terminal: self.id }, Some(QUICK_TIMEOUT)).await {
+            // Gone with its daemon: nothing left to end.
+            Err(SandboxError::Unavailable(why)) if why == "the terminal has ended" => Ok(()),
+            other => other,
+        }
+    }
+}
+
+impl Drop for BwrapTerminal {
+    /// Asks the daemon to end it, without waiting (no runtime needed).
+    fn drop(&mut self) {
+        if self.closed.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(conn) = self.conn.upgrade() {
+            conn.send_only(Op::TerminalClose { terminal: self.id });
+        }
+    }
+}
+
+/// A terminal's events, acknowledging each chunk of output to the daemon as it is consumed.
+fn terminal_events(
+    rx: mpsc::UnboundedReceiver<TerminalEvent>,
+    frames: mpsc::UnboundedSender<Vec<u8>>,
+    terminal: u64,
+) -> BoxStream<'static, TerminalEvent> {
+    Box::pin(futures::stream::unfold((rx, frames), move |(mut rx, frames)| async move {
+        let event = rx.recv().await?;
+        if let TerminalEvent::Output(data) = &event {
+            let bytes = u32::try_from(data.len()).unwrap_or(u32::MAX);
+            if let Ok(frame) = encode(&ToDaemon::TerminalAck { terminal, bytes }) {
+                let _ = frames.send(frame);
+            }
+        }
+        Some((event, (rx, frames)))
+    }))
 }
 
 /// Reports every job still running as finished (killed): their daemon is gone.
@@ -686,6 +808,7 @@ impl Sandbox for BwrapSandbox {
             isolated: landlock && seccomp,
             network: NetworkAccess::Controlled(self.inner.proxy.policy()),
             jobs: true,
+            terminal: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }
@@ -764,5 +887,25 @@ impl Sandbox for BwrapSandbox {
 
     fn subscribe(&self) -> BoxStream<'static, SandboxEvent> {
         crate::events::stream(self.inner.events.subscribe())
+    }
+
+    async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
+        let conn = self.inner.connect().await?;
+        let id = self.inner.terminals.fetch_add(1, Ordering::Relaxed) + 1;
+        // Registered first, so no output can arrive before its stream exists.
+        let (tx, rx) = mpsc::unbounded_channel();
+        if let Ok(mut open) = conn.terminals.lock() {
+            open.insert(id, tx);
+        }
+        let terminal = BwrapTerminal { conn: Arc::downgrade(&conn), id, closed: AtomicBool::new(false) };
+        if let Err(err) = terminal.ask(Op::TerminalOpen { terminal: id, size }, Some(QUICK_TIMEOUT)).await {
+            terminal.closed.store(true, Ordering::Relaxed);
+            if let Ok(mut open) = conn.terminals.lock() {
+                open.remove(&id);
+            }
+            return Err(err);
+        }
+        let events = terminal_events(rx, conn.frames.clone(), id);
+        Ok(OpenTerminal { terminal: Box::new(terminal), events })
     }
 }

@@ -3,13 +3,17 @@
 //! Backends: [`fake::FakeSandbox`] (in memory, for `--fake` and tests), [`host::HostSandbox`]
 //! (the real files of one directory, not isolated, for "This directory") and, on Linux,
 //! [`bwrap::BwrapSandbox`] (`nixxa-sandboxd` out of process under bubblewrap). All three run
-//! background jobs under [`JobLimits`].
+//! background jobs under [`JobLimits`], and open the user's terminal (`ctrl+t`) in the same
+//! place as the agent's commands: a PTY job in the daemon, the user's shell on the host (Unix),
+//! a scripted one in the fake.
 
 #[cfg(target_os = "linux")]
 pub mod bwrap;
 mod events;
 pub mod fake;
 pub mod host;
+#[cfg(unix)]
+mod host_terminal;
 mod job;
 pub mod network;
 #[cfg(target_os = "linux")]
