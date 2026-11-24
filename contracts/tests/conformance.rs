@@ -127,6 +127,112 @@ struct MemSandbox {
     job_state: Mutex<MemJobs>,
     net: Mutex<NetworkPolicy>,
     net_bug: Option<NetBug>,
+    /// Has a scripted terminal. Not a bug.
+    terminal: bool,
+    terminal_bug: Option<TermBug>,
+    term: std::sync::Arc<Mutex<MemTerm>>,
+}
+
+/// One way to get the terminal wrong.
+#[derive(Clone, Copy, PartialEq)]
+enum TermBug {
+    /// Says it has no terminal but opens one anyway.
+    UndeclaredTerminal,
+    /// Ignores resizes.
+    NoResize,
+    /// `close` returns but the terminal never ends.
+    CloseKeepsOpen,
+    /// A closed terminal still takes input.
+    WritesAfterClose,
+    /// Dropping the handle leaves the terminal open (and the next open is refused).
+    DropWedges,
+    /// `reset` leaves the terminal open.
+    ResetKeepsTerminal,
+    /// The terminal ends when a command runs (as if it were the foreground command).
+    DiesWithCommands,
+}
+
+/// The scripted terminal: echoes input; `stty size` answers the size.
+#[derive(Default)]
+struct MemTerm {
+    /// The open terminal's generation, its size and its event channel.
+    open: Option<(u64, TerminalSize, futures::channel::mpsc::UnboundedSender<TerminalEvent>)>,
+    line: String,
+    generation: u64,
+}
+
+impl MemTerm {
+    fn end(&mut self, generation: u64, reason: &str) {
+        if self.open.as_ref().is_some_and(|(g, ..)| *g == generation) {
+            if let Some((.., tx)) = self.open.take() {
+                let _ = tx.unbounded_send(TerminalEvent::Closed { reason: reason.into() });
+            }
+        }
+    }
+}
+
+struct MemTerminal {
+    state: std::sync::Arc<Mutex<MemTerm>>,
+    generation: u64,
+    bug: Option<TermBug>,
+}
+
+impl MemTerminal {
+    fn live(&self) -> bool {
+        self.bug == Some(TermBug::WritesAfterClose)
+            || self.state.lock().unwrap().open.as_ref().is_some_and(|(g, ..)| *g == self.generation)
+    }
+}
+
+#[async_trait]
+impl Terminal for MemTerminal {
+    async fn write(&self, input: &[u8]) -> Result<(), SandboxError> {
+        if !self.live() {
+            return Err(SandboxError::Unavailable("closed".into()));
+        }
+        let mut state = self.state.lock().unwrap();
+        let Some((_, size, tx)) = state.open.clone() else { return Ok(()) };
+        let _ = tx.unbounded_send(TerminalEvent::Output(input.to_vec()));
+        for c in String::from_utf8_lossy(input).chars() {
+            if c == '\r' {
+                let line = std::mem::take(&mut state.line);
+                if line.trim() == "stty size" {
+                    let answer = format!("\r\n{} {}\r\n", size.rows, size.cols);
+                    let _ = tx.unbounded_send(TerminalEvent::Output(answer.into_bytes()));
+                }
+            } else {
+                state.line.push(c);
+            }
+        }
+        Ok(())
+    }
+    async fn resize(&self, size: TerminalSize) -> Result<(), SandboxError> {
+        if !self.live() {
+            return Err(SandboxError::Unavailable("closed".into()));
+        }
+        if self.bug != Some(TermBug::NoResize) {
+            if let Some((_, current, _)) = self.state.lock().unwrap().open.as_mut() {
+                *current = size;
+            }
+        }
+        Ok(())
+    }
+    async fn close(&self) -> Result<(), SandboxError> {
+        if self.bug != Some(TermBug::CloseKeepsOpen) {
+            self.state.lock().unwrap().end(self.generation, "closed");
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MemTerminal {
+    fn drop(&mut self) {
+        if self.bug != Some(TermBug::DropWedges) && self.bug != Some(TermBug::CloseKeepsOpen) {
+            if let Ok(mut state) = self.state.lock() {
+                state.end(self.generation, "closed");
+            }
+        }
+    }
 }
 
 /// One way to get the network policy wrong.
@@ -249,6 +355,7 @@ impl Sandbox for MemSandbox {
                 (_, policy) => NetworkAccess::Controlled(policy),
             },
             jobs: self.jobs,
+            terminal: self.terminal,
             actions: if self.jobs {
                 SandboxActionKind::ALL.to_vec()
             } else if self.echo_exec || self.wedge_on_drop || self.job_bug.is_some() {
@@ -269,6 +376,21 @@ impl Sandbox for MemSandbox {
         }
         Ok(())
     }
+    async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
+        if !self.terminal && self.terminal_bug != Some(TermBug::UndeclaredTerminal) {
+            return Err(SandboxError::Unsupported("no terminal".into()));
+        }
+        let mut state = self.term.lock().unwrap();
+        if state.open.is_some() {
+            return Err(SandboxError::Unavailable("a terminal is already open".into()));
+        }
+        state.generation += 1;
+        let (tx, rx) = futures::channel::mpsc::unbounded();
+        state.open = Some((state.generation, size, tx));
+        state.line.clear();
+        let terminal = MemTerminal { state: self.term.clone(), generation: state.generation, bug: self.terminal_bug };
+        Ok(OpenTerminal { terminal: Box::new(terminal), events: Box::pin(rx) })
+    }
     fn subscribe(&self) -> futures::stream::BoxStream<'static, SandboxEvent> {
         let (tx, rx) = futures::channel::mpsc::unbounded();
         if self.jobs && self.job_bug != Some(JobBug::NoEvents) {
@@ -279,6 +401,11 @@ impl Sandbox for MemSandbox {
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
         if self.wedged.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(SandboxError::Unavailable("wedged".into()));
+        }
+        if self.terminal_bug == Some(TermBug::DiesWithCommands) && matches!(action, SandboxAction::Exec { .. }) {
+            let mut term = self.term.lock().unwrap();
+            let generation = term.generation;
+            term.end(generation, "killed with the command");
         }
         if self.jobs || self.job_bug.is_some() {
             if let Some(obs) = self.run_job_action(&id, &action) {
@@ -346,6 +473,11 @@ impl Sandbox for MemSandbox {
     async fn reset(&self) -> Result<(), SandboxError> {
         if self.wipe_on_reset {
             self.files.lock().unwrap().clear();
+        }
+        if self.terminal_bug != Some(TermBug::ResetKeepsTerminal) {
+            let mut term = self.term.lock().unwrap();
+            let generation = term.generation;
+            term.end(generation, "the sandbox was reset");
         }
         if self.job_bug != Some(JobBug::ResetKeepsJobs) {
             let mut state = self.job_state.lock().unwrap();
@@ -473,6 +605,62 @@ fn sandbox_suite_catches_an_unrestricted_sandbox_taking_a_policy() {
         net_bug: Some(NetBug::UnrestrictedAcceptsPolicy),
         ..Default::default()
     }));
+}
+
+#[test]
+fn sandbox_reference_with_a_terminal_passes() {
+    block_on(conformance::sandbox::run(|| MemSandbox { jobs: true, terminal: true, ..Default::default() }));
+}
+
+fn with_terminal_bug(bug: TermBug) -> MemSandbox {
+    MemSandbox {
+        jobs: true,
+        terminal: bug != TermBug::UndeclaredTerminal,
+        terminal_bug: Some(bug),
+        ..Default::default()
+    }
+}
+
+#[test]
+#[should_panic(expected = "without a terminal, open_terminal must be Unsupported")]
+fn sandbox_suite_catches_an_undeclared_terminal() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::UndeclaredTerminal)));
+}
+
+#[test]
+#[should_panic(expected = "must report the size after a resize")]
+fn sandbox_suite_catches_a_terminal_that_ignores_resizes() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::NoResize)));
+}
+
+#[test]
+#[should_panic(expected = "closing a terminal must end it")]
+fn sandbox_suite_catches_a_close_that_keeps_the_terminal() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::CloseKeepsOpen)));
+}
+
+#[test]
+#[should_panic(expected = "a closed terminal's write must fail")]
+fn sandbox_suite_catches_a_closed_terminal_taking_input() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::WritesAfterClose)));
+}
+
+#[test]
+#[should_panic(expected = "dropping a terminal's handle must end it")]
+fn sandbox_suite_catches_a_dropped_terminal_left_open() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::DropWedges)));
+}
+
+#[test]
+#[should_panic(expected = "reset must end the terminal")]
+fn sandbox_suite_catches_reset_leaving_the_terminal() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::ResetKeepsTerminal)));
+}
+
+#[test]
+#[should_panic(expected = "must outlive the agent's commands")]
+fn sandbox_suite_catches_a_terminal_killed_with_a_command() {
+    block_on(conformance::sandbox::run(|| with_terminal_bug(TermBug::DiesWithCommands)));
 }
 
 #[test]

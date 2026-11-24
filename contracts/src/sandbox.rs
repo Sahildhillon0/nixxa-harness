@@ -5,8 +5,8 @@ use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, SandboxAction, SandboxActionKind, SandboxError,
-    Timestamp,
+    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, SandboxAction, SandboxActionKind,
+    SandboxError, TerminalSize, Timestamp,
 };
 
 /// What a sandbox backend can do.
@@ -23,6 +23,9 @@ pub struct SandboxCapabilities {
     /// and [`SandboxEvent::JobFinished`].
     #[serde(default)]
     pub jobs: bool,
+    /// Whether [`Sandbox::open_terminal`] works: the user's interactive terminal (`ctrl+t`).
+    #[serde(default)]
+    pub terminal: bool,
     /// Supported action kinds.
     pub actions: Vec<SandboxActionKind>,
 }
@@ -61,6 +64,19 @@ pub struct SandboxCapabilities {
 ///
 /// A backend that can't restrict the network reports [`NetworkAccess::Unrestricted`], and
 /// `set_network` returns [`SandboxError::Unsupported`].
+///
+/// The user's terminal, when [`SandboxCapabilities::terminal`] is set:
+/// * [`open_terminal`](Sandbox::open_terminal) starts a shell in the same place as commands,
+///   with a terminal of the given size; one at a time is enough (a second may be refused);
+/// * the shell echoes input, and sees each resize (`stty size`);
+/// * it is not a job of the agent's: it isn't in the job table, sends no `JobFinished`, and
+///   outlives the agent's commands, foreground and background;
+/// * [`Terminal::close`](crate::Terminal::close), dropping the handle, and [`reset`](Sandbox::reset)
+///   end it and everything it started, and its events then end with
+///   [`TerminalEvent::Closed`](crate::TerminalEvent::Closed); a closed terminal's `write` and
+///   `resize` fail.
+///
+/// Without a terminal, `open_terminal` returns [`SandboxError::Unsupported`] with the reason.
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     /// What this backend supports.
@@ -80,6 +96,13 @@ pub trait Sandbox: Send + Sync {
     async fn set_network(&self, policy: NetworkPolicy) -> Result<(), SandboxError> {
         let _ = policy;
         Err(SandboxError::Unsupported("this sandbox can't restrict the network".into()))
+    }
+
+    /// Opens the user's interactive terminal (`ctrl+t`) with `size`. The default, for backends
+    /// without one, is [`SandboxError::Unsupported`].
+    async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
+        let _ = size;
+        Err(SandboxError::Unsupported("this sandbox has no terminal".into()))
     }
 
     /// The sandbox's events from now on. Dropping the stream unsubscribes. The default, for

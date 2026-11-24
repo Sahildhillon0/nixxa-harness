@@ -186,7 +186,8 @@ internal is `pub(crate)`.
 | Trait | Implemented by | Core operations |
 |---|---|---|
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
-| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request) |
+| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request); open_terminal(size) → `OpenTerminal` (the user's `ctrl+t` shell) |
+| `Terminal` | `sandbox` | write(input); resize(size); close(). Dropping it closes the terminal |
 | `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
@@ -230,7 +231,10 @@ ones fail).
 The sandbox suite checks, besides the basics: unsupported kinds error, ids are echoed, paths
 that escape the workspace never succeed, `reset` keeps the workspace, an isolated backend that
 supports `Exec` really runs `echo`, and dropping an in-flight `execute` doesn't wedge the
-backend (the next call works).
+backend (the next call works). For a backend with a terminal: input echoes, `stty size` reports
+the size before and after a resize, the terminal outlives a command and a background job,
+`close`, a dropped handle and `reset` each end it (`Closed`, then the end of the stream), and a
+closed terminal refuses input; without one, `open_terminal` is `Unsupported`.
 
 ### Contract changes made in Stage 6
 - **Background jobs (#9):** `Exec { background }` → `Outcome::Started { job: JobId }`; the
@@ -241,6 +245,13 @@ backend (the next call works).
   `Sandbox::set_network(policy)`, `SandboxCapabilities.network: NetworkAccess` (the policy, or
   `Unrestricted` for a backend that isn't isolated), `Observation.network: Vec<NetRequest>`, and
   `SandboxEvent::NetRequest` (D-064, D-065).
+- **Terminal (#16):** `Sandbox::open_terminal(TerminalSize)` → `OpenTerminal { terminal, events }`:
+  a `Terminal` handle (`write`, `resize`, `close`; dropping it closes the terminal) and a stream
+  of `TerminalEvent::Output(bytes)`, then one `TerminalEvent::Closed { reason }`.
+  `SandboxCapabilities.terminal` says whether a backend has one; without it `open_terminal` is
+  `Unsupported`, with the reason. The terminal is the user's, not a job of the agent's: it isn't
+  in the job table, sends no `JobFinished`, outlives the agent's commands, and ends with
+  `close`, a dropped handle or `reset` (D-066).
 
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
@@ -250,7 +261,6 @@ These aren't in `contracts` yet. Each lands with the stage that needs it, as its
 |---|---|
 | `SandboxAction::Patch { path, edits, expected_hash }` (search/replace hunks against a known file state) | precise edits, plan diffs, undo (#15, #2) |
 | `Sandbox::checkpoint()` → `CheckpointId`, `Sandbox::restore(CheckpointId)`, `Sandbox::diff(from, to)` | undo (#15), worktree review (#6) |
-| Terminal: `Sandbox::open_terminal(size)` → a PTY stream (input, output, resize) | ctrl+t (#16) |
 | `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
 | `Verdict` provenance (`user`, `auto`, `plan`, `policy:<rule>`, `ci`) on every `ActionRecord` | audit (#4), CI (#12) |
