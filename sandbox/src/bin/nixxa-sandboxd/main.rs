@@ -23,6 +23,8 @@ mod network;
 mod protocol;
 #[cfg(target_os = "linux")]
 mod seccomp;
+#[cfg(target_os = "linux")]
+mod terminal;
 
 #[cfg(not(target_os = "linux"))]
 fn main() {
@@ -35,9 +37,9 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--limited") {
         let code = match (args.get(2), args.get(3).map(String::as_str), args.get(4)) {
-            (Some(rlimits), Some("--"), Some(command)) if args.len() == 5 => exec::limited(rlimits, command),
+            (Some(spec), Some("--"), Some(command)) if args.len() == 5 => exec::limited(spec, command),
             _ => {
-                eprintln!("nixxa-sandboxd: usage: --limited <rlimits> -- <command>");
+                eprintln!("nixxa-sandboxd: usage: --limited <spec> -- <command>");
                 126
             }
         };
@@ -73,13 +75,14 @@ mod daemon {
     use tokio::sync::{mpsc, oneshot};
     use tokio::task::JoinHandle;
 
-    use nixxa_contracts::{Outcome, SandboxAction};
+    use nixxa_contracts::{Outcome, SandboxAction, TerminalSize};
 
     use crate::files;
     use crate::job::{End, Table, no_such_job};
     use crate::jobs::{self, Capture, Spec, Supervisors};
     use crate::network::{self, Forwarder};
     use crate::protocol::{FrameError, FromDaemon, Limits, Op, Reply, ToDaemon, VERSION, read_frame, write_frame};
+    use crate::terminal::{self, Terminal};
 
     /// How often orphans of a dead supervisor are looked for.
     const SWEEP_EVERY: Duration = Duration::from_millis(200);
@@ -161,7 +164,18 @@ mod daemon {
 
         let background =
             Table::new(limits.max_background_jobs as usize, limits.background_output_cap as usize, &limits.job_prefix);
-        let mut daemon = Daemon { out, limits, root, self_exe, supervisors, background, foreground: None, forwarder };
+        let mut daemon = Daemon {
+            out,
+            limits,
+            root,
+            self_exe,
+            supervisors,
+            background,
+            foreground: None,
+            forwarder,
+            confine: landlock_ok,
+            terminal: None,
+        };
         let output = daemon.out.clone();
         let mut sweep = tokio::time::interval(SWEEP_EVERY);
         loop {
@@ -169,6 +183,11 @@ mod daemon {
                 msg = inbox.recv() => match msg {
                     Some(Ok(ToDaemon::Request { id, op })) => daemon.handle(id, op).await,
                     Some(Ok(ToDaemon::Cancel { id })) => daemon.cancel(id),
+                    Some(Ok(ToDaemon::TerminalAck { terminal, bytes })) => {
+                        if let Some(open) = daemon.terminal.as_ref().filter(|open| open.id == terminal) {
+                            open.acknowledge(bytes);
+                        }
+                    }
                     Some(Ok(ToDaemon::Hello { .. })) => {}
                     Some(Err(FrameError::Malformed(why))) => {
                         log(format_args!("ignored a malformed frame ({} bytes of error)", why.len()));
@@ -187,7 +206,7 @@ mod daemon {
                 _ = sweep.tick() => jobs::sweep_orphans(&daemon.supervisors),
             }
         }
-        daemon.stop_all().await;
+        daemon.stop_all("the sandbox stopped").await;
         jobs::sweep_orphans(&daemon.supervisors);
         0
     }
@@ -234,6 +253,10 @@ mod daemon {
         forwarder: Option<Forwarder>,
         /// The agent's foreground command, if one is running.
         foreground: Option<Foreground>,
+        /// Whether the agent's commands get their own Landlock layer (the daemon's is enforced).
+        confine: bool,
+        /// The user's terminal, if open (D-066). Not one of the agent's jobs.
+        terminal: Option<Terminal>,
     }
 
     struct Foreground {
@@ -271,8 +294,12 @@ mod daemon {
             }
         }
 
-        /// Stops the foreground command and every background job, and waits for them to end.
-        async fn stop_all(&mut self) {
+        /// Stops the foreground command, every background job and the terminal (saying `why`),
+        /// and waits for them to end.
+        async fn stop_all(&mut self, why: &str) {
+            if let Some(open) = self.terminal.take() {
+                open.close(why).await;
+            }
             if let Some(mut fg) = self.foreground.take() {
                 if let Some(stop) = fg.stop.take() {
                     let _ = stop.send(());
@@ -301,11 +328,71 @@ mod daemon {
                     }
                 },
                 Op::Reset => {
-                    self.stop_all().await;
+                    self.stop_all("the sandbox was reset").await;
                     log(format_args!("reset id={id}"));
                     self.reply(id, Reply::Done);
                 }
                 Op::Action { action } => self.act(id, action).await,
+                Op::TerminalOpen { terminal, size } => self.open_terminal(id, terminal, size),
+                Op::TerminalInput { terminal, data } => match self.live_terminal(terminal) {
+                    // Answered by the terminal once written.
+                    Some(open) => {
+                        if open.write(id, data).is_err() {
+                            self.reply(id, Reply::Error { message: "the terminal has ended".into() });
+                        }
+                    }
+                    None => self.reply(id, Reply::Error { message: "the terminal has ended".into() }),
+                },
+                Op::TerminalResize { terminal, size } => {
+                    let reply = match self.live_terminal(terminal).map(|open| open.resize(size)) {
+                        Some(Ok(())) => Reply::Done,
+                        Some(Err(message)) => Reply::Error { message },
+                        None => Reply::Error { message: "the terminal has ended".into() },
+                    };
+                    self.reply(id, reply);
+                }
+                Op::TerminalClose { terminal } => match self.terminal.take_if(|open| open.id == terminal) {
+                    // Answered once its whole tree is gone.
+                    Some(open) => {
+                        let out = self.out.clone();
+                        tokio::spawn(async move {
+                            open.close("it was closed").await;
+                            let _ = out.send(FromDaemon::Reply { id, reply: Reply::Done });
+                        });
+                    }
+                    None => self.reply(id, Reply::Done),
+                },
+            }
+        }
+
+        /// The terminal with the client's id `terminal`, if it is still running.
+        fn live_terminal(&self, terminal: u64) -> Option<&Terminal> {
+            self.terminal.as_ref().filter(|open| open.id == terminal && !open.is_finished())
+        }
+
+        /// Opens the user's terminal: one at a time.
+        fn open_terminal(&mut self, id: u64, terminal: u64, size: TerminalSize) {
+            // Without the agent's own Landlock layer, its commands could open the terminal.
+            if !self.confine {
+                let message = "no terminal without Landlock: the agent's commands couldn't be kept away from it".into();
+                return self.reply(id, Reply::Error { message });
+            }
+            if self.terminal.as_ref().is_some_and(|open| !open.is_finished()) {
+                return self.reply(id, Reply::Error { message: "a terminal is already open".into() });
+            }
+            // Its CPU time isn't limited to a foreground command's.
+            let mut rlimits = self.limits.rlimits;
+            rlimits.cpu_secs = rlimits.cpu_secs.max(self.limits.background_max_timeout_ms / 1000);
+            let setup = terminal::Setup { self_exe: self.self_exe.clone(), rlimits, env: self.network_env() };
+            match Terminal::open(terminal, size, setup, &self.supervisors, &self.out) {
+                Ok(open) => {
+                    log(format_args!("terminal {terminal} opened"));
+                    self.terminal = Some(open);
+                    self.reply(id, Reply::Done);
+                }
+                Err(message) => {
+                    self.reply(id, Reply::Error { message: format!("the terminal couldn't open: {message}") })
+                }
             }
         }
 
@@ -379,11 +466,13 @@ mod daemon {
             let spec = Spec {
                 command,
                 cwd,
-                limit: Duration::from_millis(limit),
+                limit: Some(Duration::from_millis(limit)),
                 rlimits: limits.rlimits,
                 self_exe: self.self_exe.clone(),
                 owner: "fg".into(),
                 env: self.network_env(),
+                confine: self.confine,
+                pty: None,
             };
             let capture = Capture::First { cap: limits.output_cap as usize };
             let (stop, stopped) = oneshot::channel();
@@ -425,11 +514,13 @@ mod daemon {
             let spec = Spec {
                 command,
                 cwd,
-                limit: Duration::from_millis(limit),
+                limit: Some(Duration::from_millis(limit)),
                 rlimits,
                 self_exe: self.self_exe.clone(),
                 owner: job.id.to_string(),
                 env: self.network_env(),
+                confine: self.confine,
+                pty: None,
             };
             let capture = Capture::Last { stdout: Arc::clone(&job.stdout), stderr: Arc::clone(&job.stderr) };
             // The reply goes out before the task runs (one thread, no await in between), so

@@ -26,7 +26,11 @@ new capability lives and the Stages section for the order.
 - PR B, the network allowlist: a host-side proxy per sandbox (CONNECT with an SNI check, plain
   HTTP, host-side DNS, private addresses refused; D-064), `ctrl+n` settings with presets, the
   status bar and the policy in the agent's instructions (D-065).
-- Next: PR C (terminal) and PR D (wake-ups, notifications).
+- PR C, the terminal: `Sandbox::open_terminal`, a PTY job in the daemon that the agent can't see
+  or reach (a second Landlock layer for every agent command), the user's shell in This
+  directory, protocol v4 with flow control (D-066); the `ctrl+t` pane through a VT100 emulator,
+  `ctrl+]` to leave, sharing chosen lines into the message input (D-067).
+- Next: PR D (wake-ups, notifications).
 
 **Stage 5 — Real memory, done:**
 - `SqliteStore` in `db/` (rusqlite bundled, WAL, forward-only migrations, FTS5 search;

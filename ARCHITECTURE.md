@@ -105,9 +105,10 @@ internal is `pub(crate)`.
 - **Does not own:** deciding what to run. It enforces its own hard limits and does not trust
   the controller to have been strict enough.
 - **Planned (§11):**
-  - the host-side egress proxy behind the network allowlist (#1);
-  - PTY sessions for the user's terminal (#16);
-  - background jobs (#9) and long-running services (language servers, sandboxed MCP servers);
+  - the host-side egress proxy behind the network allowlist (#1; done, D-064);
+  - PTY sessions for the user's terminal (#16; done, D-066);
+  - background jobs (#9; done, D-061 to D-063) and long-running services (language servers,
+    sandboxed MCP servers);
   - workspace checkpoints and the `Patch` action behind undo (#15);
   - LSP queries and the repo map as built-in actions (#8);
   - read-only mounts for paths the project policy protects (#5).
@@ -148,9 +149,9 @@ internal is `pub(crate)`.
 - **Does not own:** any agent logic. If the harness contains an `if` about what the agent
   should do, it belongs in the controller.
 - **Planned (§11):**
-  - the ctrl+t terminal pane (#16);
+  - the ctrl+t terminal pane (#16; done, D-067);
   - slash commands (#10);
-  - network settings (#1);
+  - network settings (#1; done, D-065);
   - several sessions in tabs, git worktrees and the merge review (#6);
   - notifications (#9);
   - reading `AGENTS.md` and handing its rules to the controller (#5);
@@ -186,7 +187,8 @@ internal is `pub(crate)`.
 | Trait | Implemented by | Core operations |
 |---|---|---|
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
-| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request) |
+| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request); open_terminal(size) → `OpenTerminal` (the user's `ctrl+t` shell) |
+| `Terminal` | `sandbox` | write(input); resize(size); close(). Dropping it closes the terminal |
 | `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
@@ -230,7 +232,10 @@ ones fail).
 The sandbox suite checks, besides the basics: unsupported kinds error, ids are echoed, paths
 that escape the workspace never succeed, `reset` keeps the workspace, an isolated backend that
 supports `Exec` really runs `echo`, and dropping an in-flight `execute` doesn't wedge the
-backend (the next call works).
+backend (the next call works). For a backend with a terminal: input echoes, `stty size` reports
+the size before and after a resize, the terminal outlives a command and a background job,
+`close`, a dropped handle and `reset` each end it (`Closed`, then the end of the stream), and a
+closed terminal refuses input; without one, `open_terminal` is `Unsupported`.
 
 ### Contract changes made in Stage 6
 - **Background jobs (#9):** `Exec { background }` → `Outcome::Started { job: JobId }`; the
@@ -241,6 +246,13 @@ backend (the next call works).
   `Sandbox::set_network(policy)`, `SandboxCapabilities.network: NetworkAccess` (the policy, or
   `Unrestricted` for a backend that isn't isolated), `Observation.network: Vec<NetRequest>`, and
   `SandboxEvent::NetRequest` (D-064, D-065).
+- **Terminal (#16):** `Sandbox::open_terminal(TerminalSize)` → `OpenTerminal { terminal, events }`:
+  a `Terminal` handle (`write`, `resize`, `close`; dropping it closes the terminal) and a stream
+  of `TerminalEvent::Output(bytes)`, then one `TerminalEvent::Closed { reason }`.
+  `SandboxCapabilities.terminal` says whether a backend has one; without it `open_terminal` is
+  `Unsupported`, with the reason. The terminal is the user's, not a job of the agent's: it isn't
+  in the job table, sends no `JobFinished`, outlives the agent's commands, and ends with
+  `close`, a dropped handle or `reset` (D-066).
 
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
@@ -250,7 +262,6 @@ These aren't in `contracts` yet. Each lands with the stage that needs it, as its
 |---|---|
 | `SandboxAction::Patch { path, edits, expected_hash }` (search/replace hunks against a known file state) | precise edits, plan diffs, undo (#15, #2) |
 | `Sandbox::checkpoint()` → `CheckpointId`, `Sandbox::restore(CheckpointId)`, `Sandbox::diff(from, to)` | undo (#15), worktree review (#6) |
-| Terminal: `Sandbox::open_terminal(size)` → a PTY stream (input, output, resize) | ctrl+t (#16) |
 | `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
 | `Verdict` provenance (`user`, `auto`, `plan`, `policy:<rule>`, `ci`) on every `ActionRecord` | audit (#4), CI (#12) |
@@ -494,10 +505,12 @@ recorded in the DESIGN.md decision log before it is built.
   its own process tree with its own limits. Kills target one job, never the user's shell.
   *Done (D-061, D-062):* each job runs under a supervisor that is a child subreaper, so a job is
   exactly that supervisor's descendants; the daemon is a subreaper too, as a backstop. *Done
-  (D-064):* the egress proxy, a Unix socket mounted at `/run/nixxa` and forwarded from
-  `127.0.0.1:3128`. The
-  host side gains the egress proxy, reached from inside through a Unix socket the daemon
-  forwards to `127.0.0.1` in the sandbox.
+  (D-064):* the egress proxy on the host side, a Unix socket mounted at `/run/nixxa` and
+  forwarded from `127.0.0.1:3128`. *Done (D-066):* the user's terminal is a PTY job in the
+  daemon. The daemon's Landlock layer allows the terminal devices; every agent command's
+  supervisor adds a second layer without them, so the agent's commands can't open the user's
+  terminal or reach its shell's `/proc` entries. Its output has its own flow-controlled stream
+  in protocol version 4.
 - **Stage 12:** background sessions. A long-running `nixxa` service hosts the controllers, and
   the TUI becomes a client that can detach and re-attach. Until then, background work lives
   inside a running TUI.
@@ -635,6 +648,10 @@ their stage.
   action sends a chosen part of its output as a message.
 - **Daemon change:** it can't kill the user's shell when the agent's command ends, which is why
   Stage 6 moves the daemon to per-job tracking (§7).
+- **Done (D-066, D-067):** `Sandbox::open_terminal`; a PTY job in the daemon, the user's
+  `$SHELL` in This directory (Unix), a scripted one in the fake; the pane renders through a
+  VT100 emulator into cells, `ctrl+]` leaves it, and `s` puts chosen lines in the message input
+  for the user to edit and send.
 
 ### #9 Background tasks and notifications (sandbox + controller + harness)
 - **In-session jobs (Stage 6):** the agent can start a long command in the background
@@ -907,7 +924,11 @@ Every stage ends with something that runs and a checklist that must be true befo
   - PR B, the network allowlist (D-064, D-065): done. `cargo test` with a crates.io dependency
     passes inside the sandbox with only the crates.io preset allowed, and another host is
     blocked and logged (`needs_internet_cargo_test_with_only_crates_io_allowed`).
-  - PR C (terminal), PR D (wake-ups and notifications): not started.
+  - PR C, the terminal (D-066, D-067): done. `ctrl+t` opens a shell in the same sandbox (a PTY
+    job under its own supervisor), which survives the agent's commands, background jobs, timeouts
+    and cancels (`tests/terminal.rs`), isn't visible to the agent, and can't be reached by the
+    agent's commands (a second Landlock layer without the terminal devices).
+  - PR D (wake-ups and notifications): not started.
 - **Exit:**
   - `cargo test` on a fresh project with a crates.io dependency passes inside the sandbox with
     only crates.io allowed, and a request to another host is blocked and logged;

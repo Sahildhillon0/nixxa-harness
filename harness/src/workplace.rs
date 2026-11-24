@@ -101,6 +101,8 @@ impl Workplace {
                 root: workspace.root.clone(),
                 hidden_env: SECRET_ENV.iter().map(|name| (*name).to_string()).collect(),
                 jobs: job_limits(),
+                // The terminal runs the user's own shell.
+                shell: std::env::var_os("SHELL").filter(|shell| !shell.is_empty()).map(PathBuf::from),
             };
             let sandbox = HostSandbox::new(config).map_err(|err| format!("can't work in this directory: {err}"))?;
             return Ok(Self { place, sandbox: Arc::new(sandbox), copy: None, fake: false });

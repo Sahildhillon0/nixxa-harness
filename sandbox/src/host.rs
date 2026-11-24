@@ -11,6 +11,10 @@
 //! at once, a time limit, the last part of their output). On Unix each job is its own process
 //! group, and ending it kills the group; a process that leaves the group (`setsid`) escapes,
 //! which is one more way this mode isn't isolated. On Windows only the shell itself is killed.
+//!
+//! The user's terminal (`ctrl+t`, Unix only) is the user's own shell in the root, on a PTY; see
+//! `host_terminal.rs`. On Windows there is none yet: it needs ConPTY (Stage 16), and
+//! [`Sandbox::open_terminal`] says so.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -25,8 +29,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, DirEntry, JobId, NetworkAccess, Observation, Outcome, Sandbox, SandboxAction, SandboxActionKind,
-    SandboxCapabilities, SandboxError, SandboxEvent,
+    ActionId, DirEntry, JobId, NetworkAccess, Observation, OpenTerminal, Outcome, Sandbox, SandboxAction,
+    SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, TerminalSize,
 };
 
 use crate::JobLimits;
@@ -50,10 +54,13 @@ const DRAIN: Duration = Duration::from_secs(2);
 pub struct HostConfig {
     /// The directory to work in. Every path is relative to it.
     pub root: PathBuf,
-    /// Environment variables commands must not see (secrets the harness itself reads).
+    /// Environment variables commands and the terminal must not see (secrets the harness
+    /// itself reads).
     pub hidden_env: Vec<String>,
     /// Limits on background jobs.
     pub jobs: JobLimits,
+    /// The user's shell for the terminal (the harness passes `$SHELL`); `/bin/sh` without one.
+    pub shell: Option<PathBuf>,
 }
 
 /// Works on the real files under one host directory. Not isolated.
@@ -68,6 +75,12 @@ pub struct HostSandbox {
     /// can kill them at once, even when the runtime is shutting down and no task runs again.
     running: Groups,
     events: broadcast::Sender<SandboxEvent>,
+    /// The shell the terminal runs.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    shell: Option<PathBuf>,
+    /// The open terminal, if any.
+    #[cfg(unix)]
+    terminal: crate::host_terminal::Slot,
 }
 
 /// Shell pids of the running jobs, by job.
@@ -83,6 +96,8 @@ impl Drop for HostSandbox {
         }
         let pids: Vec<u32> = self.running.lock().map(|running| running.values().copied().collect()).unwrap_or_default();
         pids.into_iter().for_each(kill_group);
+        #[cfg(unix)]
+        crate::host_terminal::end_now(&self.terminal);
     }
 }
 
@@ -104,6 +119,9 @@ impl HostSandbox {
             jobs: Mutex::new(jobs),
             running: Groups::default(),
             events: broadcast::channel(crate::events::CAPACITY).0,
+            shell: config.shell,
+            #[cfg(unix)]
+            terminal: crate::host_terminal::Slot::default(),
         })
     }
 
@@ -416,8 +434,23 @@ impl Sandbox for HostSandbox {
             isolated: false,
             network: NetworkAccess::Unrestricted,
             jobs: true,
+            terminal: cfg!(unix),
             actions: SandboxActionKind::ALL.to_vec(),
         }
+    }
+
+    #[cfg(unix)]
+    async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
+        let shell = crate::host_terminal::shell_or_default(self.shell.as_ref());
+        crate::host_terminal::open(&self.terminal, &self.root, &shell, &self.hidden_env, size)
+    }
+
+    #[cfg(not(unix))]
+    async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
+        let _ = size;
+        Err(SandboxError::Unsupported(
+            "the terminal isn't available on Windows yet: it needs ConPTY, which comes with Stage 16".into(),
+        ))
     }
 
     fn subscribe(&self) -> BoxStream<'static, SandboxEvent> {
@@ -467,6 +500,8 @@ impl Sandbox for HostSandbox {
         for job in stopped {
             job.wait().await;
         }
+        #[cfg(unix)]
+        crate::host_terminal::end(&self.terminal, "the sandbox was reset").await;
         // A running foreground command is killed when its future is dropped.
         Ok(())
     }
@@ -494,8 +529,13 @@ mod tests {
     }
 
     fn host(root: &Path) -> HostSandbox {
-        HostSandbox::new(HostConfig { root: root.to_path_buf(), hidden_env: Vec::new(), jobs: JobLimits::default() })
-            .expect("host sandbox")
+        HostSandbox::new(HostConfig {
+            root: root.to_path_buf(),
+            hidden_env: Vec::new(),
+            jobs: JobLimits::default(),
+            shell: Some("/bin/sh".into()),
+        })
+        .expect("host sandbox")
     }
 
     async fn run_action(sandbox: &HostSandbox, action: SandboxAction) -> Outcome {
@@ -522,8 +562,8 @@ mod tests {
     #[test]
     fn a_missing_root_is_unavailable() {
         let missing = scratch().join("not-here");
-        let err = HostSandbox::new(HostConfig { root: missing, hidden_env: Vec::new(), jobs: JobLimits::default() })
-            .unwrap_err();
+        let config = HostConfig { root: missing, hidden_env: Vec::new(), jobs: JobLimits::default(), shell: None };
+        let err = HostSandbox::new(config).unwrap_err();
         assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
     }
 
@@ -627,6 +667,7 @@ mod tests {
             root: scratch(),
             hidden_env: vec!["HOME".into()],
             jobs: JobLimits::default(),
+            shell: None,
         })
         .expect("host sandbox");
         let Outcome::Exec { stdout, .. } = run_action(&sandbox, exec("echo \"[${HOME-unset}]\"")).await else {
@@ -732,6 +773,7 @@ mod tests {
             root: scratch(),
             hidden_env: vec!["HOME".into()],
             jobs: JobLimits::default(),
+            shell: None,
         })
         .expect("host sandbox");
         let mut events = sandbox.subscribe();
@@ -745,6 +787,88 @@ mod tests {
             panic!("expected text")
         };
         assert!(content.contains("[unset]"), "{content}");
+    }
+
+    /// Reads a terminal's events until its output contains `want` (10 s at most).
+    #[cfg(unix)]
+    async fn shown(open: &mut nixxa_contracts::OpenTerminal, want: &str) -> String {
+        use futures::StreamExt;
+        let mut seen = String::new();
+        let wait = async {
+            while !seen.contains(want) {
+                match open.events.next().await {
+                    Some(nixxa_contracts::TerminalEvent::Output(bytes)) => {
+                        seen.push_str(&String::from_utf8_lossy(&bytes))
+                    }
+                    other => panic!("the terminal ended before {want:?}: {other:?} after {seen:?}"),
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), wait).await.unwrap_or_else(|_| panic!("no {want:?}"));
+        seen
+    }
+
+    const SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_terminal_hides_the_secret_variables_and_starts_in_the_root() {
+        let root = scratch();
+        let sandbox = HostSandbox::new(HostConfig {
+            root: root.clone(),
+            hidden_env: vec!["HOME".into()],
+            jobs: JobLimits::default(),
+            shell: Some("/bin/sh".into()),
+        })
+        .expect("host sandbox");
+        let mut open = sandbox.open_terminal(SIZE).await.expect("open");
+        open.terminal
+            .write(b"echo \"[${HOME-unset}]-$((1+1))\" > seen.txt; pwd -P >> seen.txt; echo done-$((2+2))\r")
+            .await
+            .unwrap();
+        shown(&mut open, "done-4").await;
+        let seen = std::fs::read_to_string(root.join("seen.txt")).unwrap();
+        assert_eq!(seen, format!("[unset]-2\n{}\n", sandbox.root.display()));
+    }
+
+    /// What quitting does: the sandbox is dropped inside the runtime, then the runtime. The
+    /// terminal's handle is leaked here, so only the sandbox can end it.
+    #[cfg(unix)]
+    #[test]
+    fn the_terminal_ends_when_the_app_quits() {
+        let root = scratch();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().expect("runtime");
+        runtime.block_on(async {
+            let sandbox = host(&root);
+            let mut open = sandbox.open_terminal(SIZE).await.expect("open");
+            open.terminal.write(b"echo $$ > shell.pid; echo ready-$((3+3))\r").await.unwrap();
+            shown(&mut open, "ready-6").await;
+            std::mem::forget(open);
+            drop(sandbox);
+        });
+        drop(runtime);
+        let pid: i32 = std::fs::read_to_string(root.join("shell.pid")).unwrap().trim().parse().unwrap();
+        let pid = rustix::process::Pid::from_raw(pid).unwrap();
+        let gone = (0..100).any(|_| {
+            let alive = rustix::process::test_kill_process(pid).is_ok()
+                && !std::fs::read_to_string(format!("/proc/{}/stat", pid.as_raw_nonzero())).is_ok_and(|stat| {
+                    stat.rsplit_once(')').is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+                });
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        assert!(gone, "the terminal's shell {} outlived the session", pid.as_raw_nonzero());
+    }
+
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn there_is_no_terminal_on_windows_and_it_says_why() {
+        let sandbox = host(&scratch());
+        assert!(!sandbox.capabilities().terminal);
+        let err = sandbox.open_terminal(SIZE).await.map(|_| ()).unwrap_err();
+        assert!(matches!(&err, SandboxError::Unsupported(why) if why.contains("ConPTY")), "{err:?}");
     }
 
     #[cfg(unix)]

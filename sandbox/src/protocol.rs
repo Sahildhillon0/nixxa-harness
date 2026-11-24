@@ -12,16 +12,22 @@
 //! running the client may send [`ToDaemon::Cancel`] for it (or a `Reset`); the daemon kills the
 //! command and still replies to it.
 //!
+//! The user's terminal (version 4): [`Op::TerminalOpen`] starts it; its output comes as
+//! [`FromDaemon::TerminalOutput`] frames, then one [`FromDaemon::TerminalClosed`]. The daemon
+//! sends at most a window (64 KiB) of output the client hasn't acknowledged
+//! ([`ToDaemon::TerminalAck`], sent as the output is consumed), and stops reading the PTY until
+//! more is acknowledged: a slow reader makes the shell wait, and nothing is dropped.
+//!
 //! This file is compiled into both the library and the daemon binary.
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-use nixxa_contracts::{Outcome, SandboxAction, SandboxEvent};
+use nixxa_contracts::{Outcome, SandboxAction, SandboxEvent, TerminalSize};
 
 /// The protocol version both ends must agree on.
-pub(crate) const VERSION: u32 = 3;
+pub(crate) const VERSION: u32 = 4;
 
 /// The largest frame either end sends or accepts, in bytes (the JSON body, without the prefix).
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -80,6 +86,9 @@ pub(crate) enum ToDaemon {
     Request { id: u64, op: Op },
     /// Stop the request with this id if it is still running. It is still answered.
     Cancel { id: u64 },
+    /// The client has consumed this many bytes of the terminal's output: the daemon may send
+    /// that much more. Not answered.
+    TerminalAck { terminal: u64, bytes: u32 },
 }
 
 /// What a [`ToDaemon::Request`] asks for.
@@ -94,6 +103,18 @@ pub(crate) enum Op {
     Ping,
     /// Turn the network proxy on or off for the commands started from now on.
     Network { on: bool },
+    /// Open the user's terminal, with the client's id for it. Answered once it has started.
+    TerminalOpen { terminal: u64, size: TerminalSize },
+    /// Bytes typed into the terminal. Answered once the terminal has taken them.
+    TerminalInput {
+        terminal: u64,
+        #[serde(with = "base64")]
+        data: Vec<u8>,
+    },
+    /// The terminal's new size.
+    TerminalResize { terminal: u64, size: TerminalSize },
+    /// End the terminal and everything it started. Answered once they are gone.
+    TerminalClose { terminal: u64 },
 }
 
 /// The isolation layers the daemon applied to itself at start-up.
@@ -113,8 +134,16 @@ pub(crate) enum FromDaemon {
     Hello { version: u32, layers: ActiveLayers },
     /// The answer to the request with this id.
     Reply { id: u64, reply: Reply },
-    /// An unsolicited event (job completion, network request, terminal output).
+    /// An unsolicited event (job completion, network request).
     Event { event: SandboxEvent },
+    /// Output of the user's terminal.
+    TerminalOutput {
+        terminal: u64,
+        #[serde(with = "base64")]
+        data: Vec<u8>,
+    },
+    /// The user's terminal has ended; nothing more comes from it.
+    TerminalClosed { terminal: u64, reason: String },
 }
 
 /// The result of one request.
@@ -208,6 +237,60 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin, T: DeserializeOwned>(r: &mu
     decode(&body)
 }
 
+/// Terminal bytes as base64 text (JSON has no bytes, and an array of numbers is four times
+/// larger).
+mod base64 {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    pub(crate) fn encode(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+        for chunk in bytes.chunks(3) {
+            let n = chunk.iter().enumerate().fold(0u32, |n, (i, b)| n | u32::from(*b) << (16 - 8 * i));
+            for i in 0..4 {
+                if i <= chunk.len() {
+                    out.push(char::from(ALPHABET[(n >> (18 - 6 * i) & 63) as usize]));
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn decode(text: &str) -> Result<Vec<u8>, String> {
+        let text = text.as_bytes();
+        if text.len() % 4 != 0 {
+            return Err("base64 text must come in groups of four".into());
+        }
+        let mut out = Vec::with_capacity(text.len() / 4 * 3);
+        for (index, group) in text.chunks(4).enumerate() {
+            let last = index + 1 == text.len() / 4;
+            let pad = group.iter().rev().take_while(|c| **c == b'=').count();
+            if pad > 2 || (pad > 0 && !last) {
+                return Err("misplaced base64 padding".into());
+            }
+            let mut n = 0u32;
+            for (i, c) in group[..4 - pad].iter().enumerate() {
+                let value = ALPHABET.iter().position(|a| a == c).ok_or("not base64")?;
+                n |= (value as u32) << (18 - 6 * i);
+            }
+            out.extend_from_slice(&n.to_be_bytes()[1..4 - pad]);
+        }
+        Ok(out)
+    }
+
+    pub(crate) fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&encode(bytes))
+    }
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        decode(&text).map_err(serde::de::Error::custom)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,7 +335,18 @@ mod tests {
             ToDaemon::Request { id: 8, op: Op::Reset },
             ToDaemon::Request { id: 9, op: Op::Ping },
             ToDaemon::Request { id: 10, op: Op::Network { on: true } },
+            ToDaemon::Request {
+                id: 11,
+                op: Op::TerminalOpen { terminal: 1, size: TerminalSize { cols: 80, rows: 24 } },
+            },
+            ToDaemon::Request { id: 12, op: Op::TerminalInput { terminal: 1, data: b"ls\r\x03\xff".to_vec() } },
+            ToDaemon::Request {
+                id: 13,
+                op: Op::TerminalResize { terminal: 1, size: TerminalSize { cols: 1, rows: 2 } },
+            },
+            ToDaemon::Request { id: 14, op: Op::TerminalClose { terminal: 1 } },
             ToDaemon::Cancel { id: 7 },
+            ToDaemon::TerminalAck { terminal: 1, bytes: 4096 },
         ];
         for msg in to {
             assert_eq!(round_trip(&msg).await, msg);
@@ -267,9 +361,25 @@ mod tests {
             FromDaemon::Reply { id: 3, reply: Reply::Cancelled },
             FromDaemon::Reply { id: 4, reply: Reply::Done },
             FromDaemon::Reply { id: 5, reply: Reply::Error { message: "busy".into() } },
+            FromDaemon::TerminalOutput { terminal: 1, data: b"\x1b]52;c;aGk=\x07".to_vec() },
+            FromDaemon::TerminalClosed { terminal: 1, reason: "the shell exited".into() },
         ];
         for msg in from {
             assert_eq!(round_trip(&msg).await, msg);
+        }
+    }
+
+    #[test]
+    fn base64_round_trips_every_length_and_byte() {
+        let all: Vec<u8> = (0..=255).collect();
+        for len in 0..all.len() {
+            let text = base64::encode(&all[..len]);
+            assert_eq!(base64::decode(&text).unwrap(), &all[..len], "{len}");
+        }
+        assert_eq!(base64::encode(b"hi"), "aGk=");
+        assert_eq!(base64::encode(b"nixxa"), "bml4eGE=");
+        for bad in ["a", "aGk", "a===", "aG=k", "aGk=aGk=", "a!k="] {
+            assert!(base64::decode(bad).is_err(), "{bad}");
         }
     }
 

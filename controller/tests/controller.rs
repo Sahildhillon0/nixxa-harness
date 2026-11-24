@@ -84,6 +84,7 @@ impl Sandbox for EchoSandbox {
             isolated: false,
             network: NetworkAccess::default(),
             jobs: false,
+            terminal: false,
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }

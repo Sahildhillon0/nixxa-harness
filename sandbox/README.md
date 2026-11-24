@@ -23,8 +23,8 @@ The job table and the words the agent reads live in `src/job.rs`, shared by the 
 
 `bwrap::BwrapSandbox` (Linux, Stage 4) starts `nixxa-sandboxd`
 inside bubblewrap and talks to it over length-prefixed JSON frames on stdio (`src/protocol.rs`,
-protocol VERSION 3: requests carry ids and may overlap, and the daemon pushes `Event` frames
-between replies; D-062). The daemon applies Landlock (filesystem) and a seccomp deny-list to
+protocol VERSION 4: requests carry ids and may overlap, the daemon pushes `Event` frames
+between replies (D-062), and the user's terminal has its own requests and frames). The daemon applies Landlock (filesystem) and a seccomp deny-list to
 itself at start-up, and does reads, writes and listings itself with `openat2(RESOLVE_BENEATH)`
 beneath `/workspace`. Each command, foreground or background, runs under its own supervisor
 (`nixxa-sandboxd --limited`, a child subreaper that applies the rlimits and starts
@@ -35,7 +35,7 @@ output stream (the command is killed past it), rlimits, and a `systemd-run --use
 cgroup with memory and task caps when the user's systemd allows it (otherwise the backend is
 named `bubblewrap (rlimits only, no cgroup)`). It reports `isolated: true` only when
 namespaces, Landlock and seccomp are all active; a kernel without Landlock runs degraded and
-the backend name says so. Decisions: D-040 to D-046, D-061 to D-063.
+the backend name says so. Decisions: D-040 to D-046, D-061 to D-063, D-066.
 
 **The network (D-064):** `BwrapSandbox` owns a host-side proxy (`src/proxy/`): a Unix socket in a
 private directory mounted read-only at `/run/nixxa`, which the daemon forwards from
@@ -48,7 +48,28 @@ allowing a name on a shared CDN lets commands ask that server for its other site
 policy starts Off (no proxy variables, nothing logged). The presets live in `src/network.rs`.
 `HostSandbox` reports the network as unrestricted; `FakeSandbox` keeps the policy it is given.
 
-Tests: `tests/network.rs` (blocked and allowed hosts, private addresses, IP literals, ports, raw
+**The user's terminal (D-066):** `Sandbox::open_terminal(size)` → a `Terminal` handle and a stream
+of output then `Closed { reason }`. In `BwrapSandbox` the daemon opens a PTY in the sandbox's own
+`devpts` and runs bash (or sh) under its own supervisor (`src/bin/nixxa-sandboxd/terminal.rs`; the
+supervisor starts a session and takes the PTY as its controlling terminal in `exec.rs`): a job
+for rlimits, cgroup and tree tracking, but not the agent's (no time limit or output cap, not in
+the job table, no `JobFinished`, untouched by the agent's commands); `close`, `reset` and the
+daemon ending stop it, one at a time. Output is flow-controlled (64 KiB ahead of the client's
+acknowledgements). The daemon's Landlock layer allows `/dev/ptmx`, `/dev/pts` and the terminal's home
+`/nixxa-home` (a tmpfs, so its start-up files and history aren't the agent's); each agent
+command's supervisor adds a second layer without them (`landlock.rs`), so the agent's commands
+can't open the user's terminal, plant files its shell runs, read its history, or reach its
+shell's `/proc/<pid>/fd` and `environ` (they can still see command lines and send signals; and
+what the user runs from the workspace is code the agent may have written). TIOCSTI stays refused
+by seccomp. Without Landlock there is no terminal. `HostSandbox` runs the user's `$SHELL` on a PTY (`src/host_terminal.rs`, `portable-pty`,
+Unix only; Windows says it needs ConPTY), without the hidden variables, killed in `Drop`.
+`FakeSandbox` has a scripted one.
+
+Tests: `tests/terminal.rs` (the same sandbox, survives everything the agent does, close kills
+its whole tree at once and nothing else, exit / reset / daemon death with reasons, one at a time,
+invisible to the agent's job actions and events, its requests attributed to it, no secret
+environment or host files, unreachable from the agent's commands, TIOCSTI refused),
+`tests/network.rs` (blocked and allowed hosts, private addresses, IP literals, ports, raw
 TCP and UDP, Off, the mount, job attribution; two `needs_internet_` tests run with `--ignored`),
 the proxy's own tests (`src/proxy/tests.rs`), `tests/bwrap_conformance.rs` (the contract suite), `tests/bwrap.rs` (cancellation, reset,
 daemon restart, limits), `tests/jobs.rs` (background jobs: a job's whole tree dies with it and

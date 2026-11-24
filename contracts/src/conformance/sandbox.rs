@@ -9,8 +9,8 @@ use futures::stream::BoxStream;
 
 use super::id;
 use crate::{
-    DomainRule, JobId, NetworkAccess, NetworkPolicy, Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxError,
-    SandboxEvent,
+    DomainRule, JobId, NetworkAccess, NetworkPolicy, OpenTerminal, Outcome, Sandbox, SandboxAction, SandboxActionKind,
+    SandboxError, SandboxEvent, TerminalEvent, TerminalSize,
 };
 
 /// The job kinds a backend with jobs must list.
@@ -50,6 +50,12 @@ pub async fn run<S: Sandbox, F: Fn() -> S>(fresh: F) {
     unknown_jobs_fail(&fresh()).await;
     reset_stops_jobs(&fresh()).await;
     network_policy_is_reported(&fresh()).await;
+    terminals_are_declared_consistently(&fresh()).await;
+    terminal_echoes_and_reports_its_size(&fresh()).await;
+    terminal_outlives_commands(&fresh()).await;
+    closing_a_terminal_ends_it(&fresh()).await;
+    dropping_a_terminal_does_not_wedge(&fresh()).await;
+    reset_ends_the_terminal(&fresh()).await;
 }
 
 async fn describes_itself(sandbox: &dyn Sandbox) {
@@ -329,4 +335,155 @@ async fn network_policy_is_reported(sandbox: &dyn Sandbox) {
             }
         }
     }
+}
+
+/// The size every terminal scenario opens with.
+const SIZE: TerminalSize = TerminalSize { cols: 80, rows: 24 };
+/// How long a terminal may take to answer.
+const TERMINAL_PATIENCE: Duration = Duration::from_secs(20);
+
+async fn open(sandbox: &dyn Sandbox, rule: &str) -> OpenTerminal {
+    match sandbox.open_terminal(SIZE).await {
+        Ok(open) => open,
+        Err(err) => panic!("{rule}: open_terminal failed: {err:?}"),
+    }
+}
+
+/// Reads `events` until the output so far contains `want`. Panics with `rule` if it doesn't
+/// arrive in time or the terminal ends first.
+async fn wait_output(events: &mut BoxStream<'static, TerminalEvent>, want: &str, rule: &str) {
+    let mut deadline = timer(TERMINAL_PATIENCE);
+    let mut seen = Vec::new();
+    while !String::from_utf8_lossy(&seen).contains(want) {
+        match futures::future::select(events.next(), &mut deadline).await {
+            Either::Left((Some(TerminalEvent::Output(bytes)), _)) => seen.extend(bytes),
+            Either::Left((Some(TerminalEvent::Closed { reason }), _)) => {
+                panic!("{rule}: the terminal ended ({reason}) before showing {want:?}")
+            }
+            Either::Left((None, _)) => panic!("{rule}: the terminal's events ended before showing {want:?}"),
+            Either::Right(_) => {
+                let tail = String::from_utf8_lossy(&seen);
+                let tail: String = tail.chars().rev().take(200).collect::<Vec<_>>().into_iter().rev().collect();
+                panic!("{rule}: no {want:?} in the terminal's output (it ends {tail:?})")
+            }
+        }
+    }
+}
+
+/// Reads `events` until [`TerminalEvent::Closed`] and the end of the stream; returns the reason.
+async fn wait_closed(events: &mut BoxStream<'static, TerminalEvent>, rule: &str) -> String {
+    let mut deadline = timer(TERMINAL_PATIENCE);
+    let mut reason = None;
+    loop {
+        match futures::future::select(events.next(), &mut deadline).await {
+            Either::Left((Some(TerminalEvent::Output(_)), _)) => {
+                assert!(reason.is_none(), "{rule}: output came after Closed");
+            }
+            Either::Left((Some(TerminalEvent::Closed { reason: why }), _)) => {
+                assert!(reason.is_none(), "{rule}: Closed came twice");
+                assert!(!why.trim().is_empty(), "{rule}: Closed must say why");
+                reason = Some(why);
+            }
+            Either::Left((None, _)) => match reason {
+                Some(reason) => return reason,
+                None => panic!("{rule}: the events ended without Closed"),
+            },
+            Either::Right(_) => panic!("{rule}: the terminal didn't end"),
+        }
+    }
+}
+
+async fn terminals_are_declared_consistently(sandbox: &dyn Sandbox) {
+    if sandbox.capabilities().terminal {
+        return;
+    }
+    let r = sandbox.open_terminal(SIZE).await;
+    assert!(
+        matches!(r, Err(SandboxError::Unsupported(_))),
+        "without a terminal, open_terminal must be Unsupported, got {:?}",
+        r.map(|_| "a terminal")
+    );
+}
+
+async fn terminal_echoes_and_reports_its_size(sandbox: &dyn Sandbox) {
+    if !sandbox.capabilities().terminal {
+        return;
+    }
+    let rule = "a terminal must echo its input";
+    let OpenTerminal { terminal, mut events } = open(sandbox, rule).await;
+    terminal.write(b"echo nixxa-terminal\r").await.expect("write to the terminal");
+    wait_output(&mut events, "nixxa-terminal", rule).await;
+    terminal.write(b"stty size\r").await.expect("write to the terminal");
+    wait_output(&mut events, "24 80", "`stty size` must report the terminal's size").await;
+    terminal.resize(TerminalSize { cols: 100, rows: 30 }).await.expect("resize the terminal");
+    terminal.write(b"stty size\r").await.expect("write to the terminal");
+    wait_output(&mut events, "30 100", "`stty size` must report the size after a resize").await;
+    terminal.close().await.expect("close the terminal");
+    wait_closed(&mut events, "closing a terminal must end it").await;
+}
+
+async fn terminal_outlives_commands(sandbox: &dyn Sandbox) {
+    let caps = sandbox.capabilities();
+    if !(caps.terminal && caps.actions.contains(&SandboxActionKind::Exec)) {
+        return;
+    }
+    let rule = "a terminal must outlive the agent's commands";
+    let OpenTerminal { terminal, mut events } = open(sandbox, rule).await;
+    sandbox.execute(id(700), sample(SandboxActionKind::Exec)).await.expect("exec");
+    if caps.jobs {
+        let mut jobs = sandbox.subscribe();
+        let job = start(sandbox, 701, "echo nixxa").await;
+        wait_finished(&mut jobs, std::slice::from_ref(&job), "a background job must report its end").await;
+        let status = sandbox.execute(id(702), SandboxAction::JobStatus { job: JobId::new("terminal") }).await;
+        if let Ok(obs) = status {
+            assert!(
+                matches!(obs.outcome, Outcome::Failed { .. } | Outcome::Denied { .. }),
+                "the terminal must not be a job of the agent's, got {:?}",
+                obs.outcome
+            );
+        }
+    }
+    terminal.write(b"echo still-here\r").await.unwrap_or_else(|err| panic!("{rule}: {err:?}"));
+    wait_output(&mut events, "still-here", rule).await;
+    terminal.close().await.expect("close the terminal");
+    wait_closed(&mut events, "closing a terminal must end it").await;
+}
+
+async fn closing_a_terminal_ends_it(sandbox: &dyn Sandbox) {
+    if !sandbox.capabilities().terminal {
+        return;
+    }
+    let rule = "closing a terminal must end it";
+    let OpenTerminal { terminal, mut events } = open(sandbox, rule).await;
+    terminal.close().await.expect("close the terminal");
+    wait_closed(&mut events, rule).await;
+    assert!(terminal.write(b"echo late\r").await.is_err(), "a closed terminal's write must fail");
+    assert!(terminal.resize(SIZE).await.is_err(), "a closed terminal's resize must fail");
+    terminal.close().await.expect("closing a closed terminal does nothing");
+}
+
+async fn dropping_a_terminal_does_not_wedge(sandbox: &dyn Sandbox) {
+    if !sandbox.capabilities().terminal {
+        return;
+    }
+    let rule = "dropping a terminal's handle must end it";
+    let OpenTerminal { terminal, mut events } = open(sandbox, rule).await;
+    drop(terminal);
+    wait_closed(&mut events, rule).await;
+    // One at a time may be all a backend allows: the dropped one must not be in the way.
+    let OpenTerminal { terminal, mut events } = open(sandbox, "dropping a terminal wedged the sandbox").await;
+    terminal.write(b"echo again\r").await.expect("write to the terminal");
+    wait_output(&mut events, "again", "a terminal opened after a dropped one must work").await;
+    terminal.close().await.expect("close the terminal");
+    wait_closed(&mut events, "closing a terminal must end it").await;
+}
+
+async fn reset_ends_the_terminal(sandbox: &dyn Sandbox) {
+    if !sandbox.capabilities().terminal {
+        return;
+    }
+    let OpenTerminal { terminal, mut events } = open(sandbox, "reset must end the terminal").await;
+    sandbox.reset().await.expect("reset");
+    wait_closed(&mut events, "reset must end the terminal").await;
+    assert!(terminal.write(b"echo late\r").await.is_err(), "a terminal ended by reset must refuse input");
 }

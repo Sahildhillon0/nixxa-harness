@@ -1,7 +1,7 @@
 //! The daemon's side of a job: start its supervisor, capture its output, and end it.
 //!
-//! Every command (the agent's foreground command, each background job) runs under its own
-//! supervisor (`--limited`, see [`crate::exec`]), a child subreaper. A job is therefore exactly
+//! Every job (the agent's foreground command, each background job, the user's terminal) runs
+//! under its own supervisor (`--limited`, see [`crate::exec`]), a child subreaper. A job is therefore exactly
 //! the supervisor's descendants, found by following parent links in `/proc`, which also covers
 //! processes that left the process group or called `setsid`. Ending a job kills those
 //! descendants until none is left, then the supervisor; nothing outside the tree is touched.
@@ -24,6 +24,7 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot};
 
+use crate::exec::Supervise;
 use crate::job::{End, Tail};
 use crate::protocol::Rlimits;
 
@@ -36,7 +37,7 @@ const KILL_PATIENCE: Duration = Duration::from_secs(10);
 const DRAIN: Duration = Duration::from_secs(2);
 
 /// The live supervisors, the daemon's only legitimate children, with who each job is for
-/// (`fg` for the foreground command, else the job's id).
+/// (`fg` for the foreground command, `terminal` for the user's terminal, else the job's id).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Supervisors(Arc<Mutex<HashMap<i32, String>>>);
 
@@ -84,20 +85,25 @@ impl Drop for Registered {
 /// What to run.
 #[derive(Debug, Clone)]
 pub(crate) struct Spec {
-    /// The command line for `/bin/sh -c`.
+    /// The command line for `/bin/sh -c`, or for the terminal, the shell to run.
     pub command: String,
     /// The working directory (already checked to be inside the workspace).
     pub cwd: String,
-    /// The time limit.
-    pub limit: Duration,
+    /// The time limit, if any (the terminal has none).
+    pub limit: Option<Duration>,
     /// The rlimits of every process of the job.
     pub rlimits: Rlimits,
     /// This binary, to run as the supervisor.
     pub self_exe: String,
-    /// Who the job is for: `fg` or the job's id.
+    /// Who the job is for: `fg`, `terminal` or the job's id.
     pub owner: String,
-    /// Variables added to the job's environment (the network proxy's).
+    /// Variables added to the job's environment (the network proxy's; the terminal's `TERM`).
     pub env: Vec<(String, String)>,
+    /// Add the agent's Landlock layer (D-066). False only for the user's terminal, and when the
+    /// daemon's own layer isn't enforced either.
+    pub confine: bool,
+    /// The user's terminal: the PTY its shell runs on.
+    pub pty: Option<String>,
 }
 
 /// How to keep the job's output.
@@ -108,6 +114,8 @@ pub(crate) enum Capture {
     /// The last bytes of each stream, readable while it runs; the job keeps running
     /// (background jobs).
     Last { stdout: Arc<Mutex<Tail>>, stderr: Arc<Mutex<Tail>> },
+    /// Nothing: the output goes to a PTY (the user's terminal).
+    Nothing,
 }
 
 /// How a job went.
@@ -141,7 +149,8 @@ pub(crate) async fn run(
         truncated: false,
         duration: started.elapsed(),
     };
-    let rlimits = match serde_json::to_string(&spec.rlimits) {
+    let supervise = Supervise { rlimits: spec.rlimits, confine: spec.confine, pty: spec.pty.clone() };
+    let supervise = match serde_json::to_string(&supervise) {
         Ok(json) => json,
         Err(err) => return failed(err.to_string()),
     };
@@ -149,19 +158,27 @@ pub(crate) async fn run(
         Ok(pair) => pair,
         Err(err) => return failed(format!("could not start the shell: {err}")),
     };
-    let spawned = Command::new(&spec.self_exe)
+    let mut supervisor = Command::new(&spec.self_exe);
+    supervisor
         .arg("--limited")
-        .arg(rlimits)
+        .arg(supervise)
         .arg("--")
         .arg(&spec.command)
         .current_dir(&spec.cwd)
         .envs(spec.env.iter().map(|(name, value)| (name, value)))
         .stdin(Stdio::from(OwnedFd::from(theirs)))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0)
-        .kill_on_drop(true)
-        .spawn();
+        .kill_on_drop(true);
+    if matches!(capture, Capture::Nothing) {
+        // The terminal's supervisor starts a session of its own, which a process-group
+        // leader can't.
+        supervisor.stdout(Stdio::null()).stderr(Stdio::null());
+    } else {
+        supervisor.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    }
+    let spawned = supervisor.spawn();
+    // The command holds the daemon's copy of the supervisor's end of the socket: without this,
+    // a supervisor that dies (`kill -9 $PPID`) would never be noticed.
+    drop(supervisor);
     let mut child = match spawned {
         Ok(child) => child,
         Err(err) => return failed(format!("could not start the shell: {err}")),
@@ -184,11 +201,17 @@ pub(crate) async fn run(
             tokio::spawn(keep_last(child.stdout.take(), Arc::clone(stdout))),
             tokio::spawn(keep_last(child.stderr.take(), Arc::clone(stderr))),
         ),
+        Capture::Nothing => (tokio::spawn(async { (Vec::new(), false) }), tokio::spawn(async { (Vec::new(), false) })),
     };
     let aborts = [out_task.abort_handle(), err_task.abort_handle()];
     let collect = async { (out_task.await.unwrap_or_default(), err_task.await.unwrap_or_default()) };
     tokio::pin!(collect);
-    let deadline = tokio::time::sleep(spec.limit);
+    let deadline = async {
+        match spec.limit {
+            Some(limit) => tokio::time::sleep(limit).await,
+            None => std::future::pending().await,
+        }
+    };
     tokio::pin!(deadline);
 
     let mut killed_for_output = false;

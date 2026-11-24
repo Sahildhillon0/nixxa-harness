@@ -6,7 +6,9 @@ use std::time::Duration;
 
 use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, EventStream};
 use futures::StreamExt;
-use nixxa_contracts::{AccountRef, Brain, SessionId, Store, WorkspaceInfo};
+use nixxa_contracts::{
+    AccountRef, Brain, OpenTerminal, Sandbox, SessionId, Store, TerminalEvent, TerminalSize, WorkspaceInfo,
+};
 use nixxa_controller::Command;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -27,6 +29,84 @@ use nixxa_contracts::{Credential, Secret};
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 /// How long the sandbox gets to start and answer once a sandboxed place is chosen.
 const SANDBOX_START: Duration = Duration::from_secs(30);
+
+/// Terminal output the UI loop may hold before the sandbox has to wait for it.
+const TERMINAL_BACKLOG: usize = 16;
+
+/// What the open terminal's task tells the UI loop, with the terminal's number (so a replaced
+/// terminal's last words are dropped).
+enum TermMsg {
+    Opened(u64, Result<(), String>),
+    Output(u64, Vec<u8>),
+    Closed(u64, String),
+}
+
+/// What the UI loop asks of the open terminal.
+enum TermOp {
+    Write(Vec<u8>),
+    Resize(TerminalSize),
+}
+
+/// The open terminal's task. Dropping it (or its `ops`) closes the terminal.
+struct TermLink {
+    number: u64,
+    ops: mpsc::UnboundedSender<TermOp>,
+    task: JoinHandle<()>,
+}
+
+/// Opens the user's terminal and runs it: its output to the UI loop (waiting while the loop is
+/// behind, so the sandbox holds the shell instead of anything piling up), and the loop's input
+/// and resizes to it, in order. Ends when the terminal does, or when the loop lets go.
+async fn run_terminal(
+    sandbox: Arc<dyn Sandbox>,
+    size: TerminalSize,
+    number: u64,
+    tx: mpsc::Sender<TermMsg>,
+    mut ops: mpsc::UnboundedReceiver<TermOp>,
+) {
+    let OpenTerminal { terminal, mut events } = match sandbox.open_terminal(size).await {
+        Ok(open) => open,
+        Err(err) => {
+            tracing::warn!(%err, "the terminal couldn't open");
+            let _ = tx.send(TermMsg::Opened(number, Err(err.to_string()))).await;
+            return;
+        }
+    };
+    tracing::info!("terminal opened");
+    if tx.send(TermMsg::Opened(number, Ok(()))).await.is_err() {
+        return;
+    }
+    let output = async {
+        while let Some(event) = events.next().await {
+            match event {
+                TerminalEvent::Output(bytes) => {
+                    if tx.send(TermMsg::Output(number, bytes)).await.is_err() {
+                        return;
+                    }
+                }
+                TerminalEvent::Closed { reason } => {
+                    tracing::info!("terminal closed");
+                    let _ = tx.send(TermMsg::Closed(number, reason)).await;
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(TermMsg::Closed(number, "its output ended".into())).await;
+    };
+    let input = async {
+        while let Some(op) = ops.recv().await {
+            // A failure means it has ended; its Closed says why.
+            let _ = match op {
+                TermOp::Write(bytes) => terminal.write(&bytes).await,
+                TermOp::Resize(size) => terminal.resize(size).await,
+            };
+        }
+    };
+    tokio::select! {
+        () = output => {}
+        () = input => {}
+    }
+}
 
 /// A running session.
 struct Session {
@@ -227,6 +307,11 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
         }
     }
 
+    // The user's terminal (`ctrl+t`), and its messages.
+    let (term_tx, mut term_rx) = mpsc::channel::<TermMsg>(TERMINAL_BACKLOG);
+    let mut shell: Option<TermLink> = None;
+    let mut opened = 0u64;
+
     // `init` enters raw mode and the alternate screen and restores them on panic.
     let mut terminal = ratatui::init();
     let _ = crossterm::execute!(io::stdout(), EnableBracketedPaste);
@@ -235,17 +320,43 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
         if let Err(err) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(err);
         }
+        // The terminal pane's size follows the layout; its shell is told of every change.
+        if let (Some(size), Some(link)) = (app.terminal.take_resize(), &shell) {
+            let _ = link.ops.send(TermOp::Resize(size));
+        }
         let effects = tokio::select! {
             input = keys.next() => match input {
                 Some(Ok(TermEvent::Key(key))) => app.handle_key(key),
-                Some(Ok(TermEvent::Paste(text))) => {
-                    app.paste(&text);
-                    Vec::new()
-                }
+                Some(Ok(TermEvent::Paste(text))) => app.paste(&text),
                 Some(Ok(_)) => Vec::new(),
                 Some(Err(err)) => break Err(err),
                 None => break Ok(()),
             },
+            Some(message) = term_rx.recv() => {
+                let mut messages = vec![message];
+                while let Ok(message) = term_rx.try_recv() {
+                    messages.push(message);
+                }
+                let current = shell.as_ref().map(|link| link.number);
+                let mut produced = Vec::new();
+                for message in messages {
+                    match message {
+                        TermMsg::Opened(n, result) if Some(n) == current => {
+                            if result.is_err() {
+                                shell = None;
+                            }
+                            produced.extend(app.terminal_opened(result));
+                        }
+                        TermMsg::Output(n, bytes) if Some(n) == current => app.terminal_output(&bytes),
+                        TermMsg::Closed(n, reason) if Some(n) == current => {
+                            shell = None;
+                            produced.extend(app.terminal_closed(reason));
+                        }
+                        _ => {}
+                    }
+                }
+                produced
+            }
             Some(event) = ui_rx.recv() => {
                 let mut events = vec![event];
                 // Take whatever else arrived, so a burst of deltas costs one redraw.
@@ -500,6 +611,25 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     }
                     None => produced_now(&mut app, UiEvent::NetworkSet(Err("choose where to work first".into()))),
                 },
+                Effect::OpenTerminal(size) => match &workplace {
+                    Some(place) => {
+                        if let Some(old) = shell.take() {
+                            old.task.abort();
+                        }
+                        opened += 1;
+                        let (ops, rx) = mpsc::unbounded_channel();
+                        let task = tokio::spawn(run_terminal(place.sandbox.clone(), size, opened, term_tx.clone(), rx));
+                        shell = Some(TermLink { number: opened, ops, task });
+                    }
+                    None => {
+                        let _ = app.terminal_opened(Err("choose where to work first".into()));
+                    }
+                },
+                Effect::TerminalInput(bytes) => {
+                    if let Some(link) = &shell {
+                        let _ = link.ops.send(TermOp::Write(bytes));
+                    }
+                }
                 Effect::Quit => quit = true,
             }
         }
@@ -508,6 +638,11 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
         }
     };
 
+    // The terminal ends with Nixxa.
+    if let Some(link) = shell.take() {
+        link.task.abort();
+        let _ = link.task.await;
+    }
     if let Some(session) = session {
         let _ = session.commands.send(Command::Shutdown).await;
         if tokio::time::timeout(SHUTDOWN_GRACE, session.task).await.is_err() {

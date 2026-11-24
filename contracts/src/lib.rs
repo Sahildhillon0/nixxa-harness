@@ -22,6 +22,7 @@ pub mod policy;
 pub mod ports;
 pub mod sandbox;
 pub mod store;
+pub mod terminal;
 pub mod types;
 
 pub use accounts::*;
@@ -40,4 +41,5 @@ pub use policy::*;
 pub use ports::*;
 pub use sandbox::*;
 pub use store::*;
+pub use terminal::*;
 pub use types::*;

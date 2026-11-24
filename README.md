@@ -29,8 +29,9 @@ Replace one, and the rest never notice.
 > suites as **background jobs** (up to 4 at once, 30 min each by default) and check on them while
 > it works; each job is its own process tree, so ending one never touches another. The network
 > is **off** until you allow it: `ctrl+n` lets you allow crates.io, npm, PyPI or GitHub (or your
-> own hosts), or open it; every request is logged, and the status bar always shows `net: …`. The
-> `ctrl+t` terminal and notifications come next.
+> own hosts), or open it; every request is logged, and the status bar always shows `net: …`.
+> **`ctrl+t` opens a terminal** in the same place as the agent, for you: the agent can't see it or
+> reach it, and it survives everything the agent runs. Notifications come next.
 
 ---
 
@@ -117,7 +118,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
-| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **in progress** (background jobs and the network allowlist done) |
+| 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **in progress** (background jobs, the network allowlist and the terminal done) |
 | 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | planned |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
@@ -201,6 +202,21 @@ Everything goes through a proxy on your machine: HTTPS is checked against the ho
 names are resolved on your machine, and local and private addresses (your router, your own
 services) are never reachable, whatever you allow. The agent is told the policy and why a request
 was blocked, but can't change it. In **This directory** the network isn't restricted at all.
+
+## The terminal
+
+Press `ctrl+t` for a shell where the agent works: inside the sandbox (with the same files,
+limits and network policy as the agent's commands), or your own shell in **This directory**. It
+replaces the detail pane; `ctrl+t` again (from outside it) brings the details back, and the
+shell keeps running.
+
+- While you type in it, every key goes to the shell (`ctrl+c` too). `ctrl+]` leaves it.
+- Then: `i` to type again, arrows or pgup/pgdn to scroll back, `s` to share lines with the agent:
+  it picks your last command and its output, the arrows adjust it, and `enter` puts it in your
+  message, where you can edit it before sending. Nothing from the terminal reaches the agent
+  otherwise.
+- The agent's commands can't read or type into it, and its output is drawn through a terminal
+  emulator, so nothing it prints can change your real terminal.
 
 ## Your history
 
