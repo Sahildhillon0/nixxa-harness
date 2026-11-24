@@ -200,13 +200,17 @@ impl TerminalPane {
         })
     }
 
-    /// Pasted text as the shell should get it: bracketed if the program asked for it (with the
-    /// end marker taken out of the text, so a paste can't end the bracket early and run
-    /// something), with newlines as Enter.
+    /// Pasted text as the shell should get it: newlines as Enter, every other control character
+    /// (`ESC` above all, C1 controls too) dropped as xterm does, so no paste can end a bracket
+    /// early or type a key sequence; bracketed if the program asked for it.
     pub(crate) fn paste_bytes(&self, text: &str) -> Vec<u8> {
-        let text = text.replace("\r\n", "\r").replace('\n', "\r");
+        let text: String = text
+            .replace("\r\n", "\r")
+            .replace('\n', "\r")
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\r' | '\t'))
+            .collect();
         if self.parser.screen().bracketed_paste() {
-            let text = text.replace("\x1b[201~", "");
             format!("\x1b[200~{text}\x1b[201~").into_bytes()
         } else {
             text.into_bytes()
@@ -516,7 +520,14 @@ mod tests {
         let mut pane = pane(80, 24);
         assert_eq!(pane.paste_bytes("a\nb"), b"a\rb");
         pane.feed(b"\x1b[?2004h");
-        assert_eq!(pane.paste_bytes("x\x1b[201~rm -rf ~\n"), b"\x1b[200~xrm -rf ~\r\x1b[201~".to_vec());
+        assert_eq!(pane.paste_bytes("x\x1b[201~rm -rf ~\n"), b"\x1b[200~x[201~rm -rf ~\r\x1b[201~".to_vec());
+        // A marker nested in a marker doesn't reassemble once the first is gone.
+        let nested = pane.paste_bytes("x\x1b[20\x1b[201~1~touch /tmp/pwned\n");
+        assert_eq!(nested, b"\x1b[200~x[20[201~1~touch /tmp/pwned\r\x1b[201~".to_vec());
+        let ends = nested.windows(6).filter(|w| *w == b"\x1b[201~").count();
+        assert_eq!(ends, 1, "exactly one end marker, the real one");
+        // Other controls go too; tabs stay.
+        assert_eq!(pane.paste_bytes("a\tb\x03\x04\u{9b}c"), b"\x1b[200~a\tbc\x1b[201~".to_vec());
     }
 
     #[test]
