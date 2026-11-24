@@ -180,7 +180,7 @@ internal is `pub(crate)`.
 | `Credential` | A secret wrapper (`ApiKey`, `BearerToken`, `CloudProfile`, `None`) whose `Debug`/`Display` print `***`; zeroised on drop |
 | `Observation` | A result: output, error, timing, truncation flag, source |
 | `Verdict` | The policy gate's answer: `Allow`, `Ask(reason)`, `Deny(reason)` |
-| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, turn done |
+| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, a background job finished, a wake-up, turn done |
 
 ### Traits
 
@@ -241,7 +241,12 @@ closed terminal refuses input; without one, `open_terminal` is `Unsupported`.
 - **Background jobs (#9):** `Exec { background }` → `Outcome::Started { job: JobId }`; the
   `JobStatus`, `JobOutput` and `JobStop` actions; `Sandbox::subscribe()` → a stream of
   `SandboxEvent` (`JobFinished`, and `NetRequest` for the network log); `SandboxCapabilities.jobs`
-  (D-061 to D-063). `Event::JobFinished` for the controller comes with the wake-ups.
+  (D-061 to D-063).
+- **Job results and wake-ups (#9):** `SandboxEvent::JobFinished.status`, how the job ended in the
+  sandbox's own words (serde default, for events recorded before); `Event::JobFinished { job,
+  command, exit_code, duration_ms, status }` for each of the session's own jobs; `Event::WakeUp {
+  turn, jobs }` before a turn the controller starts itself because jobs the agent was waiting on
+  ended (D-068).
 - **Network allowlist (#1):** `NetworkPolicy { Off, Allow(Vec<DomainRule>), Open }`,
   `Sandbox::set_network(policy)`, `SandboxCapabilities.network: NetworkAccess` (the policy, or
   `Unrestricted` for a backend that isn't isolated), `Observation.network: Vec<NetRequest>`, and

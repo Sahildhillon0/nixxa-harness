@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountRef, ActionId, ActionRequest, ApprovalMode, BrainInfo, Message, Observation, SandboxCapabilities, SessionId,
-    SourceInfo, TurnId, Usage,
+    AccountRef, ActionId, ActionRequest, ApprovalMode, BrainInfo, JobId, Message, Observation, SandboxCapabilities,
+    SessionId, SourceInfo, TurnId, Usage,
 };
 
 /// An event from the controller to the harness (via [`EventSink`](crate::EventSink)).
@@ -102,6 +102,28 @@ pub enum Event {
         turn: Option<TurnId>,
         /// Human-readable message.
         message: String,
+    },
+    /// A background job the agent started has ended. Only the session's own jobs are reported.
+    JobFinished {
+        /// The job.
+        job: JobId,
+        /// The command it ran.
+        command: String,
+        /// The shell's exit code; `None` when it didn't exit by itself (stopped, timed out,
+        /// killed or lost with its sandbox).
+        exit_code: Option<i32>,
+        /// How long it ran.
+        duration_ms: u64,
+        /// How it ended, in the sandbox's words ("job j1 exited with code 0 after 3.1 s").
+        status: String,
+    },
+    /// A turn is starting without a user message: background jobs the agent was waiting on have
+    /// ended. A [`Event::TurnStarted`] for the same turn follows.
+    WakeUp {
+        /// The turn about to start.
+        turn: TurnId,
+        /// The jobs whose ends woke the agent.
+        jobs: Vec<JobId>,
     },
     /// A turn finished.
     TurnDone {
