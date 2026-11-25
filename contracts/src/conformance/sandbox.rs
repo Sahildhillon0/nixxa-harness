@@ -555,13 +555,17 @@ fn failure<'o>(outcome: &'o Outcome, rule: &str) -> &'o str {
 }
 
 /// Whether the backend runs a POSIX shell for `Exec` (the command scenarios need `rm`, `mv`,
-/// `chmod`, `ln`).
+/// `chmod`, `ln`). The probe needs shell syntax, so `cmd` with Git's tools on `PATH` fails it.
 async fn posix(sandbox: &dyn Sandbox) -> bool {
     if !lists(sandbox, &[SandboxActionKind::Exec]) {
         return false;
     }
-    let probe =
-        SandboxAction::Exec { command: "printf posix".into(), cwd: None, timeout_ms: Some(10_000), background: false };
+    let probe = SandboxAction::Exec {
+        command: "x=posix; printf \"$x\"".into(),
+        cwd: None,
+        timeout_ms: Some(10_000),
+        background: false,
+    };
     matches!(sandbox.execute(id(900), probe).await, Ok(o) if matches!(&o.outcome, Outcome::Exec { exit_code: Some(0), stdout, .. } if stdout == "posix"))
 }
 
@@ -624,7 +628,10 @@ async fn patches_refuse_symlinks(sandbox: &dyn Sandbox) {
         return;
     }
     write(sandbox, 920, "target.txt", "keep\n").await;
-    sh(sandbox, 921, "ln -s target.txt link.txt").await;
+    // Some shells (MSYS) copy instead of linking without the right privilege.
+    if sh(sandbox, 921, "ln -s target.txt link.txt && if test -L link.txt; then echo link; fi").await.trim() != "link" {
+        return;
+    }
     let (_, hash) = read(sandbox, 922, "target.txt").await.expect("read");
     let o = patch(sandbox, 923, "link.txt", &[("keep", "changed")], &hash).await;
     failure(&o, "a patch of a symlink must fail");
