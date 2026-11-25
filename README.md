@@ -256,4 +256,4 @@ Targets Linux, macOS and Windows.
 
 ## License
 
-To be decided.
+[MIT](LICENSE). Contributions are welcome: see [CONTRIBUTING.md](CONTRIBUTING.md).
