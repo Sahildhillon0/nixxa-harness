@@ -14,7 +14,7 @@
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
@@ -110,7 +110,7 @@ impl Dir {
 
     /// Sets this directory's own mode.
     pub(crate) fn set_mode(&self, mode: u32) -> io::Result<()> {
-        Ok(rustix::fs::fchmod(&self.0, Mode::from_raw_mode(mode & 0o7777))?)
+        Ok(rustix::fs::fchmod(&self.0, raw_mode(mode))?)
     }
 
     /// Gives a subdirectory its owner's full rights, so it can be opened, without following a
@@ -119,7 +119,7 @@ impl Dir {
     pub(crate) fn unlock(&self, name: &OsStr) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            use std::os::fd::AsRawFd;
+            use std::os::fd::{AsFd, AsRawFd};
             let flags = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             let fd = rustix::fs::openat(&self.0, name, flags, Mode::empty())?;
             let mode = meta(&rustix::fs::fstat(&fd)?).mode;
@@ -133,19 +133,20 @@ impl Dir {
             if meta.kind != Kind::Dir {
                 return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a directory"));
             }
-            Ok(rustix::fs::chmodat(
-                &self.0,
-                name,
-                Mode::from_raw_mode((meta.mode | 0o700) & 0o7777),
-                AtFlags::SYMLINK_NOFOLLOW,
-            )?)
+            Ok(rustix::fs::chmodat(&self.0, name, raw_mode(meta.mode | 0o700), AtFlags::SYMLINK_NOFOLLOW)?)
         }
     }
 }
 
 /// Sets a file's mode through its descriptor.
 pub(crate) fn set_file_mode(file: &File, mode: u32) -> io::Result<()> {
-    Ok(rustix::fs::fchmod(file, Mode::from_raw_mode(mode & 0o7777))?)
+    Ok(rustix::fs::fchmod(file, raw_mode(mode))?)
+}
+
+/// Permission bits as a `Mode` (its raw type is `u32` on Linux, `u16` on macOS; the bits fit).
+#[allow(clippy::unnecessary_cast)]
+fn raw_mode(mode: u32) -> Mode {
+    Mode::from_raw_mode((mode & 0o7777) as rustix::fs::RawMode)
 }
 
 /// The mode a new store directory gets: only its owner can use it.
