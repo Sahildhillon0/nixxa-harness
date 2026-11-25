@@ -87,6 +87,20 @@ pub(crate) fn event(event: &Event) {
         Event::AccountChanged { account } => {
             tracing::info!(account = %safe::line(&account.to_string()), "account changed")
         }
+        Event::Checkpoint { turn, checkpoint, before } => {
+            let before = before.as_ref().map(|id| safe::line(id.as_str())).unwrap_or_default();
+            tracing::info!(%turn, checkpoint = %safe::line(checkpoint.as_str()), before, "checkpoint");
+        }
+        Event::NotUndoable { turn, before, reason } => {
+            let before = before.as_ref().map(|id| safe::line(id.as_str())).unwrap_or_default();
+            tracing::warn!(%turn, before, reason = %safe::line(reason), "no checkpoint: can't be undone");
+        }
+        // How many paths, never which (paths are the agent's).
+        Event::Restored { checkpoint, undone } => tracing::info!(
+            checkpoint = %safe::line(checkpoint.as_str()),
+            paths = undone.changes.len(),
+            "workspace restored"
+        ),
         // Message text and streamed tokens are content, not metadata.
         Event::Message { .. } | Event::TextDelta { .. } | Event::ApprovalNeeded { .. } => {}
     }
@@ -108,6 +122,7 @@ fn action_kind(action: &Action) -> &'static str {
             nixxa_contracts::SandboxActionKind::Exec => "exec",
             nixxa_contracts::SandboxActionKind::ReadFile => "read",
             nixxa_contracts::SandboxActionKind::WriteFile => "write",
+            nixxa_contracts::SandboxActionKind::Patch => "patch",
             nixxa_contracts::SandboxActionKind::ListDir => "list",
             nixxa_contracts::SandboxActionKind::JobStatus => "job-status",
             nixxa_contracts::SandboxActionKind::JobOutput => "job-output",
@@ -122,6 +137,8 @@ fn outcome_kind(outcome: &Outcome) -> &'static str {
     match outcome {
         Outcome::Exec { .. } => "exec",
         Outcome::Text { .. } => "text",
+        Outcome::File { .. } => "file",
+        Outcome::Patched { .. } => "patched",
         Outcome::Listing { .. } => "listing",
         Outcome::Written { .. } => "written",
         Outcome::Recorded { .. } => "recorded",
@@ -241,6 +258,31 @@ pub(crate) mod tests {
                 ),
             });
             event(&Event::Error { turn: Some(turn.clone()), message: "boom\x1b]0;x\x07".into() });
+            // A patch's diff and a restore's paths are the agent's content.
+            event(&Event::ActionFinished {
+                turn: turn.clone(),
+                observation: Observation::new(
+                    ActionId::new("a2"),
+                    Outcome::Patched { diff: "-old\n+hunter3\n".into(), hash: "h".into() },
+                ),
+            });
+            event(&Event::Checkpoint {
+                turn: turn.clone(),
+                checkpoint: nixxa_contracts::CheckpointId::new("run.1"),
+                before: Some(ActionId::new("a2")),
+            });
+            event(&Event::Restored {
+                checkpoint: nixxa_contracts::CheckpointId::new("run.1"),
+                undone: nixxa_contracts::WorkspaceDiff {
+                    changes: vec![nixxa_contracts::FileChange {
+                        path: "secret-plans.txt".into(),
+                        before: None,
+                        after: None,
+                        diff: Some("+hunter4".into()),
+                    }],
+                    not_covered: Vec::new(),
+                },
+            });
             event(&Event::SessionEnded { session: SessionId::new("s1") });
         });
 
@@ -253,10 +295,15 @@ pub(crate) mod tests {
             "action finished",
             "controller error",
             "session ended",
+            "outcome=\"patched\"",
+            "checkpoint=run.1",
+            "workspace restored",
+            "paths=1",
         ] {
             assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
         }
-        for leaked in ["my password", "cat secret.txt", "hunter2", "\x1b", "\x07"] {
+        for leaked in ["my password", "cat secret.txt", "hunter2", "hunter3", "hunter4", "secret-plans", "\x1b", "\x07"]
+        {
             assert!(!log.contains(leaked), "{leaked:?} reached the log:\n{log}");
         }
     }

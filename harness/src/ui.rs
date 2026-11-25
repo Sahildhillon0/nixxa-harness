@@ -16,6 +16,7 @@ use crate::safe;
 use crate::sessions::ago;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 use crate::terminal::State as TermState;
+use crate::undo::{self, Diff as UndoDiff};
 use nixxa_sandbox::network::PRESETS;
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
@@ -108,6 +109,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     draw_setup(frame, app, theme, body);
     draw_sessions(frame, app, theme, body);
     draw_network(frame, app, theme, body);
+    draw_undo(frame, app, theme, body);
     draw_place(frame, app, theme, body);
     safe::scrub(frame.buffer_mut());
 }
@@ -268,6 +270,12 @@ fn happening_line(happening: &Happening, theme: Theme, width: usize) -> Line<'st
             let jobs: Vec<&str> = jobs.iter().map(|job| job.as_str()).collect();
             ("↻", theme.accent(), "wake", format!("{} ended: the agent carries on", jobs.join(", ")), String::new())
         }
+        Happening::NotUndoable { label, reason } => {
+            ("✗", theme.bad(), "undo", format!("no checkpoint {label}: {reason}"), "can't undo".to_string())
+        }
+        Happening::Restored { label, paths } => {
+            ("↶", theme.accent(), "undo", format!("back as it was {label}"), format!("{paths} paths"))
+        }
     };
     let target = safe::line(&target);
     let room = width.saturating_sub(2 + 7 + 1 + how.chars().count());
@@ -292,6 +300,14 @@ fn activity_line(activity: &Activity, theme: Theme, width: usize) -> Line<'stati
         ActivityState::Failed => "failed".to_string(),
     };
     let timing = if activity.auto_approved { format!("auto · {timing}") } else { timing };
+    // A patch says how much it changed.
+    let timing = match activity.observation.as_ref().map(|o| &o.outcome) {
+        Some(Outcome::Patched { diff, .. }) => {
+            let (added, removed) = diff_counts(diff);
+            format!("+{added} -{removed} · {timing}")
+        }
+        _ => timing,
+    };
     let (kind, target) = describe(&activity.request);
     let room = width.saturating_sub(2 + 7 + 1 + timing.chars().count());
     Line::from(vec![
@@ -312,14 +328,41 @@ fn state_icon(state: ActivityState, theme: Theme) -> (&'static str, Style) {
     }
 }
 
+/// Lines added and removed by a unified diff (its `+++`/`---` headers aside).
+fn diff_counts(diff: &str) -> (usize, usize) {
+    let lines = || diff.lines().filter(|line| !line.starts_with("+++") && !line.starts_with("---"));
+    (lines().filter(|line| line.starts_with('+')).count(), lines().filter(|line| line.starts_with('-')).count())
+}
+
+/// A unified diff's lines, coloured: what goes in green, what goes out red, hunk heads dim.
+/// Every line through `safe::line`.
+fn diff_lines(diff: &str, theme: Theme) -> Vec<Line<'static>> {
+    output_lines(diff)
+        .into_iter()
+        .map(|line| {
+            let style = if line.starts_with("+++") || line.starts_with("---") || line.starts_with("@@") {
+                theme.dim()
+            } else if line.starts_with('+') {
+                theme.ok()
+            } else if line.starts_with('-') {
+                theme.bad()
+            } else {
+                Style::new()
+            };
+            Line::styled(line, style)
+        })
+        .collect()
+}
+
 /// `(kind, target)` for an action, e.g. `("exec", "cargo test")` or `("notes", "search")`.
 /// Both are safe to draw.
-fn describe(request: &ActionRequest) -> (String, String) {
+pub(crate) fn describe(request: &ActionRequest) -> (String, String) {
     let (kind, target) = match &request.action {
         Action::Sandbox { action } => match action {
             SandboxAction::Exec { command, .. } => ("exec".into(), command.clone()),
             SandboxAction::ReadFile { path } => ("read".into(), path.clone()),
             SandboxAction::WriteFile { path, .. } => ("write".into(), path.clone()),
+            SandboxAction::Patch { path, .. } => ("edit".into(), path.clone()),
             SandboxAction::ListDir { path } => ("list".into(), path.clone()),
             SandboxAction::JobStatus { job } => ("job-status".into(), job.to_string()),
             SandboxAction::JobOutput { job, .. } => ("job-output".into(), job.to_string()),
@@ -358,6 +401,15 @@ fn draw_detail(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
             lines.extend(output_lines(stderr).into_iter().map(|l| Line::styled(l, theme.bad())));
         }
         Some(Outcome::Text { content }) => lines.extend(output_lines(content).into_iter().map(Line::raw)),
+        Some(Outcome::File { content, hash }) => {
+            lines.push(Line::styled(format!("sha256 {}", safe::line(hash)), theme.dim()));
+            lines.extend(output_lines(content).into_iter().map(Line::raw));
+        }
+        Some(Outcome::Patched { diff, hash }) => {
+            let (added, removed) = diff_counts(diff);
+            lines.push(Line::styled(format!("+{added} -{removed} · new sha256 {}", safe::line(hash)), theme.dim()));
+            lines.extend(diff_lines(diff, theme));
+        }
         Some(Outcome::Listing { entries }) => lines.extend(
             entries
                 .iter()
@@ -461,6 +513,12 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         "type a host, *.domain or an IP, with :port if not 443/80 · enter add · esc cancel".to_string()
     } else if app.network.open {
         "1 off · 2 allow · 3 open · ↑/↓ choose · space preset on/off · a add host · d remove · esc close".to_string()
+    } else if let Some(view) = &app.undo {
+        if view.confirming {
+            "enter restore these files · esc back".to_string()
+        } else {
+            "←/→ further back / forward · ↑/↓ pgup/pgdn scroll · enter undo · esc close".to_string()
+        }
     } else if app.typing_in_terminal() {
         if app.approval().is_some() {
             "an action waits for you: ctrl+] then y/n · until then every key goes to the shell".to_string()
@@ -482,7 +540,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     } else {
         let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
         format!(
-            "enter send · tab focus · shift-tab ask/auto · ctrl-t terminal · ctrl-n network · ctrl-s sessions{key} · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
+            "enter send · tab focus · shift-tab ask/auto · ctrl-t terminal · ctrl-n network · ctrl-s sessions{key} · ctrl-z undo · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
         )
     };
     let auto = app.mode == ApprovalMode::Auto;
@@ -491,6 +549,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         || app.setup.is_some()
         || app.sessions.is_some()
         || app.network.open
+        || app.undo.is_some()
         || app.approval().is_some()
         || app.notice.is_some();
     let style = if urgent { theme.pending() } else { theme.dim() };
@@ -799,6 +858,95 @@ fn draw_sessions(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// The undo view (`/undo`, `ctrl+z`), over the panes: which checkpoint, what going back to it
+/// changes, and what it can't bring back. Paths, diffs, link targets and labels come from the
+/// workspace or the agent: every one goes through `safe::line`.
+fn draw_undo(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
+    let Some(view) = app.undo.as_ref() else { return };
+    let width = over.width.min(120);
+    let inner = usize::from(width.saturating_sub(2));
+    let choice = view.chosen();
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Go back to the workspace as it was ", theme.dim()),
+            Span::styled(truncate(&safe::line(&choice.label), inner.saturating_sub(36)), theme.accent()),
+        ]),
+        Line::styled(
+            format!("{} of {} · ← further back, → forward", view.selected + 1, view.choices.len()),
+            theme.dim(),
+        ),
+        Line::default(),
+    ];
+    let mut not_covered: Vec<String> = Vec::new();
+    match &view.diff {
+        UndoDiff::Loading => lines.push(Line::styled("Looking at what changed since…", theme.dim())),
+        UndoDiff::Failed(why) => lines.push(Line::styled(format!("✗ {}", safe::line(why)), theme.bad())),
+        UndoDiff::Ready(diff) if diff.is_empty() => {
+            lines.push(Line::styled("Nothing changed since then: there is nothing to undo.", theme.dim()));
+            not_covered.clone_from(&diff.not_covered);
+        }
+        UndoDiff::Ready(diff) => {
+            let n = diff.changes.len();
+            lines.push(Line::raw(format!("Undoing changes {n} path{}:", if n == 1 { "" } else { "s" })));
+            for change in &diff.changes {
+                let what = undo::what_undo_does(change);
+                let style = match what {
+                    "remove" => theme.bad(),
+                    "restore" => theme.ok(),
+                    _ => theme.pending(),
+                };
+                let why = match what {
+                    "remove" => "  (made since)",
+                    "restore" => "  (deleted since)",
+                    _ => "",
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {what:<8}"), style),
+                    Span::raw(truncate(&safe::line(&change.path), inner.saturating_sub(28))),
+                    Span::styled(why, theme.dim()),
+                ]));
+            }
+            for change in diff.changes.iter().filter(|c| c.diff.is_some()) {
+                lines.push(Line::default());
+                lines.extend(diff_lines(change.diff.as_deref().unwrap_or_default(), theme));
+            }
+            not_covered.clone_from(&diff.not_covered);
+        }
+    }
+    lines.push(Line::default());
+    lines.push(Line::styled("What an undo can't bring back:", theme.pending()));
+    let mut cannot = vec![
+        "network requests, and what was sent or downloaded".to_string(),
+        "anything outside the workspace: /tmp, other folders, other machines".to_string(),
+        "the agent's background jobs: they are stopped first; your terminal (ctrl+t) keeps running".to_string(),
+    ];
+    if !not_covered.is_empty() {
+        cannot.push(format!("left out of checkpoints, left as they are: {}", not_covered.join(", ")));
+    }
+    for missing in app.checkpoints.missing_after(choice) {
+        cannot
+            .push(format!("no checkpoint {} ({}): you can't go back to just before it", missing.label, missing.reason));
+    }
+    for line in cannot {
+        lines.push(Line::raw(format!("  · {}", truncate(&safe::line(&line), inner.saturating_sub(4)))));
+    }
+    if view.confirming {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "Restore these files? enter restores, esc goes back.",
+            theme.bad().add_modifier(Modifier::BOLD),
+        ));
+    }
+    let height = over.height;
+    let room = usize::from(height.saturating_sub(2)).max(1);
+    let skip = view.scroll.min(lines.len().saturating_sub(room));
+    let shown: Vec<Line> = lines.into_iter().skip(skip).take(room).collect();
+    let area = Rect { x: over.x + (over.width - width) / 2, y: over.y, width, height };
+    let block = Block::bordered().title(" Undo ").border_style(theme.accent());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(shown).block(block), area);
+}
+
 /// The network settings (`ctrl+n`), over the panes: the mode, the allowed hosts, and the
 /// requests made so far. Hosts and reasons come from commands: every one goes through
 /// `safe::line`.
@@ -1002,7 +1150,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(crate) fn truncate(text: &str, max: usize) -> String {
     let flat = text.replace('\n', " ");
     if flat.chars().count() <= max {
         return flat;
@@ -1082,6 +1230,7 @@ pub(crate) mod tests {
                 network: NetworkAccess::Controlled(NetworkPolicy::Off),
                 jobs: false,
                 terminal: true,
+                checkpoints: false,
                 actions: SandboxActionKind::ALL.to_vec(),
             },
         });
@@ -1581,6 +1730,82 @@ pub(crate) mod tests {
         assert_eq!(wrap("aa bb cc", 5), vec!["aa bb", "cc"]);
         assert_eq!(wrap("abcdefg", 3), vec!["abc", "def", "g"]);
         assert_eq!(wrap("a\nb", 10), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn the_undo_view_shows_what_it_does_and_what_it_cant_all_escaped() {
+        use nixxa_contracts::{CheckpointId, EntryState, FileChange, WorkspaceDiff};
+        let mut app = started();
+        app.sandbox.as_mut().unwrap().checkpoints = true;
+        app.apply(Event::Message {
+            turn: TurnId::new("turn-0"),
+            message: Message::text(Role::User, "tidy", Timestamp(0)),
+        });
+        app.apply(Event::Checkpoint { turn: TurnId::new("turn-0"), checkpoint: CheckpointId::new("c1"), before: None });
+        app.apply(Event::NotUndoable {
+            turn: TurnId::new("turn-0"),
+            before: None,
+            reason: "the store is full\u{1b}[2J".into(),
+        });
+        app.handle_key(crossterm::event::KeyEvent::new(KeyCode::Char('z'), crossterm::event::KeyModifiers::CONTROL));
+        let file = Some(EntryState::File { size: 1, mode: 0o644, hash: "h".into() });
+        let hostile = "evil\u{1b}]52;c;cHduZWQ=\u{7}\u{202E}gpj.exe";
+        let diff = WorkspaceDiff {
+            changes: vec![
+                FileChange { path: hostile.into(), before: None, after: file.clone(), diff: None },
+                FileChange {
+                    path: "src/main.rs".into(),
+                    before: file.clone(),
+                    after: file.clone(),
+                    diff: Some("--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-fn main() {}\n+fn main() { \u{1b}[31mpwn }\n".into()),
+                },
+                FileChange { path: "gone.txt".into(), before: file, after: None, diff: None },
+            ],
+            not_covered: vec!["target/".into()],
+        };
+        app.undo_diff(&CheckpointId::new("c1"), Ok(diff));
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains(" Undo ") && text.contains("at the start of the turn for \"tidy\""), "{text}");
+        assert!(text.contains("remove  evil^[]52;c;cHduZWQ=^G"), "escaped:\n{text}");
+        assert!(text.contains("revert  src/main.rs") && text.contains("restore gone.txt"), "{text}");
+        assert!(text.contains("+fn main() { ^[[31mpwn }"), "the diff is escaped too:\n{text}");
+        assert!(text.contains("network requests") && text.contains("outside the workspace"), "{text}");
+        assert!(text.contains("left as they are: target/"), "{text}");
+        assert!(text.contains("the store is full^[[2J"), "{text}");
+        assert!(!text.contains('\u{1b}') && !text.contains('\u{202E}') && !text.contains('\u{7}'));
+        app.handle_key(key(KeyCode::Enter));
+        let text = screen(&mut app, 120, 40);
+        assert!(text.contains("Restore these files?") && text.contains("enter restore these files"), "{text}");
+    }
+
+    #[test]
+    fn a_patch_shows_its_size_in_the_activity_and_its_diff_in_the_details() {
+        use nixxa_contracts::{ActionRequest, Edit, Observation, Outcome, SandboxAction};
+        let mut app = started();
+        let request = ActionRequest {
+            id: ActionId::new("p1"),
+            action: Action::Sandbox {
+                action: SandboxAction::Patch {
+                    path: "src/lib.rs".into(),
+                    edits: vec![Edit { search: "a".into(), replace: "b".into() }],
+                    expected_hash: "h".into(),
+                },
+            },
+            reason: None,
+        };
+        app.apply(Event::ActionProposed { turn: TurnId::new("turn-0"), request });
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,2 +1,2 @@\n-old line\n+new line\n+more\u{1b}[2J\n";
+        let outcome = Outcome::Patched { diff: diff.into(), hash: "beef".into() };
+        app.apply(Event::ActionFinished {
+            turn: TurnId::new("turn-0"),
+            observation: Observation::new(ActionId::new("p1"), outcome),
+        });
+        let text = screen(&mut app, 120, 30);
+        assert!(text.contains("edit   src/lib.rs") && text.contains("+2 -1"), "{text}");
+        assert!(
+            text.contains("-old line") && text.contains("+more^[[2J") && text.contains("new sha256 beef"),
+            "{text}"
+        );
     }
 
     #[test]
