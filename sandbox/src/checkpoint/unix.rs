@@ -103,6 +103,20 @@ impl Dir {
         Ok(rustix::fs::renameat(&self.0, from, &self.0, to)?)
     }
 
+    /// Moves `from` in this directory to `to` in `into`, replacing nothing that is a file.
+    pub(crate) fn rename_into(&self, from: &OsStr, into: &Dir, to: &OsStr) -> io::Result<()> {
+        Ok(rustix::fs::renameat(&self.0, from, &into.0, to)?)
+    }
+
+    /// Whether `name` is here (links not followed).
+    pub(crate) fn has(&self, name: &OsStr) -> io::Result<bool> {
+        match rustix::fs::statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => Ok(true),
+            Err(rustix::io::Errno::NOENT) => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
     /// Makes a symbolic link `name` pointing at `target`.
     pub(crate) fn symlink(&self, target: &[u8], name: &OsStr) -> io::Result<()> {
         Ok(rustix::fs::symlinkat(OsStr::from_bytes(target), &self.0, name)?)

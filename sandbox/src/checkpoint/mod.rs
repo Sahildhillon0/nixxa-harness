@@ -71,6 +71,17 @@ const PEEK_CAP: u64 = 256 * 1024;
 const DIFFS_CAP: usize = 1024 * 1024;
 /// A file changed this recently is hashed again next time, whatever its metadata says.
 const RACY: Duration = Duration::from_secs(2);
+/// How deep a snapshot goes. A workspace nested deeper can't be checkpointed (it says so), and
+/// is not looked into when showing how things are now. It bounds the snapshot's recursion (and
+/// the restore's and the diff's, which follow the snapshots) and the descriptors it holds.
+pub(crate) const MAX_DEPTH: usize = 256;
+/// How deep removing a tree goes before it moves what is below up beside it, for a later
+/// round: removing a tree of any depth holds this many descriptors at most, and recursion
+/// this deep at most.
+const REMOVE_DEPTH: usize = 64;
+/// A file in the store, rewritten at every checkpoint: a store whose `alive` is old belongs to
+/// a Nixxa that ended without removing it.
+pub const ALIVE: &str = "alive";
 
 /// Where a sandbox keeps its checkpoints, and how much they may hold. The harness chooses it.
 #[derive(Debug, Clone)]
@@ -135,8 +146,9 @@ enum Node {
     Skipped {
         mode: u32,
     },
-    /// A file or directory that couldn't be read (its owner took away the rights), seen while
-    /// looking at how things are now. Never in a checkpoint: a checkpoint fails instead.
+    /// A file or directory that wasn't read while looking at how things are now: its owner
+    /// took away the rights, a file bigger than the store's cap, or a directory past
+    /// [`MAX_DEPTH`]. Never in a checkpoint: a checkpoint fails instead.
     Unreadable {
         kind: Kind,
         mode: u32,
@@ -295,7 +307,7 @@ impl Store {
             started: SystemTime::now(),
             store_id,
         };
-        match walk.tree(&root, &[], previous.as_ref()) {
+        match walk.tree(&root, &[], previous.as_ref(), 0) {
             Ok(tree) => {
                 let Walk { known, not_covered, peeked, .. } = walk;
                 self.known = known;
@@ -321,6 +333,11 @@ impl Store {
         }
         self.taken.push(snapshot);
         Ok(self.id(self.taken.len() - 1))
+    }
+
+    /// Says the store is in use (see [`ALIVE`]).
+    fn alive(&self) {
+        let _ = std::fs::write(self.dir.join(ALIVE), std::process::id().to_string());
     }
 
     fn blob(&self, hash: &Hash) -> Option<Vec<u8>> {
@@ -497,24 +514,68 @@ fn open_or_make(dir: &Dir, name: &OsStr, path: &[u8]) -> Result<Dir, Failure> {
     }
 }
 
-/// Removes an entry, and everything in it for a directory, without following anything.
+/// Removes an entry, and everything in it for a directory, without following anything, at any
+/// depth: a directory [`REMOVE_DEPTH`] levels down is moved up beside the tree (under a new
+/// name in `dir`) and removed in a later round, so neither the recursion nor the descriptors
+/// held grow with the tree's depth, and every directory is still opened about once.
 fn remove_tree(dir: &Dir, name: &OsStr, kind: Kind, path: &[u8]) -> Result<(), Failure> {
-    if kind == Kind::Dir {
-        let sub = match dir.open_dir(name) {
-            Ok(sub) => sub,
-            Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
-                dir.unlock(name).map_err(|err| io_at("can't remove", path, &err))?;
-                dir.open_dir(name).map_err(|err| io_at("can't remove", path, &err))?
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(err) => return Err(io_at("can't remove", path, &err)),
+    if kind != Kind::Dir {
+        return match dir.remove(name, false) {
+            Err(err) if err.kind() != io::ErrorKind::NotFound => Err(io_at("can't remove", path, &err)),
+            _ => Ok(()),
         };
-        sub.set_mode(0o700).map_err(|err| io_at("can't remove", path, &err))?;
-        for (inner, meta) in sub.list().map_err(|err| io_at("can't list", path, &err))? {
-            remove_tree(&sub, &inner, meta.kind, &child(path, &inner))?;
-        }
     }
-    match dir.remove(name, kind == Kind::Dir) {
+    let mut rounds = vec![name.to_os_string()];
+    let mut moved = 0u64;
+    while let Some(next) = rounds.pop() {
+        remove_dir(dir, dir, &next, path, 1, &mut rounds, &mut moved)?;
+    }
+    Ok(())
+}
+
+/// Removes the directory `name` in `parent` with everything in it; see [`remove_tree`].
+fn remove_dir(
+    top: &Dir,
+    parent: &Dir,
+    name: &OsStr,
+    path: &[u8],
+    depth: usize,
+    rounds: &mut Vec<OsString>,
+    moved: &mut u64,
+) -> Result<(), Failure> {
+    let sub = match parent.open_dir(name) {
+        Ok(sub) => sub,
+        Err(err) if err.kind() == io::ErrorKind::PermissionDenied => {
+            parent.unlock(name).map_err(|err| io_at("can't remove", path, &err))?;
+            parent.open_dir(name).map_err(|err| io_at("can't remove", path, &err))?
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(io_at("can't remove", path, &err)),
+    };
+    sub.set_mode(0o700).map_err(|err| io_at("can't remove", path, &err))?;
+    for (inner, meta) in sub.list().map_err(|err| io_at("can't list", path, &err))? {
+        if meta.kind != Kind::Dir {
+            match sub.remove(&inner, false) {
+                Err(err) if err.kind() != io::ErrorKind::NotFound => return Err(io_at("can't remove", path, &err)),
+                _ => continue,
+            }
+        }
+        if depth < REMOVE_DEPTH {
+            remove_dir(top, &sub, &inner, path, depth + 1, rounds, moved)?;
+            continue;
+        }
+        // Too deep to hold on to: up beside the tree, for the next round.
+        let name = loop {
+            *moved += 1;
+            let candidate = OsString::from(format!(".nixxa-remove-{}-{moved}", std::process::id()));
+            if !top.has(&candidate).map_err(|err| io_at("can't remove", path, &err))? {
+                break candidate;
+            }
+        };
+        sub.rename_into(&inner, top, &name).map_err(|err| io_at("can't remove", path, &err))?;
+        rounds.push(name);
+    }
+    match parent.remove(name, true) {
         Err(err) if err.kind() != io::ErrorKind::NotFound => Err(io_at("can't remove", path, &err)),
         _ => Ok(()),
     }
@@ -562,7 +623,13 @@ fn compare(before: &Tree, after: &Tree, rel: &[u8], change: &mut impl FnMut(&[u8
 }
 
 impl Walk<'_> {
-    fn tree(&mut self, dir: &Dir, rel: &[u8], previous: Option<&Arc<Tree>>) -> Result<Arc<Tree>, Failure> {
+    fn tree(
+        &mut self,
+        dir: &Dir,
+        rel: &[u8],
+        previous: Option<&Arc<Tree>>,
+        depth: usize,
+    ) -> Result<Arc<Tree>, Failure> {
         let mut tree = Tree::new();
         let entries = dir.list().map_err(|err| io_at("can't list", rel, &err))?;
         for (name, meta) in entries {
@@ -575,6 +642,17 @@ impl Walk<'_> {
                 Kind::Dir => {
                     if self.store_id == Some((meta.key.dev, meta.key.ino)) {
                         continue;
+                    }
+                    if depth + 1 >= MAX_DEPTH {
+                        if self.keep == Keep::Peek {
+                            tree.insert(name, Node::Unreadable { kind: Kind::Dir, mode: meta.mode, size: 0 });
+                            continue;
+                        }
+                        return Err(Failure::Io(format!(
+                            "the workspace is nested more than {MAX_DEPTH} directories deep at `{}`, so no checkpoint \
+                             can be taken until that tree is gone",
+                            shown(&path)
+                        )));
                     }
                     let sub = match dir.open_dir(&name) {
                         Ok(sub) => sub,
@@ -590,7 +668,7 @@ impl Walk<'_> {
                         Some(Node::Dir { tree, .. }) => Some(tree.clone()),
                         _ => None,
                     });
-                    Node::Dir { mode: meta.mode, tree: self.tree(&sub, &path, before.as_ref())? }
+                    Node::Dir { mode: meta.mode, tree: self.tree(&sub, &path, before.as_ref(), depth + 1)? }
                 }
                 Kind::File => match self.file(dir, &name, meta, &path)? {
                     Some(node) => node,
@@ -625,6 +703,19 @@ impl Walk<'_> {
                 return Ok(Some(Node::File { hash, size: meta.size, mode: meta.mode }));
             }
         }
+        // The cap is checked before anything is read: a sparse file costs a command nothing,
+        // and its every byte would otherwise be copied before being refused.
+        let keep = self.keep;
+        let too_big = |size: u64, store: &Store| match keep {
+            Keep::Store => store.used.saturating_add(size) > store.cap,
+            Keep::Peek => size > store.cap,
+        };
+        if too_big(meta.size, self.store) {
+            return match self.keep {
+                Keep::Store => Err(self.full(path)),
+                Keep::Peek => Ok(Some(Node::Unreadable { kind: Kind::File, mode: meta.mode, size: meta.size })),
+            };
+        }
         let (mut file, opened) = match dir.open_file(name) {
             Ok(open) => open,
             Err(err) if vanished(&err) => return Ok(None),
@@ -647,6 +738,17 @@ impl Walk<'_> {
                 break;
             }
             size += n as u64;
+            // It may grow while it is read.
+            if too_big(size, self.store) {
+                if let Some((temp_path, out)) = temp.take() {
+                    drop(out);
+                    let _ = std::fs::remove_file(temp_path);
+                }
+                return match self.keep {
+                    Keep::Store => Err(self.full(path)),
+                    Keep::Peek => Ok(Some(Node::Unreadable { kind: Kind::File, mode: opened.mode, size })),
+                };
+            }
             sha2::Digest::update(&mut hasher, &buf[..n]);
             if let Some((_, out)) = temp.as_mut() {
                 out.write_all(&buf[..n]).map_err(|err| io_at("the store can't take", path, &err))?;
@@ -667,6 +769,14 @@ impl Walk<'_> {
             self.known.insert(path.to_vec(), (opened.key, hash));
         }
         Ok(Some(Node::File { hash, size, mode: opened.mode }))
+    }
+
+    fn full(&self, path: &[u8]) -> Failure {
+        Failure::Cap(format!(
+            "the checkpoint store for this session is full ({} MiB): `{}` and what came before it don't fit",
+            self.store.cap / (1024 * 1024),
+            shown(path)
+        ))
     }
 
     /// Whether `err` means an entry can't be read, and this snapshot only looks (a checkpoint
@@ -690,11 +800,7 @@ impl Walk<'_> {
         }
         if self.store.used + size > self.store.cap {
             let _ = std::fs::remove_file(temp);
-            return Err(Failure::Cap(format!(
-                "the checkpoint store for this session is full ({} MiB): `{}` and what came before it don't fit",
-                self.store.cap / (1024 * 1024),
-                shown(path)
-            )));
+            return Err(self.full(path));
         }
         let blob = self.store.blob_path(&hash);
         let stored = blob.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|()| std::fs::rename(temp, &blob));
@@ -774,6 +880,7 @@ impl Checkpoints {
             known: HashMap::new(),
             temp: 0,
         };
+        store.alive();
         Ok(Self { store: Arc::new(Mutex::new(Some(store))), dir: config.dir.clone() })
     }
 
@@ -794,7 +901,11 @@ impl Checkpoints {
     }
 
     pub(crate) async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
-        self.run(|store| store.checkpoint().map_err(SandboxError::from)).await
+        self.run(|store| {
+            store.alive();
+            store.checkpoint().map_err(SandboxError::from)
+        })
+        .await
     }
 
     pub(crate) async fn restore(&self, id: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {

@@ -53,7 +53,10 @@ content-addressed store of our own in the directory the harness gives
 under their SHA-256; trees are in memory, shared between checkpoints. Unchanged files are
 recognised by device, inode, size, mtime and ctime, and the first 2 s of a change are always
 re-read: 10,000 files take about 12 ms unchanged and 11 ms with one changed. Past the cap a
-checkpoint is `LimitExceeded` and keeps nothing. A fixed list of build directories (`target`,
+checkpoint is `LimitExceeded` and keeps nothing; the cap is checked from a file's size before it
+is read and again while it is copied, so a sparse file is refused at once. Snapshots go 256
+levels deep at most (a deeper workspace can't be checkpointed, and says why), and removing a
+tree of any depth works in rounds of 64 levels, so nothing recurses with the tree's depth. A fixed list of build directories (`target`,
 `node_modules`, …, `EXCLUDED`) and special files are left out, and `.gitignore` is never read.
 For `BwrapSandbox`, snapshot and restore run **on the host** over the mounted directory, never
 through the daemon, and the store is never mounted. Every entry is hostile:

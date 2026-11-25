@@ -134,3 +134,24 @@ async fn a_fifo_the_agent_makes_does_not_hang_a_checkpoint() {
     let diff = sb.diff(&id, None).await.unwrap();
     assert_eq!(diff.not_covered, vec!["pipe (a special file)".to_string()]);
 }
+
+#[tokio::test]
+async fn a_deep_tree_the_agent_builds_neither_crashes_nor_blocks_the_next_action_or_undo() {
+    let scratch = Scratch::new("undo-deep");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    sh_out(&sb, "echo keep > keep.txt").await;
+    let before = sb.checkpoint().await.unwrap();
+    // Relative names only, so no path limit applies; past the snapshot's depth limit.
+    sh_out(&sb, "i=0; while [ $i -lt 1500 ]; do mkdir d && cd d || exit 1; i=$((i+1)); done; echo deep").await;
+    let refused = sb.checkpoint().await;
+    assert!(
+        matches!(&refused, Err(nixxa_contracts::SandboxError::Other(why)) if why.contains("nested more than")),
+        "{refused:?}"
+    );
+    // The next action still runs.
+    assert_eq!(sh_out(&sb, "echo still here").await.trim(), "still here");
+    let diff = sb.diff(&before, None).await.unwrap();
+    assert!(diff.changes.iter().any(|c| c.path == "d" && c.before.is_none()));
+    sb.restore(&before).await.unwrap();
+    assert_eq!(sh_out(&sb, "ls -A").await.trim(), "keep.txt", "the deep tree is gone");
+}

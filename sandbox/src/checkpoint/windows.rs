@@ -124,6 +124,18 @@ impl Dir {
         std::fs::rename(self.0.join(from), self.0.join(to))
     }
 
+    pub(crate) fn rename_into(&self, from: &OsStr, into: &Dir, to: &OsStr) -> io::Result<()> {
+        std::fs::rename(self.0.join(from), into.0.join(to))
+    }
+
+    pub(crate) fn has(&self, name: &OsStr) -> io::Result<bool> {
+        match std::fs::symlink_metadata(self.0.join(name)) {
+            Ok(_) => Ok(true),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
+
     pub(crate) fn symlink(&self, target: &[u8], name: &OsStr) -> io::Result<()> {
         let target = String::from_utf8_lossy(target).into_owned();
         std::os::windows::fs::symlink_file(target, self.0.join(name))

@@ -362,6 +362,100 @@ mod unix_attacks {
         assert_eq!(s.read("a.txt"), "aaaa");
     }
 
+    /// The review's probe: a sparse file costs a command nothing, but must not make the store
+    /// copy it before refusing it.
+    #[tokio::test]
+    async fn a_sparse_file_past_the_cap_is_refused_before_anything_is_copied() {
+        let s = Scratch::new();
+        s.write("small.txt", "small\n");
+        let big = std::fs::File::create(s.at("big")).unwrap();
+        big.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        let store = s.store(1024 * 1024);
+        let started = std::time::Instant::now();
+        let refused = store.checkpoint().await;
+        assert!(matches!(&refused, Err(SandboxError::LimitExceeded(why)) if why.contains("`big`")), "{refused:?}");
+        assert!(started.elapsed() < std::time::Duration::from_secs(2), "refused at once: {:?}", started.elapsed());
+        let temp = s.base.join("store").join("run-1").join("tmp");
+        assert_eq!(std::fs::read_dir(temp).unwrap().count(), 0, "nothing was copied");
+        assert!(s.blobs().is_empty(), "and nothing kept");
+        // The undo view still works: the file isn't read, just marked.
+        std::fs::remove_file(s.at("big")).unwrap();
+        let before = store.checkpoint().await.unwrap();
+        let big = std::fs::File::create(s.at("big")).unwrap();
+        big.set_len(2 * 1024 * 1024 * 1024).unwrap();
+        let started = std::time::Instant::now();
+        let diff = store.diff(&before, None).await.unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(find(&diff, "big").before.is_none());
+        store.restore(&before).await.unwrap();
+        assert!(!s.at("big").exists());
+    }
+
+    /// `d/d/d/…` `levels` deep under `name`, made one level at a time (no path is ever long).
+    fn deep(s: &Scratch, name: &str, levels: usize) {
+        let mut dir = std::fs::File::open(s.ws()).unwrap();
+        let mut name = name.to_string();
+        for _ in 0..levels {
+            rustix::fs::mkdirat(&dir, name.as_str(), rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
+            let next = rustix::fs::openat(
+                &dir,
+                name.as_str(),
+                rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
+                rustix::fs::Mode::empty(),
+            )
+            .unwrap();
+            dir = std::fs::File::from(next);
+            name = "d".into();
+        }
+        rustix::fs::mkdirat(&dir, "bottom", rustix::fs::Mode::from_raw_mode(0o755)).unwrap();
+    }
+
+    /// The review's second probe: 100,000 levels made by a command. Before, the snapshot's
+    /// recursion overflowed the blocking thread's stack and aborted Nixxa.
+    #[tokio::test]
+    async fn a_tree_of_any_depth_neither_crashes_nor_blocks_undo() {
+        let s = Scratch::new();
+        s.write("keep.txt", "keep\n");
+        let store = s.store(DEFAULT_CAP);
+        let before = store.checkpoint().await.unwrap();
+        deep(&s, "deep", 100_000);
+        // A checkpoint is refused with the reason, at once.
+        let refused = store.checkpoint().await;
+        assert!(
+            matches!(&refused, Err(SandboxError::Other(why)) if why.contains("nested more than 256")),
+            "{refused:?}"
+        );
+        // The undo view shows it, without going all the way down.
+        let diff = store.diff(&before, None).await.unwrap();
+        assert!(find(&diff, "deep").before.is_none(), "{:?}", &diff.changes[..3]);
+        assert!(diff.changes.len() <= MAX_DEPTH + 2, "{}", diff.changes.len());
+        // And the undo removes all of it.
+        let undone = store.restore(&before).await.unwrap();
+        assert!(undone.changes.iter().any(|c| c.path == "deep"));
+        assert!(!s.at("deep").exists(), "the deep tree is gone");
+        let left: Vec<_> = std::fs::read_dir(s.ws()).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("keep.txt")], "no moved pieces are left");
+        // Checkpoints work again.
+        store.checkpoint().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_deep_tree_in_a_checkpoint_is_restored_and_a_deeper_one_removed() {
+        // Within the limit, a deep tree is kept and put back; past REMOVE_DEPTH it is removed in
+        // rounds.
+        let s = Scratch::new();
+        deep(&s, "kept", 200);
+        let store = s.store(DEFAULT_CAP);
+        let before = store.checkpoint().await.unwrap();
+        std::fs::rename(s.at("kept"), s.at("moved")).unwrap();
+        deep(&s, "fresh", 5_000);
+        store.restore(&before).await.unwrap();
+        assert!(!s.at("moved").exists() && !s.at("fresh").exists());
+        let bottom = (0..199).fold(s.at("kept"), |path, _| path.join("d")).join("bottom");
+        assert!(bottom.is_dir(), "the deep tree is back to its bottom");
+        assert!(store.diff(&before, None).await.unwrap().is_empty());
+    }
+
     /// The numbers for the PR: `cargo test -p nixxa-sandbox --release -- --ignored --nocapture
     /// a_checkpoint_of_ten_thousand_files`.
     #[tokio::test]
@@ -386,5 +480,46 @@ mod unix_attacks {
         let start = std::time::Instant::now();
         store.checkpoint().await.unwrap();
         time("one file changed", start);
+    }
+
+    /// A real tree's first checkpoint, for the PR: `NIXXA_TIMING_DIR=<a repo> cargo test -p
+    /// nixxa-sandbox --release -- --ignored --nocapture a_first_checkpoint_of_a_real_tree`. It
+    /// only reads that directory.
+    #[tokio::test]
+    #[ignore = "a timing, run by hand"]
+    async fn a_first_checkpoint_of_a_real_tree() {
+        let Some(dir) = std::env::var_os("NIXXA_TIMING_DIR") else { return };
+        let s = Scratch::new();
+        let store = Checkpoints::new(
+            &PathBuf::from(dir).canonicalize().unwrap(),
+            &CheckpointConfig { dir: s.base.join("store").join("run-1"), cap: DEFAULT_CAP },
+        )
+        .unwrap();
+        let start = std::time::Instant::now();
+        let id = store.checkpoint().await.unwrap();
+        println!(
+            "first checkpoint: {:?}, {} MiB stored",
+            start.elapsed(),
+            store_size(&s.base.join("store")) / (1024 * 1024)
+        );
+        std::thread::sleep(RACY + std::time::Duration::from_millis(100));
+        store.checkpoint().await.unwrap();
+        let start = std::time::Instant::now();
+        store.checkpoint().await.unwrap();
+        println!("unchanged: {:?}", start.elapsed());
+        let diff = store.diff(&id, None).await.unwrap();
+        println!("left out: {:?}", diff.not_covered);
+    }
+
+    fn store_size(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| {
+                let meta = std::fs::symlink_metadata(e.path()).unwrap();
+                if meta.is_dir() { store_size(&e.path()) } else { meta.len() }
+            })
+            .sum()
     }
 }
