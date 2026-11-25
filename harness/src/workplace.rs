@@ -172,13 +172,34 @@ const OLD_STORE: std::time::Duration = std::time::Duration::from_secs(3 * 24 * 6
 
 /// Removes checkpoint stores left by earlier runs that crashed (a clean quit removes its own).
 pub(crate) fn remove_old_checkpoints() {
-    let Some(root) = checkpoints_root() else { return };
-    let Ok(entries) = std::fs::read_dir(&root) else { return };
-    let Some(cutoff) = std::time::SystemTime::now().checked_sub(OLD_STORE) else { return };
+    if let Some(root) = checkpoints_root() {
+        remove_old_stores(&root, std::time::SystemTime::now(), &running);
+    }
+}
+
+/// Whether the Nixxa with this pid may still be running: on Linux, whether `/proc` has it;
+/// elsewhere unknown, so only the store's age decides.
+fn running(pid: u32) -> bool {
+    cfg!(target_os = "linux") && Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Removes the stores under `root` that are old by `now`: the store and its `alive` file
+/// (rewritten at every checkpoint) both older than [`OLD_STORE`], and the Nixxa whose pid ends
+/// its name (`<millis>-<pid>`) not running.
+fn remove_old_stores(root: &Path, now: std::time::SystemTime, running: &dyn Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let Some(cutoff) = now.checked_sub(OLD_STORE) else { return };
     for entry in entries.flatten() {
-        let old = entry.metadata().and_then(|m| m.modified()).is_ok_and(|modified| modified < cutoff);
-        if old && entry.file_type().is_ok_and(|t| t.is_dir()) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let newest =
+            [modified(&path), modified(&path.join(nixxa_sandbox::checkpoint::ALIVE))].into_iter().flatten().max();
+        let pid = entry.file_name().to_str().and_then(|name| name.rsplit('-').next()?.parse::<u32>().ok());
+        if newest.is_some_and(|newest| newest < cutoff) && !pid.is_some_and(running) {
+            let _ = std::fs::remove_dir_all(path);
         }
     }
 }
@@ -479,6 +500,29 @@ mod tests {
         std::fs::write(beside.join(DAEMON), "").unwrap();
         assert_eq!(find_daemon(Some(&beside), Some(path)), Some(beside.join(DAEMON)), "beside the harness wins");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn only_stores_that_are_old_and_whose_nixxa_is_gone_are_removed() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("nixxa-stores-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["100-11", "200-22", "300-33"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join(nixxa_sandbox::checkpoint::ALIVE), "x").unwrap();
+        }
+        // In four days: all three look old; 22's Nixxa still runs; 33's store was touched then.
+        let later = SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60);
+        let touched = std::fs::File::options()
+            .write(true)
+            .open(root.join("300-33").join(nixxa_sandbox::checkpoint::ALIVE))
+            .unwrap();
+        touched.set_modified(later).unwrap();
+        remove_old_stores(&root, later, &|pid| pid == 22);
+        let mut left: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("200-22"), std::ffi::OsString::from("300-33")]);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The places against the real sandbox: the daemon this workspace built, and `bwrap`.
