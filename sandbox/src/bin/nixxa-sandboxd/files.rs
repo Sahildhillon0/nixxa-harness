@@ -1,4 +1,5 @@
-//! `ReadFile`, `WriteFile` and `ListDir`, done by the daemon itself, beneath the workspace only.
+//! `ReadFile`, `WriteFile`, `Patch` and `ListDir`, done by the daemon itself, beneath the
+//! workspace only.
 //!
 //! A path is first checked as text ([`relative`]): an absolute path is refused unless it is
 //! under `/workspace`, and `..` is refused anywhere. It is then opened with
@@ -13,7 +14,9 @@ use std::os::fd::{AsFd, OwnedFd};
 use rustix::fs::{AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags};
 use rustix::io::Errno;
 
-use nixxa_contracts::{DirEntry, Outcome};
+use nixxa_contracts::{DirEntry, Edit, Outcome};
+
+use crate::patch;
 
 /// Where the workspace is mounted inside the sandbox.
 pub(crate) const WORKSPACE: &str = "/workspace";
@@ -81,9 +84,105 @@ pub(crate) fn read(root: &OwnedFd, path: &str, cap: u64) -> Outcome {
     if bytes.len() as u64 > cap {
         return failed(format!("the file is too large to read (limit {cap} bytes)"));
     }
+    let hash = patch::hash(&bytes);
     match String::from_utf8(bytes) {
-        Ok(content) => Outcome::Text { content },
+        Ok(content) => Outcome::File { content, hash },
         Err(_) => failed("the file is not UTF-8 text"),
+    }
+}
+
+/// Applies a patch to an existing regular file, never through a symbolic link (the file's own
+/// name included): all the edits or none, then a new file beside it, with the same mode, is
+/// renamed over it.
+pub(crate) fn patch(root: &OwnedFd, path: &str, edits: &[Edit], expected: &str, cap: u64) -> Outcome {
+    let rel = match relative(path) {
+        Ok(rel) => rel,
+        Err(why) => return failed(why),
+    };
+    if rel == "." {
+        return failed("that is the workspace root");
+    }
+    let mut parts: Vec<&str> = rel.split('/').collect();
+    let Some(name) = parts.pop() else { return failed("that is the workspace root") };
+    let mut dir: Option<OwnedFd> = None;
+    for part in parts {
+        let at = dir.as_ref().map_or(root.as_fd(), |d| d.as_fd());
+        match open_dir_step(at, part) {
+            Ok(fd) => dir = Some(fd),
+            Err(err) => return failed(errno_words(err)),
+        }
+    }
+    let at = dir.as_ref().map_or(root.as_fd(), |d| d.as_fd());
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let fd = match rustix::fs::openat2(at, name, flags, Mode::empty(), BENEATH | ResolveFlags::NO_SYMLINKS) {
+        Ok(fd) => fd,
+        Err(Errno::LOOP) => {
+            return failed("that is a symbolic link, which a patch doesn't follow: patch the file it points to");
+        }
+        Err(err) => return failed(errno_words(err)),
+    };
+    let before = match rustix::fs::fstat(&fd) {
+        Ok(st) if FileType::from_raw_mode(st.st_mode) != FileType::RegularFile => {
+            return failed("that is not a regular file");
+        }
+        Ok(st) if st.st_size as u64 > cap => {
+            return failed(format!("the file is too large to patch ({} bytes, limit {cap})", st.st_size));
+        }
+        Ok(st) => st,
+        Err(err) => return failed(errno_words(err)),
+    };
+    let mut old = Vec::new();
+    if let Err(err) = std::fs::File::from(fd).take(cap + 1).read_to_end(&mut old) {
+        return failed(err.to_string());
+    }
+    let new = match patch::apply(&old, edits, expected) {
+        Ok(new) => new,
+        Err(why) => return failed(why),
+    };
+    if new.len() as u64 > cap {
+        return failed(format!("the patched file would be too large ({} bytes, limit {cap})", new.len()));
+    }
+    // A new name beside the file; one that is taken (the agent may have put a file there) is
+    // skipped for the next.
+    static TEMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let create = OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let mut tries = 0;
+    let (temp, out) = loop {
+        let n = TEMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = format!(".nixxa-patch-{}-{n}", rustix::process::getpid().as_raw_nonzero());
+        match rustix::fs::openat2(at, temp.as_str(), create, Mode::from_raw_mode(0o600), BENEATH) {
+            Ok(out) => break (temp, out),
+            Err(Errno::EXIST) if tries < 16 => tries += 1,
+            Err(err) => return failed(errno_words(err)),
+        }
+    };
+    let mode = Mode::from_raw_mode(before.st_mode & 0o7777);
+    let written = rustix::fs::fchmod(&out, mode).map_err(std::io::Error::from).and_then(|()| {
+        let mut out = std::fs::File::from(out);
+        out.write_all(&new)?;
+        out.flush()
+    });
+    // The file must still be the one read: not changed or swapped meanwhile.
+    let same = match rustix::fs::statat(at, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(now) => {
+            now.st_ino == before.st_ino
+                && now.st_size == before.st_size
+                && now.st_mtime == before.st_mtime
+                && now.st_mtime_nsec == before.st_mtime_nsec
+        }
+        Err(_) => false,
+    };
+    let result = match (written, same) {
+        (Err(err), _) => Err(err.to_string()),
+        (Ok(()), false) => Err("the file changed while it was being patched, so nothing was changed".to_string()),
+        (Ok(()), true) => rustix::fs::renameat(at, temp.as_str(), at, name).map_err(errno_words),
+    };
+    match result {
+        Ok(()) => Outcome::Patched { diff: patch::unified(&rel, &old, &new), hash: patch::hash(&new) },
+        Err(why) => {
+            let _ = rustix::fs::unlinkat(at, temp.as_str(), AtFlags::empty());
+            failed(why)
+        }
     }
 }
 
@@ -274,8 +373,9 @@ mod tests {
         let (s, root) = scratch("rw");
         assert_eq!(write(&root, "a/b/c.txt", "hi", 100), Outcome::Written { bytes: 2 });
         assert_eq!(std::fs::read_to_string(s.0.join("ws/a/b/c.txt")).unwrap(), "hi");
-        assert_eq!(read(&root, "a/b/c.txt", 100), Outcome::Text { content: "hi".into() });
-        assert_eq!(read(&root, "/workspace/a/b/c.txt", 100), Outcome::Text { content: "hi".into() });
+        let hi = Outcome::File { content: "hi".into(), hash: patch::hash(b"hi") };
+        assert_eq!(read(&root, "a/b/c.txt", 100), hi);
+        assert_eq!(read(&root, "/workspace/a/b/c.txt", 100), hi);
         match list(&root, "a") {
             Outcome::Listing { entries } => {
                 assert_eq!(entries, vec![DirEntry { name: "b".into(), is_dir: true, size: None }])
@@ -318,6 +418,63 @@ mod tests {
         assert!(is_failed(&list(&root, "dir")));
         assert_eq!(std::fs::read_to_string(s.0.join("outside/secret.txt")).unwrap(), "secret");
         assert!(!s.0.join("outside/new.txt").exists());
+    }
+
+    fn edit(search: &str, replace: &str) -> Vec<Edit> {
+        vec![Edit { search: search.into(), replace: replace.into() }]
+    }
+
+    #[test]
+    fn patches_replace_the_file_and_keep_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let (s, root) = scratch("patch");
+        let path = s.0.join("ws/run.sh");
+        std::fs::write(&path, "echo one\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o751)).unwrap();
+        let ino = std::fs::metadata(&path).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).unwrap();
+        let o = patch(&root, "run.sh", &edit("one", "two"), &patch::hash(b"echo one\n"), 100);
+        assert!(
+            matches!(&o, Outcome::Patched { diff, hash } if diff.contains("+echo two") && *hash == patch::hash(b"echo two\n")),
+            "{o:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo two\n");
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o7777, 0o751, "the mode is kept");
+        assert_ne!(std::os::unix::fs::MetadataExt::ino(&meta), ino, "replaced, not written into");
+        let leftovers: Vec<_> = std::fs::read_dir(s.0.join("ws")).unwrap().collect();
+        assert_eq!(leftovers.len(), 1, "no temporary file is left");
+        // A stale hash changes nothing.
+        assert!(is_failed(&patch(&root, "run.sh", &edit("two", "three"), &patch::hash(b"echo one\n"), 100)));
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "echo two\n");
+        assert!(
+            is_failed(&patch(
+                &root,
+                "run.sh",
+                &edit("two", "x".repeat(200).as_str()),
+                &patch::hash(b"echo two\n"),
+                100
+            )),
+            "the cap"
+        );
+    }
+
+    #[test]
+    fn patches_never_follow_links() {
+        let (s, root) = scratch("patchlinks");
+        let ws = s.0.join("ws");
+        std::fs::write(ws.join("real.txt"), "keep\n").unwrap();
+        std::fs::create_dir(ws.join("real")).unwrap();
+        std::fs::write(ws.join("real/inner.txt"), "keep\n").unwrap();
+        symlink("real.txt", ws.join("inside-link")).unwrap();
+        symlink("real", ws.join("dir-link")).unwrap();
+        symlink(s.0.join("outside/secret.txt"), ws.join("out-link")).unwrap();
+        let keep = patch::hash(b"keep\n");
+        for path in ["inside-link", "dir-link/inner.txt", "out-link", "../outside/secret.txt", "missing.txt", "real"] {
+            assert!(is_failed(&patch(&root, path, &edit("keep", "pwned"), &keep, 100)), "{path}");
+        }
+        assert_eq!(std::fs::read_to_string(ws.join("real.txt")).unwrap(), "keep\n");
+        assert_eq!(std::fs::read_to_string(ws.join("real/inner.txt")).unwrap(), "keep\n");
+        assert_eq!(std::fs::read_to_string(s.0.join("outside/secret.txt")).unwrap(), "secret");
     }
 
     #[test]

@@ -26,8 +26,8 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use nixxa_contracts::{Outcome, SandboxAction, SandboxEvent, TerminalSize};
 
-/// The protocol version both ends must agree on.
-pub(crate) const VERSION: u32 = 4;
+/// The protocol version both ends must agree on. 5: `Patch`, and reads carry the file's hash.
+pub(crate) const VERSION: u32 = 5;
 
 /// The largest frame either end sends or accepts, in bytes (the JSON body, without the prefix).
 pub(crate) const MAX_FRAME: usize = 8 * 1024 * 1024;

@@ -9,8 +9,9 @@ use futures::stream::BoxStream;
 use tokio::sync::{broadcast, mpsc};
 
 use nixxa_contracts::{
-    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, Outcome, Sandbox, SandboxAction,
-    SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal, TerminalEvent, TerminalSize,
+    ActionId, CheckpointId, EntryState, FileChange, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal,
+    Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal,
+    TerminalEvent, TerminalSize, WorkspaceDiff,
 };
 
 use crate::job::{End, Table};
@@ -23,9 +24,13 @@ use crate::job::{End, Table};
 ///
 /// Its terminal is scripted too: it echoes what is typed and runs nothing; `stty size` answers
 /// the terminal's size and `exit` ends it.
+///
+/// Patches and checkpoints work on its files (a checkpoint is a copy of them), so undo can be
+/// shown with `--fake`.
 #[derive(Debug)]
 pub struct FakeSandbox {
     files: Mutex<HashMap<String, String>>,
+    checkpoints: Mutex<Vec<HashMap<String, String>>>,
     jobs: Mutex<Table>,
     events: broadcast::Sender<SandboxEvent>,
     /// The policy set, reported back; the fake has no network to apply it to.
@@ -37,6 +42,7 @@ impl Default for FakeSandbox {
     fn default() -> Self {
         Self {
             files: Mutex::default(),
+            checkpoints: Mutex::default(),
             jobs: Mutex::new(Table::new(4, 64 * 1024, "")),
             events: broadcast::channel(crate::events::CAPACITY).0,
             network: Mutex::default(),
@@ -167,6 +173,35 @@ impl Drop for ScriptedTerminal {
     }
 }
 
+/// What differs between two sets of the fake's files.
+fn diff_files(before: &HashMap<String, String>, after: &HashMap<String, String>) -> WorkspaceDiff {
+    let state = |content: &String| EntryState::File {
+        size: content.len() as u64,
+        mode: 0o644,
+        hash: crate::patch::hash(content.as_bytes()),
+    };
+    let mut paths: Vec<&String> = before.keys().chain(after.keys()).collect();
+    paths.sort();
+    paths.dedup();
+    let changes = paths
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| {
+            let (old, new) = (before.get(path), after.get(path));
+            FileChange {
+                path: path.clone(),
+                before: old.map(state),
+                after: new.map(state),
+                diff: match (old, new) {
+                    (Some(old), Some(new)) => Some(crate::patch::unified(path, old.as_bytes(), new.as_bytes())),
+                    _ => None,
+                },
+            }
+        })
+        .collect();
+    WorkspaceDiff { changes, not_covered: Vec::new() }
+}
+
 /// The code of a final `exit N` in `command`, else 0.
 fn final_exit_code(command: &str) -> i32 {
     command
@@ -200,6 +235,17 @@ impl FakeSandbox {
         }
     }
 
+    /// The files a checkpoint recorded.
+    fn taken(&self, checkpoint: &CheckpointId) -> Result<HashMap<String, String>, SandboxError> {
+        let taken = self.checkpoints.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?;
+        checkpoint
+            .as_str()
+            .strip_prefix("fake.")
+            .and_then(|n| n.parse::<usize>().ok())
+            .and_then(|n| taken.get(n).cloned())
+            .ok_or_else(|| SandboxError::NoCheckpoint(checkpoint.clone()))
+    }
+
     /// Rejects paths that escape the workspace.
     fn confine(&self, path: &str) -> Option<String> {
         if path.starts_with('/') || path.split('/').any(|c| c == "..") {
@@ -218,6 +264,7 @@ impl Sandbox for FakeSandbox {
             network: NetworkAccess::Controlled(self.network.lock().map(|p| p.clone()).unwrap_or_default()),
             jobs: true,
             terminal: true,
+            checkpoints: true,
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }
@@ -239,6 +286,7 @@ impl Sandbox for FakeSandbox {
             }
             SandboxAction::ReadFile { ref path }
             | SandboxAction::WriteFile { ref path, .. }
+            | SandboxAction::Patch { ref path, .. }
             | SandboxAction::ListDir { ref path } => path.clone(),
         };
         let Some(path) = self.confine(&path) else {
@@ -247,8 +295,23 @@ impl Sandbox for FakeSandbox {
         let mut files = self.files.lock().unwrap();
         let outcome = match action {
             SandboxAction::ReadFile { .. } => match files.get(&path) {
-                Some(content) => Outcome::Text { content: content.clone() },
+                Some(content) => {
+                    Outcome::File { content: content.clone(), hash: crate::patch::hash(content.as_bytes()) }
+                }
                 None => Outcome::Failed { message: "no such file".into() },
+            },
+            SandboxAction::Patch { edits, expected_hash, .. } => match files.get(&path) {
+                None => Outcome::Failed { message: "no such file".into() },
+                Some(old) => match crate::patch::apply(old.as_bytes(), &edits, &expected_hash) {
+                    Err(message) => Outcome::Failed { message },
+                    Ok(new) => {
+                        let new = String::from_utf8_lossy(&new).into_owned();
+                        let diff = crate::patch::unified(&path, old.as_bytes(), new.as_bytes());
+                        let hash = crate::patch::hash(new.as_bytes());
+                        files.insert(path, new);
+                        Outcome::Patched { diff, hash }
+                    }
+                },
             },
             SandboxAction::WriteFile { content, .. } => {
                 let bytes = content.len() as u64;
@@ -282,6 +345,32 @@ impl Sandbox for FakeSandbox {
 
     async fn health(&self) -> Result<(), SandboxError> {
         Ok(())
+    }
+
+    async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
+        let files = self.files.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?.clone();
+        let mut taken = self.checkpoints.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?;
+        if taken.last() != Some(&files) {
+            taken.push(files);
+        }
+        Ok(CheckpointId::new(format!("fake.{}", taken.len() - 1)))
+    }
+
+    async fn restore(&self, checkpoint: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {
+        let target = self.taken(checkpoint)?;
+        let mut files = self.files.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?;
+        let undone = diff_files(&target, &files);
+        *files = target;
+        Ok(undone)
+    }
+
+    async fn diff(&self, from: &CheckpointId, to: Option<&CheckpointId>) -> Result<WorkspaceDiff, SandboxError> {
+        let before = self.taken(from)?;
+        let after = match to {
+            Some(to) => self.taken(to)?,
+            None => self.files.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?.clone(),
+        };
+        Ok(diff_files(&before, &after))
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
@@ -349,7 +438,7 @@ mod tests {
             .expect("write");
         sandbox.reset().await.expect("reset");
         let read = sandbox.execute(id, SandboxAction::ReadFile { path: "keep.txt".into() }).await.expect("read");
-        assert!(matches!(read.outcome, Outcome::Text { .. }), "reset must keep the workspace");
+        assert!(matches!(read.outcome, Outcome::File { .. }), "reset must keep the workspace");
     }
 
     #[tokio::test]

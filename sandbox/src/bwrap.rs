@@ -43,8 +43,9 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use nixxa_contracts::{
-    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, Outcome, Sandbox, SandboxAction,
-    SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal, TerminalEvent, TerminalSize,
+    ActionId, CheckpointId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, Outcome, Sandbox,
+    SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal, TerminalEvent,
+    TerminalSize, WorkspaceDiff,
 };
 
 use crate::JobLimits;
@@ -121,6 +122,9 @@ pub struct BwrapConfig {
     pub open_files_max: u64,
     /// Limits on background jobs.
     pub jobs: JobLimits,
+    /// Where checkpoints (undo) are kept, on the host, never mounted into the sandbox; `None`
+    /// for none. Checkpoints and restores run on the host over the mounted directory.
+    pub checkpoints: Option<crate::checkpoint::CheckpointConfig>,
     /// Tests only: names the network proxy resolves from this table instead of asking the
     /// system resolver. The harness leaves it empty.
     #[doc(hidden)]
@@ -148,6 +152,7 @@ impl BwrapConfig {
             file_size_max: 1024 * 1024 * 1024,
             open_files_max: 1024,
             jobs: JobLimits::default(),
+            checkpoints: None,
             hosts: std::collections::HashMap::new(),
         }
     }
@@ -189,6 +194,7 @@ impl std::fmt::Debug for BwrapSandbox {
 
 struct Inner {
     workspace: PathBuf,
+    checkpoints: Option<crate::checkpoint::Checkpoints>,
     daemon: PathBuf,
     bwrap: PathBuf,
     /// `systemd-run` and the runtime dir, when the sandbox gets a cgroup scope.
@@ -269,8 +275,11 @@ impl BwrapSandbox {
         // The proxy's private directory goes where the user's runtime files do.
         let base = config.runtime_dir.clone().unwrap_or_else(std::env::temp_dir);
         let proxy = Proxy::new(&base, config.hosts.clone(), events.clone());
+        let checkpoints =
+            config.checkpoints.as_ref().map(|c| crate::checkpoint::Checkpoints::new(&workspace, c)).transpose()?;
         Ok(Self {
             inner: Arc::new(Inner {
+                checkpoints,
                 workspace,
                 daemon,
                 bwrap,
@@ -294,6 +303,10 @@ impl BwrapSandbox {
     /// sandbox), rather than with per-process rlimits only.
     pub fn has_cgroup(&self) -> bool {
         self.inner.scope.is_some()
+    }
+
+    fn checkpoints(&self) -> Result<&crate::checkpoint::Checkpoints, SandboxError> {
+        self.inner.checkpoints.as_ref().ok_or_else(|| SandboxError::Unsupported("checkpoints are off".into()))
     }
 }
 
@@ -822,8 +835,21 @@ impl Sandbox for BwrapSandbox {
             // Not once the daemon has said Landlock isn't there: the agent's commands couldn't be
             // kept away from the terminal (D-066).
             terminal: landlock || !self.inner.started.load(Ordering::Relaxed),
+            checkpoints: self.inner.checkpoints.is_some(),
             actions: SandboxActionKind::ALL.to_vec(),
         }
+    }
+
+    async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
+        self.checkpoints()?.checkpoint().await
+    }
+
+    async fn restore(&self, checkpoint: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {
+        self.checkpoints()?.restore(checkpoint).await
+    }
+
+    async fn diff(&self, from: &CheckpointId, to: Option<&CheckpointId>) -> Result<WorkspaceDiff, SandboxError> {
+        self.checkpoints()?.diff(from, to).await
     }
 
     async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
@@ -837,6 +863,12 @@ impl Sandbox for BwrapSandbox {
             SandboxAction::WriteFile { content, .. } if content.len() as u64 > config.file_cap => {
                 let message =
                     format!("the content is too large to write ({} bytes, limit {})", content.len(), config.file_cap);
+                return Ok(Observation::failed(id, message));
+            }
+            SandboxAction::Patch { edits, .. }
+                if edits.iter().map(|e| e.search.len() + e.replace.len()).sum::<usize>() as u64 > config.file_cap =>
+            {
+                let message = format!("the patch is too large (its edits pass {} bytes)", config.file_cap);
                 return Ok(Observation::failed(id, message));
             }
             _ => (QUICK_TIMEOUT, false),

@@ -12,6 +12,10 @@
 //! group, and ending it kills the group; a process that leaves the group (`setsid`) escapes,
 //! which is one more way this mode isn't isolated. On Windows only the shell itself is killed.
 //!
+//! Patches replace the file at once (a new file beside it, renamed over it, with its mode kept),
+//! and never through a symbolic link. Checkpoints (undo) live in a store on the host (see
+//! `checkpoint/`), outside the directory.
+//!
 //! The user's terminal (`ctrl+t`, Unix only) is the user's own shell in the root, on a PTY; see
 //! `host_terminal.rs`. On Windows there is none yet: it needs ConPTY (Stage 16), and
 //! [`Sandbox::open_terminal`] says so.
@@ -29,11 +33,12 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, DirEntry, JobId, NetworkAccess, Observation, OpenTerminal, Outcome, Sandbox, SandboxAction,
-    SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, TerminalSize,
+    ActionId, CheckpointId, DirEntry, Edit, JobId, NetworkAccess, Observation, OpenTerminal, Outcome, Sandbox,
+    SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, TerminalSize, WorkspaceDiff,
 };
 
 use crate::JobLimits;
+use crate::checkpoint::{CheckpointConfig, Checkpoints};
 use crate::job::{End, Handles, Job, Table, Tail, no_such_job};
 
 /// The time limit when the action asks for none.
@@ -61,6 +66,8 @@ pub struct HostConfig {
     pub jobs: JobLimits,
     /// The user's shell for the terminal (the harness passes `$SHELL`); `/bin/sh` without one.
     pub shell: Option<PathBuf>,
+    /// Where checkpoints (undo) are kept; `None` for none.
+    pub checkpoints: Option<CheckpointConfig>,
 }
 
 /// Works on the real files under one host directory. Not isolated.
@@ -81,6 +88,9 @@ pub struct HostSandbox {
     /// The open terminal, if any.
     #[cfg(unix)]
     terminal: crate::host_terminal::Slot,
+    checkpoints: Option<Checkpoints>,
+    /// Numbers temporary files.
+    temp: std::sync::atomic::AtomicU64,
 }
 
 /// Shell pids of the running jobs, by job.
@@ -112,6 +122,7 @@ impl HostSandbox {
             return Err(SandboxError::Unavailable(format!("{} is not a directory", root.display())));
         }
         let jobs = Table::new(config.jobs.max_running as usize, config.jobs.output_cap as usize, "");
+        let checkpoints = config.checkpoints.as_ref().map(|c| Checkpoints::new(&root, c)).transpose()?;
         Ok(Self {
             root,
             hidden_env: config.hidden_env,
@@ -122,6 +133,8 @@ impl HostSandbox {
             shell: config.shell,
             #[cfg(unix)]
             terminal: crate::host_terminal::Slot::default(),
+            checkpoints,
+            temp: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -168,12 +181,70 @@ impl HostSandbox {
             Err(err) => return failed(io_words(&err)),
         }
         match tokio::fs::read(path).await {
-            Ok(bytes) => match String::from_utf8(bytes) {
-                Ok(content) => Outcome::Text { content },
-                Err(_) => failed("the file is not UTF-8 text"),
-            },
+            Ok(bytes) => {
+                let hash = crate::patch::hash(&bytes);
+                match String::from_utf8(bytes) {
+                    Ok(content) => Outcome::File { content, hash },
+                    Err(_) => failed("the file is not UTF-8 text"),
+                }
+            }
             Err(err) => failed(io_words(&err)),
         }
+    }
+
+    /// Applies a patch: never through a symbolic link, all edits or none, and the file replaced
+    /// at once with its mode kept.
+    async fn patch(&self, path: &Path, shown: &str, edits: &[Edit], expected: &str) -> Outcome {
+        let before = match tokio::fs::symlink_metadata(path).await {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return failed("that is a symbolic link, which a patch doesn't follow: patch the file it points to");
+            }
+            Ok(meta) if !meta.is_file() => return failed("that is not a regular file"),
+            Ok(meta) if meta.len() > READ_CAP => {
+                return failed(format!("the file is too large to patch ({} bytes, limit {READ_CAP})", meta.len()));
+            }
+            Ok(meta) => meta,
+            Err(err) => return failed(io_words(&err)),
+        };
+        let old = match tokio::fs::read(path).await {
+            Ok(old) => old,
+            Err(err) => return failed(io_words(&err)),
+        };
+        let new = match crate::patch::apply(&old, edits, expected) {
+            Ok(new) => new,
+            Err(why) => return failed(why),
+        };
+        let Some(parent) = path.parent() else { return failed("that is the workspace root") };
+        let n = self.temp.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let temp = parent.join(format!(".nixxa-patch-{}-{n}", std::process::id()));
+        let replaced = async {
+            // `create_new` never opens an existing file or follows a link.
+            let mut file = tokio::fs::OpenOptions::new().write(true).create_new(true).open(&temp).await?;
+            tokio::io::AsyncWriteExt::write_all(&mut file, &new).await?;
+            tokio::io::AsyncWriteExt::flush(&mut file).await?;
+            drop(file);
+            tokio::fs::set_permissions(&temp, before.permissions()).await?;
+            // The file must still be the one read: not changed or swapped meanwhile.
+            let now = tokio::fs::symlink_metadata(path).await?;
+            if now.file_type().is_symlink()
+                || now.len() != before.len()
+                || now.modified().ok() != before.modified().ok()
+            {
+                return Err(std::io::Error::other(
+                    "the file changed while it was being patched, so nothing was changed",
+                ));
+            }
+            tokio::fs::rename(&temp, path).await
+        };
+        if let Err(err) = replaced.await {
+            let _ = tokio::fs::remove_file(&temp).await;
+            return failed(io_words(&err));
+        }
+        Outcome::Patched { diff: crate::patch::unified(shown, &old, &new), hash: crate::patch::hash(&new) }
+    }
+
+    fn checkpoints(&self) -> Result<&Checkpoints, SandboxError> {
+        self.checkpoints.as_ref().ok_or_else(|| SandboxError::Unsupported("checkpoints are off".into()))
     }
 
     async fn write(&self, path: &Path, content: String) -> Outcome {
@@ -435,8 +506,21 @@ impl Sandbox for HostSandbox {
             network: NetworkAccess::Unrestricted,
             jobs: true,
             terminal: cfg!(unix),
+            checkpoints: self.checkpoints.is_some(),
             actions: SandboxActionKind::ALL.to_vec(),
         }
+    }
+
+    async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
+        self.checkpoints()?.checkpoint().await
+    }
+
+    async fn restore(&self, checkpoint: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {
+        self.checkpoints()?.restore(checkpoint).await
+    }
+
+    async fn diff(&self, from: &CheckpointId, to: Option<&CheckpointId>) -> Result<WorkspaceDiff, SandboxError> {
+        self.checkpoints()?.diff(from, to).await
     }
 
     #[cfg(unix)]
@@ -478,6 +562,10 @@ impl Sandbox for HostSandbox {
             SandboxAction::WriteFile { path, content } => {
                 let Some(path) = self.resolve(&path) else { return outside() };
                 self.write(&path, content).await
+            }
+            SandboxAction::Patch { path: shown, edits, expected_hash } => {
+                let Some(path) = self.resolve(&shown) else { return outside() };
+                self.patch(&path, &shown, &edits, &expected_hash).await
             }
             SandboxAction::ListDir { path } => {
                 let Some(path) = self.resolve(&path) else { return outside() };
@@ -529,11 +617,14 @@ mod tests {
     }
 
     fn host(root: &Path) -> HostSandbox {
+        let mut store = root.as_os_str().to_owned();
+        store.push("-checkpoints");
         HostSandbox::new(HostConfig {
             root: root.to_path_buf(),
             hidden_env: Vec::new(),
             jobs: JobLimits::default(),
             shell: Some("/bin/sh".into()),
+            checkpoints: Some(CheckpointConfig { dir: store.into(), cap: crate::checkpoint::DEFAULT_CAP }),
         })
         .expect("host sandbox")
     }
@@ -562,7 +653,13 @@ mod tests {
     #[test]
     fn a_missing_root_is_unavailable() {
         let missing = scratch().join("not-here");
-        let config = HostConfig { root: missing, hidden_env: Vec::new(), jobs: JobLimits::default(), shell: None };
+        let config = HostConfig {
+            root: missing,
+            hidden_env: Vec::new(),
+            jobs: JobLimits::default(),
+            shell: None,
+            checkpoints: None,
+        };
         let err = HostSandbox::new(config).unwrap_err();
         assert!(matches!(err, SandboxError::Unavailable(_)), "{err:?}");
     }
@@ -588,7 +685,7 @@ mod tests {
         let sandbox = host(&root);
         assert_eq!(
             run_action(&sandbox, SandboxAction::ReadFile { path: "./a.txt".into() }).await,
-            Outcome::Text { content: "alpha".into() }
+            Outcome::File { content: "alpha".into(), hash: crate::patch::hash(b"alpha") }
         );
         let Outcome::Listing { entries } = run_action(&sandbox, SandboxAction::ListDir { path: ".".into() }).await
         else {
@@ -668,6 +765,7 @@ mod tests {
             hidden_env: vec!["HOME".into()],
             jobs: JobLimits::default(),
             shell: None,
+            checkpoints: None,
         })
         .expect("host sandbox");
         let Outcome::Exec { stdout, .. } = run_action(&sandbox, exec("echo \"[${HOME-unset}]\"")).await else {
@@ -774,6 +872,7 @@ mod tests {
             hidden_env: vec!["HOME".into()],
             jobs: JobLimits::default(),
             shell: None,
+            checkpoints: None,
         })
         .expect("host sandbox");
         let mut events = sandbox.subscribe();
@@ -819,6 +918,7 @@ mod tests {
             hidden_env: vec!["HOME".into()],
             jobs: JobLimits::default(),
             shell: Some("/bin/sh".into()),
+            checkpoints: None,
         })
         .expect("host sandbox");
         let mut open = sandbox.open_terminal(SIZE).await.expect("open");
