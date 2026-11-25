@@ -391,6 +391,13 @@ mod unix_attacks {
         assert!(!s.at("big").exists());
     }
 
+    /// How deep the deepest test trees go. On macOS each directory made or removed costs more the
+    /// deeper it is (CI: 5,000 levels took 48 s, where Linux takes 0.1 s), so 100,000 would take
+    /// hours there; Linux (and its CI job) runs the review's 100,000, and macOS a depth still
+    /// well past [`MAX_DEPTH`] and [`REMOVE_DEPTH`].
+    const DEEPEST: usize = if cfg!(target_os = "macos") { 1_000 } else { 100_000 };
+    const DEEPER: usize = if cfg!(target_os = "macos") { 1_000 } else { 5_000 };
+
     /// `d/d/d/…` `levels` deep under `name`, made one level at a time (no path is ever long).
     fn deep(s: &Scratch, name: &str, levels: usize) {
         let mut dir = std::fs::File::open(s.ws()).unwrap();
@@ -418,7 +425,7 @@ mod unix_attacks {
         s.write("keep.txt", "keep\n");
         let store = s.store(DEFAULT_CAP);
         let before = store.checkpoint().await.unwrap();
-        deep(&s, "deep", 100_000);
+        deep(&s, "deep", DEEPEST);
         // A checkpoint is refused with the reason, at once.
         let refused = store.checkpoint().await;
         assert!(
@@ -448,7 +455,7 @@ mod unix_attacks {
         let store = s.store(DEFAULT_CAP);
         let before = store.checkpoint().await.unwrap();
         std::fs::rename(s.at("kept"), s.at("moved")).unwrap();
-        deep(&s, "fresh", 5_000);
+        deep(&s, "fresh", DEEPER);
         store.restore(&before).await.unwrap();
         assert!(!s.at("moved").exists() && !s.at("fresh").exists());
         let bottom = (0..199).fold(s.at("kept"), |path, _| path.join("d")).join("bottom");
