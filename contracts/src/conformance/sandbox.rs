@@ -9,13 +9,15 @@ use futures::stream::BoxStream;
 
 use super::id;
 use crate::{
-    DomainRule, JobId, NetworkAccess, NetworkPolicy, OpenTerminal, Outcome, Sandbox, SandboxAction, SandboxActionKind,
-    SandboxError, SandboxEvent, TerminalEvent, TerminalSize,
+    CheckpointId, DomainRule, Edit, EntryState, JobId, NetworkAccess, NetworkPolicy, OpenTerminal, Outcome, Sandbox,
+    SandboxAction, SandboxActionKind, SandboxError, SandboxEvent, TerminalEvent, TerminalSize, WorkspaceDiff,
 };
 
 /// The job kinds a backend with jobs must list.
 const JOB_KINDS: [SandboxActionKind; 3] =
     [SandboxActionKind::JobStatus, SandboxActionKind::JobOutput, SandboxActionKind::JobStop];
+/// The SHA-256 of `hello nixxa\n`, the sample file's contents.
+const HELLO_HASH: &str = "cb6112f1c4749bb872768a2125c60119597c2a657661a3618dc11c0a1f68e685";
 /// How long a job's `JobFinished` may take to arrive.
 const JOB_PATIENCE: Duration = Duration::from_secs(20);
 
@@ -28,6 +30,11 @@ fn sample(kind: SandboxActionKind) -> SandboxAction {
         SandboxActionKind::WriteFile => {
             SandboxAction::WriteFile { path: "conformance/hello.txt".into(), content: "hello nixxa\n".into() }
         }
+        SandboxActionKind::Patch => SandboxAction::Patch {
+            path: "conformance/hello.txt".into(),
+            edits: vec![Edit { search: "hello".into(), replace: "hi".into() }],
+            expected_hash: "0".repeat(64),
+        },
         SandboxActionKind::ListDir => SandboxAction::ListDir { path: "conformance".into() },
         SandboxActionKind::JobStatus => SandboxAction::JobStatus { job: JobId::new("conformance") },
         SandboxActionKind::JobOutput => SandboxAction::JobOutput { job: JobId::new("conformance"), tail_bytes: 64 },
@@ -56,6 +63,12 @@ pub async fn run<S: Sandbox, F: Fn() -> S>(fresh: F) {
     closing_a_terminal_ends_it(&fresh()).await;
     dropping_a_terminal_does_not_wedge(&fresh()).await;
     reset_ends_the_terminal(&fresh()).await;
+    patches_apply_exactly(&fresh()).await;
+    patches_refuse_symlinks(&fresh()).await;
+    checkpoints_are_declared_consistently(&fresh()).await;
+    checkpoints_restore_writes_and_patches(&fresh()).await;
+    checkpoints_restore_what_commands_did(&fresh()).await;
+    older_checkpoints_restore_after_newer(&fresh()).await;
 }
 
 async fn describes_itself(sandbox: &dyn Sandbox) {
@@ -98,7 +111,11 @@ async fn write_read_list(sandbox: &dyn Sandbox) {
     let w = sandbox.execute(id(1), sample(SandboxActionKind::WriteFile)).await.expect("write");
     assert!(matches!(w.outcome, Outcome::Written { .. }), "write: {w:?}");
     let r = sandbox.execute(id(2), sample(SandboxActionKind::ReadFile)).await.expect("read");
-    assert_eq!(r.outcome, Outcome::Text { content: "hello nixxa\n".into() }, "read must return what was written");
+    assert_eq!(
+        r.outcome,
+        Outcome::File { content: "hello nixxa\n".into(), hash: HELLO_HASH.into() },
+        "read must return what was written, with the SHA-256 of its bytes"
+    );
     if has(SandboxActionKind::ListDir) {
         let l = sandbox.execute(id(3), sample(SandboxActionKind::ListDir)).await.expect("list");
         match l.outcome {
@@ -116,6 +133,11 @@ async fn escapes_never_succeed(sandbox: &dyn Sandbox) {
         SandboxAction::ReadFile { path: "../outside.txt".into() },
         SandboxAction::ReadFile { path: "/etc/hostname".into() },
         SandboxAction::WriteFile { path: "../escape.txt".into(), content: "x".into() },
+        SandboxAction::Patch {
+            path: "../escape.txt".into(),
+            edits: vec![Edit { search: "x".into(), replace: "y".into() }],
+            expected_hash: "0".repeat(64),
+        },
         SandboxAction::ListDir { path: "..".into() },
     ];
     for (n, action) in attempts.into_iter().enumerate() {
@@ -143,7 +165,10 @@ async fn reset_keeps_the_workspace(sandbox: &dyn Sandbox) {
     assert!(matches!(w.outcome, Outcome::Written { .. }), "write: {w:?}");
     sandbox.reset().await.expect("reset");
     let r = sandbox.execute(id(301), sample(SandboxActionKind::ReadFile)).await.expect("read after reset");
-    assert_eq!(r.outcome, Outcome::Text { content: "hello nixxa\n".into() }, "reset must keep the workspace");
+    assert!(
+        matches!(&r.outcome, Outcome::File { content, .. } if content == "hello nixxa\n"),
+        "reset must keep the workspace: {r:?}"
+    );
 }
 
 async fn isolated_exec_really_runs(sandbox: &dyn Sandbox) {
@@ -490,4 +515,258 @@ async fn reset_ends_the_terminal(sandbox: &dyn Sandbox) {
     sandbox.reset().await.expect("reset");
     wait_closed(&mut events, "reset must end the terminal").await;
     assert!(terminal.write(b"echo late\r").await.is_err(), "a terminal ended by reset must refuse input");
+}
+
+// ---- Patches and checkpoints ----
+
+/// Whether the backend has everything a scenario needs.
+fn lists(sandbox: &dyn Sandbox, kinds: &[SandboxActionKind]) -> bool {
+    let caps = sandbox.capabilities();
+    kinds.iter().all(|kind| caps.actions.contains(kind))
+}
+
+async fn write(sandbox: &dyn Sandbox, n: u32, path: &str, content: &str) {
+    let action = SandboxAction::WriteFile { path: path.into(), content: content.into() };
+    let o = sandbox.execute(id(n), action).await.expect("write");
+    assert!(matches!(o.outcome, Outcome::Written { .. }), "write {path}: {o:?}");
+}
+
+/// The file's contents and hash, or `None` when the read fails.
+async fn read(sandbox: &dyn Sandbox, n: u32, path: &str) -> Option<(String, String)> {
+    let o = sandbox.execute(id(n), SandboxAction::ReadFile { path: path.into() }).await.expect("read");
+    match o.outcome {
+        Outcome::File { content, hash } => Some((content, hash)),
+        Outcome::Failed { .. } => None,
+        other => panic!("ReadFile must answer File or Failed, got {other:?}"),
+    }
+}
+
+async fn patch(sandbox: &dyn Sandbox, n: u32, path: &str, edits: &[(&str, &str)], hash: &str) -> Outcome {
+    let edits = edits.iter().map(|(search, replace)| Edit { search: (*search).into(), replace: (*replace).into() });
+    let action = SandboxAction::Patch { path: path.into(), edits: edits.collect(), expected_hash: hash.into() };
+    sandbox.execute(id(n), action).await.expect("patch").outcome
+}
+
+fn failure<'o>(outcome: &'o Outcome, rule: &str) -> &'o str {
+    match outcome {
+        Outcome::Failed { message } => message,
+        other => panic!("{rule}: expected the patch to fail, got {other:?}"),
+    }
+}
+
+/// Whether the backend runs a POSIX shell for `Exec` (the command scenarios need `rm`, `mv`,
+/// `chmod`, `ln`).
+async fn posix(sandbox: &dyn Sandbox) -> bool {
+    if !lists(sandbox, &[SandboxActionKind::Exec]) {
+        return false;
+    }
+    let probe =
+        SandboxAction::Exec { command: "printf posix".into(), cwd: None, timeout_ms: Some(10_000), background: false };
+    matches!(sandbox.execute(id(900), probe).await, Ok(o) if matches!(&o.outcome, Outcome::Exec { exit_code: Some(0), stdout, .. } if stdout == "posix"))
+}
+
+async fn sh(sandbox: &dyn Sandbox, n: u32, command: &str) -> String {
+    let action =
+        SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(20_000), background: false };
+    match sandbox.execute(id(n), action).await.expect("exec").outcome {
+        Outcome::Exec { exit_code: Some(0), stdout, .. } => stdout,
+        other => panic!("`{command}` failed: {other:?}"),
+    }
+}
+
+async fn patches_apply_exactly(sandbox: &dyn Sandbox) {
+    use SandboxActionKind::{Patch, ReadFile, WriteFile};
+    if !lists(sandbox, &[Patch, ReadFile, WriteFile]) {
+        return;
+    }
+    let path = "conformance/patch.txt";
+    let original = "one\ntwo\nthree\ntwo again\n";
+    write(sandbox, 910, path, original).await;
+    let (_, h0) = read(sandbox, 911, path).await.expect("read");
+    assert!(
+        h0.len() == 64 && h0.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')),
+        "a hash is lowercase hex SHA-256: {h0}"
+    );
+
+    // Success: the diff shows the change, and the new hash is the file's.
+    let done = patch(sandbox, 912, path, &[("three", "THREE")], &h0).await;
+    let Outcome::Patched { diff, hash: h1 } = done else { panic!("a matching patch must apply: {done:?}") };
+    assert!(diff.contains("-three") && diff.contains("+THREE"), "the patch's diff must show the change:\n{diff}");
+    let (now, h_now) = read(sandbox, 913, path).await.expect("read");
+    assert_eq!(now, "one\ntwo\nTHREE\ntwo again\n", "the patch must be applied");
+    assert_eq!(h1, h_now, "the patch's hash must be the file's new hash");
+
+    // No match, and two matches: each says which edit, and nothing changes.
+    let none = patch(sandbox, 914, path, &[("one", "1"), ("absent", "x")], &h1).await;
+    let rule = "a search that matches nothing must fail, saying which edit";
+    assert!(failure(&none, rule).contains("edit 2"), "{rule}: {none:?}");
+    let (after, _) = read(sandbox, 915, path).await.expect("read");
+    assert_eq!(after, now, "all the edits apply, or none do");
+    let two = patch(sandbox, 916, path, &[("two", "2")], &h1).await;
+    let rule = "a search that matches twice must fail, saying which edit";
+    assert!(failure(&two, rule).contains("edit 1"), "{rule}: {two:?}");
+    assert_eq!(read(sandbox, 917, path).await.expect("read").0, now, "a search that matches twice must change nothing");
+
+    // A stale hash: nothing changes, and the failure gives the current hash.
+    let stale = patch(sandbox, 918, path, &[("one", "1")], &h0).await;
+    let rule = "a stale patch must fail with the file's current hash";
+    assert!(failure(&stale, rule).contains(&h1), "{rule}: {stale:?}");
+    assert_eq!(read(sandbox, 919, path).await.expect("read").0, now, "a stale patch must change nothing");
+
+    // A missing file.
+    let missing = patch(sandbox, 925, "conformance/missing.txt", &[("a", "b")], &h1).await;
+    failure(&missing, "a patch of a missing file must fail");
+}
+
+async fn patches_refuse_symlinks(sandbox: &dyn Sandbox) {
+    use SandboxActionKind::{Patch, ReadFile, WriteFile};
+    if !(lists(sandbox, &[Patch, ReadFile, WriteFile]) && posix(sandbox).await) {
+        return;
+    }
+    write(sandbox, 920, "target.txt", "keep\n").await;
+    sh(sandbox, 921, "ln -s target.txt link.txt").await;
+    let (_, hash) = read(sandbox, 922, "target.txt").await.expect("read");
+    let o = patch(sandbox, 923, "link.txt", &[("keep", "changed")], &hash).await;
+    failure(&o, "a patch of a symlink must fail");
+    assert_eq!(read(sandbox, 924, "target.txt").await.expect("read").0, "keep\n", "a patch never follows a symlink");
+}
+
+async fn checkpoints_are_declared_consistently(sandbox: &dyn Sandbox) {
+    let never = CheckpointId::new("conformance-never-taken");
+    if !sandbox.capabilities().checkpoints {
+        assert!(
+            matches!(sandbox.checkpoint().await, Err(SandboxError::Unsupported(_))),
+            "without checkpoints, checkpoint must be Unsupported"
+        );
+        assert!(
+            matches!(sandbox.restore(&never).await, Err(SandboxError::Unsupported(_))),
+            "without checkpoints, restore must be Unsupported"
+        );
+        assert!(
+            matches!(sandbox.diff(&never, None).await, Err(SandboxError::Unsupported(_))),
+            "without checkpoints, diff must be Unsupported"
+        );
+        return;
+    }
+    let taken = sandbox.checkpoint().await.expect("checkpoint");
+    assert!(sandbox.diff(&taken, None).await.expect("diff").is_empty(), "nothing changed since the checkpoint");
+    assert!(
+        matches!(sandbox.restore(&never).await, Err(SandboxError::NoCheckpoint(_))),
+        "an unknown checkpoint must be NoCheckpoint"
+    );
+    assert!(
+        matches!(sandbox.diff(&never, None).await, Err(SandboxError::NoCheckpoint(_))),
+        "an unknown checkpoint must be NoCheckpoint"
+    );
+    assert!(
+        matches!(sandbox.diff(&taken, Some(&never)).await, Err(SandboxError::NoCheckpoint(_))),
+        "an unknown checkpoint must be NoCheckpoint"
+    );
+    sandbox.reset().await.expect("reset");
+    sandbox.restore(&taken).await.expect("checkpoints survive a reset");
+}
+
+fn change<'d>(diff: &'d WorkspaceDiff, path: &str) -> &'d crate::FileChange {
+    diff.changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("the diff must list {path}: {diff:?}"))
+}
+
+fn lacks(diff: &WorkspaceDiff, path: &str) {
+    assert!(diff.changes.iter().all(|c| c.path != path), "the diff must not list {path}: {diff:?}");
+}
+
+async fn checkpoints_restore_writes_and_patches(sandbox: &dyn Sandbox) {
+    use SandboxActionKind::{Patch, ReadFile, WriteFile};
+    if !(sandbox.capabilities().checkpoints && lists(sandbox, &[Patch, ReadFile, WriteFile])) {
+        return;
+    }
+    write(sandbox, 930, "a.txt", "alpha\n").await;
+    write(sandbox, 931, "b.txt", "beta\n").await;
+    write(sandbox, 932, "same.txt", "same\n").await;
+    let before = sandbox.checkpoint().await.expect("checkpoint");
+    write(sandbox, 933, "a.txt", "ALPHA\n").await;
+    let (_, hash) = read(sandbox, 934, "b.txt").await.expect("read");
+    let o = patch(sandbox, 935, "b.txt", &[("beta", "BETA")], &hash).await;
+    assert!(matches!(o, Outcome::Patched { .. }), "{o:?}");
+    write(sandbox, 936, "new/created.txt", "new\n").await;
+
+    let diff = sandbox.diff(&before, None).await.expect("diff");
+    let a = change(&diff, "a.txt");
+    assert!(matches!((&a.before, &a.after), (Some(EntryState::File { .. }), Some(EntryState::File { .. }))), "{a:?}");
+    assert!(
+        a.diff.as_deref().is_some_and(|d| d.contains("-alpha") && d.contains("+ALPHA")),
+        "a text change carries its diff: {a:?}"
+    );
+    change(&diff, "b.txt");
+    let created = change(&diff, "new/created.txt");
+    assert!(created.before.is_none() && created.after.is_some(), "{created:?}");
+    lacks(&diff, "same.txt");
+
+    let undone = sandbox.restore(&before).await.expect("restore");
+    change(&undone, "a.txt");
+    change(&undone, "new/created.txt");
+    assert_eq!(read(sandbox, 937, "a.txt").await.expect("a.txt").0, "alpha\n", "restore must bring back the content");
+    assert_eq!(read(sandbox, 938, "b.txt").await.expect("b.txt").0, "beta\n", "restore must undo the patch");
+    assert!(read(sandbox, 939, "new/created.txt").await.is_none(), "restore must remove files created since");
+    assert!(sandbox.diff(&before, None).await.expect("diff").is_empty(), "after a restore nothing differs from it");
+}
+
+async fn checkpoints_restore_what_commands_did(sandbox: &dyn Sandbox) {
+    use SandboxActionKind::{ReadFile, WriteFile};
+    if !(sandbox.capabilities().checkpoints && lists(sandbox, &[ReadFile, WriteFile]) && posix(sandbox).await) {
+        return;
+    }
+    write(sandbox, 940, "keep/doomed.txt", "doomed\n").await;
+    write(sandbox, 941, "moved.txt", "moved\n").await;
+    write(sandbox, 942, "plain.sh", "echo hi\n").await;
+    sh(sandbox, 943, "chmod 644 plain.sh && ln -s moved.txt link").await;
+    let before = sandbox.checkpoint().await.expect("checkpoint");
+    sh(sandbox, 944, "rm keep/doomed.txt && rmdir keep && mv moved.txt elsewhere.txt && mkdir -p made/deep && echo x > made/deep/f && chmod 755 plain.sh && rm link").await;
+
+    let diff = sandbox.diff(&before, None).await.expect("diff");
+    for gone in ["keep", "keep/doomed.txt", "moved.txt", "link"] {
+        let c = change(&diff, gone);
+        assert!(c.before.is_some() && c.after.is_none(), "{gone} was deleted: {c:?}");
+    }
+    for made in ["elsewhere.txt", "made", "made/deep", "made/deep/f"] {
+        let c = change(&diff, made);
+        assert!(c.before.is_none() && c.after.is_some(), "{made} was created: {c:?}");
+    }
+    let mode = change(&diff, "plain.sh");
+    assert!(
+        matches!((&mode.before, &mode.after), (Some(EntryState::File { mode: m0, .. }), Some(EntryState::File { mode: m1, .. })) if m0 & 0o777 == 0o644 && m1 & 0o777 == 0o755),
+        "a mode change must show: {mode:?}"
+    );
+    let link = change(&diff, "link");
+    assert_eq!(link.before, Some(EntryState::Symlink { target: "moved.txt".into() }), "a symlink is kept as a link");
+
+    sandbox.restore(&before).await.expect("restore");
+    let check = "test -f keep/doomed.txt && test -f moved.txt && test ! -e elsewhere.txt && test ! -e made \
+                 && test ! -x plain.sh && test -L link && test \"$(readlink link)\" = moved.txt && echo restored";
+    assert_eq!(sh(sandbox, 945, check).await.trim(), "restored", "restore must undo rm, mv, mkdir, chmod and ln");
+    assert_eq!(read(sandbox, 946, "keep/doomed.txt").await.expect("read").0, "doomed\n");
+    assert!(sandbox.diff(&before, None).await.expect("diff").is_empty(), "after a restore nothing differs from it");
+}
+
+async fn older_checkpoints_restore_after_newer(sandbox: &dyn Sandbox) {
+    use SandboxActionKind::{ReadFile, WriteFile};
+    if !(sandbox.capabilities().checkpoints && lists(sandbox, &[ReadFile, WriteFile])) {
+        return;
+    }
+    write(sandbox, 950, "v.txt", "1\n").await;
+    let one = sandbox.checkpoint().await.expect("checkpoint");
+    write(sandbox, 951, "v.txt", "2\n").await;
+    write(sandbox, 952, "two.txt", "2\n").await;
+    let two = sandbox.checkpoint().await.expect("checkpoint");
+    write(sandbox, 953, "v.txt", "3\n").await;
+    let between = sandbox.diff(&one, Some(&two)).await.expect("diff");
+    change(&between, "v.txt");
+    change(&between, "two.txt");
+    sandbox.restore(&two).await.expect("restore the newer");
+    assert_eq!(read(sandbox, 954, "v.txt").await.expect("read").0, "2\n");
+    sandbox.restore(&one).await.expect("restore the older after the newer");
+    assert_eq!(read(sandbox, 955, "v.txt").await.expect("read").0, "1\n");
+    assert!(read(sandbox, 956, "two.txt").await.is_none(), "two.txt came after the older checkpoint");
+    sandbox.restore(&two).await.expect("and the newer again");
+    assert_eq!(read(sandbox, 957, "v.txt").await.expect("read").0, "2\n");
+    assert_eq!(read(sandbox, 958, "two.txt").await.expect("read").0, "2\n");
 }

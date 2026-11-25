@@ -59,6 +59,10 @@ id_type!(
     JobId
 );
 id_type!(
+    /// Identifies a workspace checkpoint taken by the [`Sandbox`](crate::Sandbox), for undo.
+    CheckpointId
+);
+id_type!(
     /// Identifies a knowledge source, e.g. `claude-mem`, `obsidian`, `codegraph`, `context7`.
     SourceId
 );

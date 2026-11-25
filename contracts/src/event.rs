@@ -3,8 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountRef, ActionId, ActionRequest, ApprovalMode, BrainInfo, JobId, Message, Observation, SandboxCapabilities,
-    SessionId, SourceInfo, TurnId, Usage,
+    AccountRef, ActionId, ActionRequest, ApprovalMode, BrainInfo, CheckpointId, JobId, Message, Observation,
+    SandboxCapabilities, SessionId, SourceInfo, TurnId, Usage, WorkspaceDiff,
 };
 
 /// An event from the controller to the harness (via [`EventSink`](crate::EventSink)).
@@ -124,6 +124,33 @@ pub enum Event {
         turn: TurnId,
         /// The jobs whose ends woke the agent.
         jobs: Vec<JobId>,
+    },
+    /// A checkpoint of the workspace was taken: before an action that can change files, or at
+    /// the start of a turn. Restoring it undoes that action, or that turn, and what came after.
+    Checkpoint {
+        /// The turn.
+        turn: TurnId,
+        /// The checkpoint.
+        checkpoint: CheckpointId,
+        /// The action it comes before; `None` for the start of the turn.
+        before: Option<ActionId>,
+    },
+    /// No checkpoint could be taken (the store's size cap, or a failure): the action or turn
+    /// still runs, but can't be undone.
+    NotUndoable {
+        /// The turn.
+        turn: TurnId,
+        /// The action; `None` for the start of the turn.
+        before: Option<ActionId>,
+        /// Why.
+        reason: String,
+    },
+    /// The workspace was put back as it was at a checkpoint (the user's undo).
+    Restored {
+        /// The checkpoint.
+        checkpoint: CheckpointId,
+        /// What that undid.
+        undone: WorkspaceDiff,
     },
     /// A turn finished.
     TurnDone {

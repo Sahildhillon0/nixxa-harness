@@ -131,6 +131,45 @@ struct MemSandbox {
     terminal: bool,
     terminal_bug: Option<TermBug>,
     term: std::sync::Arc<Mutex<MemTerm>>,
+    patch_bug: Option<PatchBug>,
+    /// Keeps checkpoints (copies of the files). Not a bug.
+    checkpoints: bool,
+    checkpoint_bug: Option<CheckpointBug>,
+    taken: Mutex<Vec<HashMap<String, String>>>,
+}
+
+/// One way to get patches wrong.
+#[derive(Clone, Copy, PartialEq)]
+enum PatchBug {
+    /// Applies the edits whatever the file's hash.
+    IgnoresHash,
+    /// Replaces the first match even when there are several.
+    FirstMatch,
+    /// Writes each edit as it goes, so a later failing edit leaves the earlier ones applied.
+    Partial,
+}
+
+/// One way to get checkpoints wrong.
+#[derive(Clone, Copy, PartialEq)]
+enum CheckpointBug {
+    /// Restores the files the checkpoint had, but leaves files created since.
+    KeepsCreated,
+    /// Treats an unknown checkpoint as an empty one.
+    UnknownIsEmpty,
+    /// Restoring a checkpoint forgets the newer ones.
+    ForgetsNewer,
+}
+
+fn sha256(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// `-`/`+` lines for what differs: enough of a diff for the suite.
+fn mem_diff(old: &str, new: &str) -> String {
+    let gone = old.lines().filter(|line| !new.lines().any(|l| l == *line)).map(|line| format!("-{line}\n"));
+    let came = new.lines().filter(|line| !old.lines().any(|l| l == *line)).map(|line| format!("+{line}\n"));
+    gone.chain(came).collect()
 }
 
 /// One way to get the terminal wrong.
@@ -359,6 +398,7 @@ impl Sandbox for MemSandbox {
             },
             jobs: self.jobs,
             terminal: self.terminal,
+            checkpoints: self.checkpoints,
             actions: if self.jobs {
                 SandboxActionKind::ALL.to_vec()
             } else if self.echo_exec || self.wedge_on_drop || self.job_bug.is_some() {
@@ -366,10 +406,16 @@ impl Sandbox for MemSandbox {
                     SandboxActionKind::Exec,
                     SandboxActionKind::ReadFile,
                     SandboxActionKind::WriteFile,
+                    SandboxActionKind::Patch,
                     SandboxActionKind::ListDir,
                 ]
             } else {
-                vec![SandboxActionKind::ReadFile, SandboxActionKind::WriteFile, SandboxActionKind::ListDir]
+                vec![
+                    SandboxActionKind::ReadFile,
+                    SandboxActionKind::WriteFile,
+                    SandboxActionKind::Patch,
+                    SandboxActionKind::ListDir,
+                ]
             },
         }
     }
@@ -430,6 +476,7 @@ impl Sandbox for MemSandbox {
             }
             SandboxAction::ReadFile { path }
             | SandboxAction::WriteFile { path, .. }
+            | SandboxAction::Patch { path, .. }
             | SandboxAction::ListDir { path } => path,
         };
         let Some(path) = self.confine(path) else {
@@ -441,9 +488,42 @@ impl Sandbox for MemSandbox {
                 return Err(SandboxError::Unsupported("job".into()));
             }
             SandboxAction::ReadFile { .. } => match files.get(&path) {
-                Some(c) => Outcome::Text { content: c.clone() },
-                None if self.no_confinement => Outcome::Text { content: "host file".into() },
+                Some(c) => Outcome::File { content: c.clone(), hash: sha256(c.as_bytes()) },
+                None if self.no_confinement => {
+                    Outcome::File { content: "host file".into(), hash: sha256(b"host file") }
+                }
                 None => Outcome::Failed { message: "no such file".into() },
+            },
+            SandboxAction::Patch { edits, expected_hash, .. } => match files.get(&path).cloned() {
+                None => Outcome::Failed { message: "no such file".into() },
+                Some(old) => {
+                    let hash = sha256(old.as_bytes());
+                    if hash != expected_hash && self.patch_bug != Some(PatchBug::IgnoresHash) {
+                        Outcome::Failed { message: format!("the file changed: its hash is now {hash}") }
+                    } else {
+                        let mut new = old.clone();
+                        let mut failed = None;
+                        for (n, edit) in edits.iter().enumerate() {
+                            let count = new.matches(edit.search.as_str()).count();
+                            if count == 1 || (count > 1 && self.patch_bug == Some(PatchBug::FirstMatch)) {
+                                new = new.replacen(edit.search.as_str(), &edit.replace, 1);
+                                if self.patch_bug == Some(PatchBug::Partial) {
+                                    files.insert(path.clone(), new.clone());
+                                }
+                            } else {
+                                failed = Some(format!("edit {}: the search matches {count} places", n + 1));
+                                break;
+                            }
+                        }
+                        match failed {
+                            Some(message) => Outcome::Failed { message },
+                            None => {
+                                files.insert(path.clone(), new.clone());
+                                Outcome::Patched { diff: mem_diff(&old, &new), hash: sha256(new.as_bytes()) }
+                            }
+                        }
+                    }
+                }
             },
             SandboxAction::WriteFile { content, .. } => {
                 let bytes = content.len() as u64;
@@ -473,6 +553,43 @@ impl Sandbox for MemSandbox {
     async fn health(&self) -> Result<(), SandboxError> {
         Ok(())
     }
+    async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
+        if !self.checkpoints {
+            return Err(SandboxError::Unsupported("no checkpoints".into()));
+        }
+        let mut taken = self.taken.lock().unwrap();
+        taken.push(self.files.lock().unwrap().clone());
+        Ok(CheckpointId::new(format!("c{}", taken.len() - 1)))
+    }
+    async fn restore(&self, checkpoint: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {
+        if !self.checkpoints {
+            return Err(SandboxError::Unsupported("no checkpoints".into()));
+        }
+        let state = self.state(checkpoint)?;
+        let undone = mem_workspace_diff(&state, &self.files.lock().unwrap());
+        let mut files = self.files.lock().unwrap();
+        if self.checkpoint_bug == Some(CheckpointBug::KeepsCreated) {
+            files.extend(state);
+        } else {
+            *files = state;
+        }
+        if self.checkpoint_bug == Some(CheckpointBug::ForgetsNewer) {
+            let n: usize = checkpoint.as_str()[1..].parse().unwrap_or(0);
+            self.taken.lock().unwrap().truncate(n + 1);
+        }
+        Ok(undone)
+    }
+    async fn diff(&self, from: &CheckpointId, to: Option<&CheckpointId>) -> Result<WorkspaceDiff, SandboxError> {
+        if !self.checkpoints {
+            return Err(SandboxError::Unsupported("no checkpoints".into()));
+        }
+        let before = self.state(from)?;
+        let after = match to {
+            Some(to) => self.state(to)?,
+            None => self.files.lock().unwrap().clone(),
+        };
+        Ok(mem_workspace_diff(&before, &after))
+    }
     async fn reset(&self) -> Result<(), SandboxError> {
         if self.wipe_on_reset {
             self.files.lock().unwrap().clear();
@@ -495,6 +612,17 @@ impl Sandbox for MemSandbox {
 }
 
 impl MemSandbox {
+    /// The files a checkpoint recorded.
+    fn state(&self, checkpoint: &CheckpointId) -> Result<HashMap<String, String>, SandboxError> {
+        let taken = self.taken.lock().unwrap();
+        let n = checkpoint.as_str().strip_prefix('c').and_then(|n| n.parse::<usize>().ok());
+        match n.and_then(|n| taken.get(n)) {
+            Some(state) => Ok(state.clone()),
+            None if self.checkpoint_bug == Some(CheckpointBug::UnknownIsEmpty) => Ok(HashMap::new()),
+            None => Err(SandboxError::NoCheckpoint(checkpoint.clone())),
+        }
+    }
+
     /// Handles `Exec` and the job actions with the tiny shell; `None` for the file actions.
     fn run_job_action(&self, id: &ActionId, action: &SandboxAction) -> Option<Observation> {
         let bug = self.job_bug;
@@ -537,6 +665,27 @@ impl MemSandbox {
         };
         Some(Observation::new(id.clone(), outcome))
     }
+}
+
+fn mem_workspace_diff(before: &HashMap<String, String>, after: &HashMap<String, String>) -> WorkspaceDiff {
+    let state = |c: &String| EntryState::File { size: c.len() as u64, mode: 0o644, hash: sha256(c.as_bytes()) };
+    let mut paths: Vec<&String> = before.keys().chain(after.keys()).collect();
+    paths.sort();
+    paths.dedup();
+    let changes = paths
+        .into_iter()
+        .filter(|path| before.get(*path) != after.get(*path))
+        .map(|path| FileChange {
+            path: path.clone(),
+            before: before.get(path).map(state),
+            after: after.get(path).map(state),
+            diff: match (before.get(path), after.get(path)) {
+                (Some(old), Some(new)) => Some(mem_diff(old, new)),
+                _ => None,
+            },
+        })
+        .collect();
+    WorkspaceDiff { changes, not_covered: Vec::new() }
 }
 
 #[test]
@@ -894,4 +1043,126 @@ fn action_wire_format_is_stable() {
     let json = serde_json::to_value(&a).unwrap();
     assert_eq!(json, serde_json::json!({"target": "sandbox", "action": {"kind": "read_file", "path": "src/main.rs"}}));
     assert_eq!(serde_json::from_value::<Action>(json).unwrap(), a);
+}
+
+// ---------- Patches and checkpoints ----------
+
+#[test]
+fn sandbox_reference_with_checkpoints_passes() {
+    block_on(conformance::sandbox::run(|| MemSandbox { checkpoints: true, ..Default::default() }));
+}
+
+fn with_patch_bug(bug: PatchBug) -> MemSandbox {
+    MemSandbox { patch_bug: Some(bug), ..Default::default() }
+}
+
+#[test]
+#[should_panic(expected = "a stale patch must fail")]
+fn sandbox_suite_catches_a_patch_that_ignores_the_hash() {
+    block_on(conformance::sandbox::run(|| with_patch_bug(PatchBug::IgnoresHash)));
+}
+
+#[test]
+#[should_panic(expected = "a search that matches twice")]
+fn sandbox_suite_catches_a_patch_that_takes_the_first_of_several_matches() {
+    block_on(conformance::sandbox::run(|| with_patch_bug(PatchBug::FirstMatch)));
+}
+
+#[test]
+#[should_panic(expected = "all the edits apply, or none do")]
+fn sandbox_suite_catches_a_partly_applied_patch() {
+    block_on(conformance::sandbox::run(|| with_patch_bug(PatchBug::Partial)));
+}
+
+fn with_checkpoint_bug(bug: CheckpointBug) -> MemSandbox {
+    MemSandbox { checkpoints: true, checkpoint_bug: Some(bug), ..Default::default() }
+}
+
+#[test]
+#[should_panic(expected = "restore must remove files created since")]
+fn sandbox_suite_catches_a_restore_that_keeps_new_files() {
+    block_on(conformance::sandbox::run(|| with_checkpoint_bug(CheckpointBug::KeepsCreated)));
+}
+
+#[test]
+#[should_panic(expected = "an unknown checkpoint must be NoCheckpoint")]
+fn sandbox_suite_catches_an_unknown_checkpoint_restoring() {
+    block_on(conformance::sandbox::run(|| with_checkpoint_bug(CheckpointBug::UnknownIsEmpty)));
+}
+
+#[test]
+#[should_panic(expected = "and the newer again")]
+fn sandbox_suite_catches_a_restore_that_forgets_newer_checkpoints() {
+    block_on(conformance::sandbox::run(|| with_checkpoint_bug(CheckpointBug::ForgetsNewer)));
+}
+
+#[test]
+#[should_panic(expected = "without checkpoints, checkpoint must be Unsupported")]
+fn sandbox_suite_catches_undeclared_checkpoints() {
+    // Keeps checkpoints but says it doesn't.
+    struct Undeclared(MemSandbox);
+    #[async_trait]
+    impl Sandbox for Undeclared {
+        fn capabilities(&self) -> SandboxCapabilities {
+            SandboxCapabilities { checkpoints: false, ..self.0.capabilities() }
+        }
+        async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
+            self.0.execute(id, action).await
+        }
+        async fn health(&self) -> Result<(), SandboxError> {
+            self.0.health().await
+        }
+        async fn reset(&self) -> Result<(), SandboxError> {
+            self.0.reset().await
+        }
+        async fn set_network(&self, policy: NetworkPolicy) -> Result<(), SandboxError> {
+            self.0.set_network(policy).await
+        }
+        async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
+            self.0.checkpoint().await
+        }
+    }
+    block_on(conformance::sandbox::run(|| Undeclared(MemSandbox { checkpoints: true, ..Default::default() })));
+}
+
+#[test]
+fn records_and_reads_from_before_stage_7_still_load() {
+    let old = serde_json::json!({
+        "request": {"id": "a", "action": {"target": "sandbox", "action": {"kind": "read_file", "path": "x"}}, "reason": null},
+        "verdict": {"verdict": "allow"},
+        "observation": null,
+        "at": 1
+    });
+    let record: ActionRecord = serde_json::from_value(old).unwrap();
+    assert_eq!(record.checkpoint, None);
+    let caps =
+        serde_json::json!({"backend": "b", "isolated": true, "network": {"access": "unrestricted"}, "actions": []});
+    let caps: SandboxCapabilities = serde_json::from_value(caps).unwrap();
+    assert!(!caps.checkpoints);
+}
+
+#[test]
+fn patches_and_diffs_round_trip() {
+    let action = SandboxAction::Patch {
+        path: "src/a.rs".into(),
+        edits: vec![Edit { search: "a".into(), replace: "b".into() }],
+        expected_hash: "00".into(),
+    };
+    let json = serde_json::to_value(&action).unwrap();
+    assert_eq!(json["kind"], "patch");
+    assert_eq!(serde_json::from_value::<SandboxAction>(json).unwrap(), action);
+    assert!(action.changes_files() && action.is_mutating());
+    assert!(!SandboxAction::ReadFile { path: "a".into() }.changes_files());
+    let diff = WorkspaceDiff {
+        changes: vec![FileChange {
+            path: "l".into(),
+            before: Some(EntryState::Symlink { target: "t".into() }),
+            after: None,
+            diff: None,
+        }],
+        not_covered: vec!["target/".into()],
+    };
+    let event = Event::Restored { checkpoint: CheckpointId::new("c1"), undone: diff };
+    let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
+    assert_eq!(back, event);
 }
