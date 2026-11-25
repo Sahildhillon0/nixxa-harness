@@ -115,7 +115,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | Stage | Name | Delivers | Status |
 |---|---|---|---|
 | 0 | Foundations | Repo, docs, folder skeleton | done |
-| 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | done (macOS/Windows CI pending) |
+| 1 | Contracts | Cargo workspace, shared types/traits/events, CI on Linux/macOS/Windows, boundary checks | done  |
 | 2 | Walking skeleton | TUI + minimal controller loop with fake brain, sandbox, store and knowledge | done |
 | 3 | Real brain | First LLM provider, streaming, context-window management; first API key stored in the OS keychain | **in progress** (Anthropic live checks pending) |
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
