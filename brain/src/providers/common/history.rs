@@ -46,6 +46,8 @@ pub(crate) fn observation_text(observation: &Observation) -> (String, bool) {
             (format!("exit code: {code}\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"), false)
         }
         Outcome::Text { content } => (content.clone(), false),
+        Outcome::File { content, hash } => (format!("{content}\n--- end of file; hash: {hash} ---"), false),
+        Outcome::Patched { diff, hash } => (format!("Patched. The file's new hash: {hash}\n{diff}"), false),
         Outcome::Listing { entries } => {
             let lines: Vec<String> = entries
                 .iter()
@@ -165,6 +167,10 @@ mod tests {
     fn observations_render_every_outcome() {
         let o = |outcome| observation_text(&Observation::new(ActionId::new("x"), outcome));
         assert_eq!(o(Outcome::Written { bytes: 3 }), ("Wrote 3 bytes.".into(), false));
+        let file = o(Outcome::File { content: "fn a() {}\n".into(), hash: "c0ffee".into() });
+        assert_eq!(file, ("fn a() {}\n\n--- end of file; hash: c0ffee ---".into(), false), "the model sees the hash");
+        let patched = o(Outcome::Patched { diff: "-a\n+b\n".into(), hash: "beef".into() });
+        assert_eq!(patched, ("Patched. The file's new hash: beef\n-a\n+b\n".into(), false));
         assert_eq!(o(Outcome::Text { content: String::new() }), ("(no output)".into(), false));
         assert_eq!(
             o(Outcome::Recorded { location: Some("Sessions/a.md".into()) }),

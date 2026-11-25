@@ -282,7 +282,17 @@ async fn a_local_request_goes_to_the_account_url_without_auth() {
         body["tools"].as_array().unwrap().iter().map(|t| t["function"]["name"].as_str().unwrap()).collect();
     assert_eq!(
         names,
-        vec!["exec", "read_file", "write_file", "list_dir", "job_status", "job_output", "job_stop", "notes__search"]
+        vec![
+            "exec",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "job_status",
+            "job_output",
+            "job_stop",
+            "notes__search"
+        ]
     );
     assert_eq!(body["tools"][0]["type"], "function");
 }

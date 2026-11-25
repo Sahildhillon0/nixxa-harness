@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use nixxa_contracts::{
-    Action, BrainError, Context, JobId, KnowledgeAction, SandboxAction, SandboxActionKind, SourceId, ToolSpec,
+    Action, BrainError, Context, Edit, JobId, KnowledgeAction, SandboxAction, SandboxActionKind, SourceId, ToolSpec,
 };
 use serde_json::{Map, Value, json};
 
@@ -36,6 +36,7 @@ pub(crate) fn sandbox_name(kind: SandboxActionKind) -> &'static str {
         SandboxActionKind::Exec => "exec",
         SandboxActionKind::ReadFile => "read_file",
         SandboxActionKind::WriteFile => "write_file",
+        SandboxActionKind::Patch => "edit_file",
         SandboxActionKind::ListDir => "list_dir",
         SandboxActionKind::JobStatus => "job_status",
         SandboxActionKind::JobOutput => "job_output",
@@ -117,17 +118,44 @@ fn sandbox_definition(kind: SandboxActionKind, jobs: bool) -> Value {
             )
         }
         SandboxActionKind::ReadFile => (
-            "Read a text file from the workspace. Returns its contents.",
+            "Read a text file from the workspace. Returns its contents and its hash, which edit_file needs.",
             json!({ "path": path("File path relative to the workspace root, `/`-separated.") }),
             vec!["path"],
         ),
         SandboxActionKind::WriteFile => (
-            "Create a text file in the workspace, or replace one, with the given contents.",
+            "Create a new text file in the workspace with the given contents. To change a file that already \
+             exists, use edit_file: write_file would replace the whole file.",
             json!({
                 "path": path("File path relative to the workspace root, `/`-separated."),
-                "content": { "type": "string", "description": "The complete new contents of the file." }
+                "content": { "type": "string", "description": "The complete contents of the new file." }
             }),
             vec!["path", "content"],
+        ),
+        SandboxActionKind::Patch => (
+            "Change an existing text file by exact search/replace edits. Read the file with read_file first and \
+             send the hash it returned as expected_hash: if the file changed since, nothing is changed and you \
+             get its new hash, so read it again. Each search must match the file exactly once, whitespace \
+             included (add surrounding lines to make it unique); the edits apply in order, and all of them \
+             apply or none do. Returns a diff and the file's new hash, for the next edit.",
+            json!({
+                "path": path("File path relative to the workspace root, `/`-separated."),
+                "edits": {
+                    "type": "array",
+                    "minItems": 1,
+                    "description": "The edits, applied in order, each to the result of the ones before.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "search": { "type": "string", "description": "Text that occurs exactly once in the file." },
+                            "replace": { "type": "string", "description": "What it becomes." }
+                        },
+                        "required": ["search", "replace"],
+                        "additionalProperties": false
+                    }
+                },
+                "expected_hash": { "type": "string", "description": "The hash read_file (or the last edit_file) returned for this file." }
+            }),
+            vec!["path", "edits", "expected_hash"],
         ),
         SandboxActionKind::ListDir => (
             "List a directory in the workspace: names, whether each is a directory, and file sizes.",
@@ -202,6 +230,7 @@ fn sandbox_action(
         SandboxActionKind::Exec => &["command", "cwd", "timeout_ms"],
         SandboxActionKind::ReadFile | SandboxActionKind::ListDir => &["path"],
         SandboxActionKind::WriteFile => &["path", "content"],
+        SandboxActionKind::Patch => &["path", "edits", "expected_hash"],
         SandboxActionKind::JobStatus | SandboxActionKind::JobStop => &["job"],
         SandboxActionKind::JobOutput => &["job", "tail_bytes"],
     };
@@ -256,6 +285,31 @@ fn sandbox_action(
         SandboxActionKind::JobStop => SandboxAction::JobStop { job: JobId::new(string("job")?) },
         SandboxActionKind::ReadFile => SandboxAction::ReadFile { path: string("path")? },
         SandboxActionKind::WriteFile => SandboxAction::WriteFile { path: string("path")?, content: string("content")? },
+        SandboxActionKind::Patch => {
+            let Some(Value::Array(items)) = input.get("edits") else {
+                return Err(invalid(name, "`edits` must be an array of {search, replace} objects"));
+            };
+            if items.is_empty() {
+                return Err(invalid(name, "`edits` is empty"));
+            }
+            let mut edits = Vec::with_capacity(items.len());
+            for (n, item) in items.iter().enumerate() {
+                let edit = item.as_object().filter(|edit| edit.keys().all(|key| key == "search" || key == "replace"));
+                match edit.map(|edit| (edit.get("search"), edit.get("replace"))) {
+                    Some((Some(Value::String(search)), Some(Value::String(replace)))) if !search.is_empty() => {
+                        edits.push(Edit { search: search.clone(), replace: replace.clone() });
+                    }
+                    _ => {
+                        let why = format!(
+                            "edit {} must be an object with a non-empty string `search` and a string `replace`",
+                            n + 1
+                        );
+                        return Err(invalid(name, &why));
+                    }
+                }
+            }
+            SandboxAction::Patch { path: string("path")?, edits, expected_hash: string("expected_hash")? }
+        }
         SandboxActionKind::ListDir => SandboxAction::ListDir { path: string("path")? },
     })
 }
@@ -333,6 +387,11 @@ pub(crate) fn tool_use_for(action: &Action) -> (String, Value) {
                 }
                 SandboxAction::ReadFile { path } | SandboxAction::ListDir { path } => json!({ "path": path }),
                 SandboxAction::WriteFile { path, content } => json!({ "path": path, "content": content }),
+                SandboxAction::Patch { path, edits, expected_hash } => json!({
+                    "path": path,
+                    "edits": edits.iter().map(|e| json!({ "search": e.search, "replace": e.replace })).collect::<Vec<_>>(),
+                    "expected_hash": expected_hash
+                }),
                 SandboxAction::JobStatus { job } => json!({ "job": job }),
                 SandboxAction::JobOutput { job, tail_bytes } => json!({ "job": job, "tail_bytes": tail_bytes }),
                 SandboxAction::JobStop { job } => json!({ "job": job }),
@@ -471,6 +530,37 @@ mod tests {
     }
 
     #[test]
+    fn edit_file_is_a_patch_validated_strictly() {
+        let (definitions, map) = build(&context(SandboxActionKind::ALL.to_vec(), vec![]));
+        let edit_file = definitions.iter().find(|d| d["name"] == "edit_file").expect("offered");
+        let description = edit_file["description"].as_str().unwrap();
+        assert!(description.contains("read_file first") && description.contains("expected_hash"), "{description}");
+        let write = definitions.iter().find(|d| d["name"] == "write_file").unwrap();
+        assert!(write["description"].as_str().unwrap().contains("use edit_file"));
+        let good = json!({ "path": "a.rs", "edits": [{ "search": "a", "replace": "b" }], "expected_hash": "h" });
+        assert_eq!(
+            to_action(&map, "edit_file", good).unwrap(),
+            Action::Sandbox {
+                action: SandboxAction::Patch {
+                    path: "a.rs".into(),
+                    edits: vec![Edit { search: "a".into(), replace: "b".into() }],
+                    expected_hash: "h".into(),
+                },
+            }
+        );
+        for bad in [
+            json!({ "path": "a.rs", "edits": [], "expected_hash": "h" }),
+            json!({ "path": "a.rs", "edits": "a->b", "expected_hash": "h" }),
+            json!({ "path": "a.rs", "edits": [{ "search": "", "replace": "b" }], "expected_hash": "h" }),
+            json!({ "path": "a.rs", "edits": [{ "search": "a" }], "expected_hash": "h" }),
+            json!({ "path": "a.rs", "edits": [{ "search": "a", "replace": "b", "all": true }], "expected_hash": "h" }),
+            json!({ "path": "a.rs", "edits": [{ "search": "a", "replace": "b" }] }),
+        ] {
+            assert!(to_action(&map, "edit_file", bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
     fn background_is_offered_only_with_jobs() {
         let (definitions, map) = build(&context(vec![SandboxActionKind::Exec], vec![]));
         assert!(definitions[0]["input_schema"]["properties"].get("background").is_none());
@@ -519,6 +609,16 @@ mod tests {
             Action::Sandbox { action: SandboxAction::JobOutput { job: JobId::new("j2"), tail_bytes: 100 } },
             Action::Sandbox { action: SandboxAction::JobStop { job: JobId::new("j2") } },
             Action::Sandbox { action: SandboxAction::WriteFile { path: "a".into(), content: "b".into() } },
+            Action::Sandbox {
+                action: SandboxAction::Patch {
+                    path: "src/a.rs".into(),
+                    edits: vec![
+                        Edit { search: "fn a".into(), replace: "fn b".into() },
+                        Edit { search: "x".into(), replace: String::new() },
+                    ],
+                    expected_hash: "ab".repeat(32),
+                },
+            },
             Action::Knowledge {
                 action: KnowledgeAction::Call {
                     source: SourceId::new("notes"),

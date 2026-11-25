@@ -353,7 +353,17 @@ async fn the_request_carries_key_version_tools_caching_and_fallback() {
         body["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap().to_string()).collect();
     assert_eq!(
         tools,
-        vec!["exec", "read_file", "write_file", "list_dir", "job_status", "job_output", "job_stop", "notes__search"]
+        vec![
+            "exec",
+            "read_file",
+            "write_file",
+            "edit_file",
+            "list_dir",
+            "job_status",
+            "job_output",
+            "job_stop",
+            "notes__search"
+        ]
     );
     assert!(body.get("thinking").is_none(), "Sonnet 5.5 thinks adaptively by default");
     assert!(body.get("temperature").is_none());
