@@ -61,6 +61,13 @@ impl Watch {
         self.observe(event)
     }
 
+    /// The jobs still running, with their commands.
+    pub(crate) fn running(&self) -> Vec<(JobId, String)> {
+        let mut running: Vec<_> = self.running.iter().map(|(job, r)| (job.clone(), r.command.clone())).collect();
+        running.sort();
+        running
+    }
+
     /// The agent stopped `job` itself: its end is noted but wakes nobody.
     pub(crate) fn stopping(&mut self, job: &JobId) {
         if let Some(running) = self.running.get_mut(job) {

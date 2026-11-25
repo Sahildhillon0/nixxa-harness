@@ -17,6 +17,9 @@ pub(crate) fn describe(action: &Action) -> String {
             }
             SandboxAction::ReadFile { path } => format!("read `{path}`"),
             SandboxAction::WriteFile { path, .. } => format!("write `{path}`"),
+            SandboxAction::Patch { path, edits, .. } => {
+                format!("edit `{path}` ({} change{})", edits.len(), if edits.len() == 1 { "" } else { "s" })
+            }
             SandboxAction::ListDir { path } => format!("list `{path}`"),
             SandboxAction::JobStatus { job } => format!("check on job `{job}`"),
             SandboxAction::JobOutput { job, .. } => format!("read the output of job `{job}`"),

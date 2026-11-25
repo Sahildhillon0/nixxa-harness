@@ -85,6 +85,7 @@ impl Sandbox for EchoSandbox {
             network: NetworkAccess::default(),
             jobs: false,
             terminal: false,
+            checkpoints: false,
             actions: SandboxActionKind::ALL.to_vec(),
         }
     }
@@ -1836,4 +1837,342 @@ async fn a_job_that_ends_before_its_start_is_heard_is_still_noted() {
         let told = rig.brain.contexts().iter().filter(|c| mentions(c, "job j1 exited with code 127") > 0).count();
         assert!(told >= 1, "run {run}: the agent is told");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Checkpoints and undo (D-072)
+// ---------------------------------------------------------------------------------------------
+
+/// Runs nothing, keeps checkpoints (or fails them, past its "cap"), and logs every call in
+/// order.
+#[derive(Default)]
+struct UndoSandbox {
+    log: Mutex<Vec<String>>,
+    taken: Mutex<u32>,
+    full: bool,
+}
+
+impl UndoSandbox {
+    fn log(&self) -> Vec<String> {
+        self.log.lock().unwrap().clone()
+    }
+
+    fn position(&self, entry: &str) -> usize {
+        self.log().iter().position(|e| e == entry).unwrap_or_else(|| panic!("{entry} not in {:?}", self.log()))
+    }
+
+    /// What a restore undid: a deleted file brought back, a new one removed.
+    fn undone() -> nixxa_contracts::WorkspaceDiff {
+        use nixxa_contracts::{EntryState, FileChange};
+        let file = || Some(EntryState::File { size: 3, mode: 0o644, hash: "h".into() });
+        nixxa_contracts::WorkspaceDiff {
+            changes: vec![
+                FileChange { path: "new.txt".into(), before: None, after: file(), diff: None },
+                FileChange { path: "src/main.rs".into(), before: file(), after: None, diff: None },
+            ],
+            not_covered: vec!["target/".into()],
+        }
+    }
+}
+
+#[async_trait]
+impl Sandbox for UndoSandbox {
+    fn capabilities(&self) -> SandboxCapabilities {
+        SandboxCapabilities { jobs: true, checkpoints: true, ..EchoSandbox.capabilities() }
+    }
+
+    async fn execute(&self, id: ActionId, action: SandboxAction) -> Result<Observation, SandboxError> {
+        self.log.lock().unwrap().push(format!("execute {}", id.as_str()));
+        let outcome = match action {
+            SandboxAction::Exec { background: true, .. } => Outcome::Started { job: nixxa_contracts::JobId::new("j1") },
+            SandboxAction::Exec { command, .. } => {
+                Outcome::Exec { exit_code: Some(0), stdout: command, stderr: String::new() }
+            }
+            SandboxAction::WriteFile { content, .. } => Outcome::Written { bytes: content.len() as u64 },
+            SandboxAction::Patch { .. } => Outcome::Patched { diff: "-a\n+b\n".into(), hash: "h2".into() },
+            SandboxAction::ReadFile { .. } => Outcome::File { content: "a\n".into(), hash: "h1".into() },
+            _ => Outcome::Text { content: "ok".into() },
+        };
+        Ok(Observation::new(id, outcome))
+    }
+
+    async fn health(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn reset(&self) -> Result<(), SandboxError> {
+        Ok(())
+    }
+
+    async fn checkpoint(&self) -> Result<nixxa_contracts::CheckpointId, SandboxError> {
+        if self.full {
+            self.log.lock().unwrap().push("checkpoint refused".into());
+            return Err(SandboxError::LimitExceeded("the checkpoint store is full".into()));
+        }
+        let mut taken = self.taken.lock().unwrap();
+        *taken += 1;
+        self.log.lock().unwrap().push(format!("checkpoint c{taken}"));
+        Ok(nixxa_contracts::CheckpointId::new(format!("c{taken}")))
+    }
+
+    async fn restore(
+        &self,
+        checkpoint: &nixxa_contracts::CheckpointId,
+    ) -> Result<nixxa_contracts::WorkspaceDiff, SandboxError> {
+        self.log.lock().unwrap().push(format!("restore {checkpoint}"));
+        Ok(Self::undone())
+    }
+}
+
+fn sandbox_request(id: &str, action: SandboxAction) -> ActionRequest {
+    ActionRequest { id: ActionId::new(id), action: Action::Sandbox { action }, reason: None }
+}
+
+/// One step proposing every kind of file action and two that change nothing, then done.
+fn every_kind() -> Vec<Step> {
+    vec![
+        step(vec![
+            intent(Intent::Act { request: exec_request("run", "rm -rf src && echo x > new.txt") }),
+            intent(Intent::Act {
+                request: sandbox_request(
+                    "write",
+                    SandboxAction::WriteFile { path: "a.txt".into(), content: "a".into() },
+                ),
+            }),
+            intent(Intent::Act {
+                request: sandbox_request(
+                    "patch",
+                    SandboxAction::Patch {
+                        path: "a.txt".into(),
+                        edits: vec![nixxa_contracts::Edit { search: "a".into(), replace: "b".into() }],
+                        expected_hash: "h1".into(),
+                    },
+                ),
+            }),
+            intent(Intent::Act { request: sandbox_request("read", SandboxAction::ReadFile { path: "a.txt".into() }) }),
+            intent(Intent::Act { request: sandbox_request("list", SandboxAction::ListDir { path: ".".into() }) }),
+        ]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]
+}
+
+fn checkpoint_ids(sink: &RecordingSink) -> Vec<(String, Option<String>)> {
+    sink.all()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::Checkpoint { checkpoint, before, .. } => {
+                Some((checkpoint.as_str().to_string(), before.map(|b| b.as_str().to_string())))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_checkpoint_comes_before_every_action_that_changes_files_and_at_every_turn() {
+    let sandbox = Arc::new(UndoSandbox::default());
+    let rig = Rig::start(ScriptedBrain::new(every_kind()), ScriptedApprovals::allowing(), sandbox.clone(), 8).await;
+    rig.turn("go").await;
+    assert_eq!(
+        sandbox.log(),
+        vec![
+            "checkpoint c1", // the turn
+            "checkpoint c2",
+            "execute run",
+            "checkpoint c3",
+            "execute write",
+            "checkpoint c4",
+            "execute patch",
+            "execute read",
+            "execute list",
+        ],
+        "a checkpoint before (never after) each exec, write and patch; none for reads"
+    );
+    assert_eq!(
+        checkpoint_ids(&rig.sink),
+        vec![
+            ("c1".into(), None),
+            ("c2".into(), Some("run".into())),
+            ("c3".into(), Some("write".into())),
+            ("c4".into(), Some("patch".into())),
+        ]
+    );
+    // The checkpoint is announced before the action starts.
+    let events = rig.sink.all();
+    let announced =
+        events.iter().position(|e| matches!(e, Event::Checkpoint { before: Some(id), .. } if id.as_str() == "run"));
+    let started =
+        events.iter().position(|e| matches!(e, Event::ActionStarted { action_id, .. } if action_id.as_str() == "run"));
+    assert!(announced.unwrap() < started.unwrap());
+    let records = rig.store.record("s1").actions;
+    let recorded: Vec<_> = records
+        .iter()
+        .map(|r| (r.request.id.as_str().to_string(), r.checkpoint.as_ref().map(|c| c.as_str().to_string())))
+        .collect();
+    assert_eq!(
+        recorded,
+        vec![
+            ("run".into(), Some("c2".into())),
+            ("write".into(), Some("c3".into())),
+            ("patch".into(), Some("c4".into())),
+            ("read".into(), None),
+            ("list".into(), None),
+        ],
+        "each action is stored with the checkpoint before it"
+    );
+}
+
+#[tokio::test]
+async fn a_background_command_gets_a_checkpoint_and_a_denied_one_none() {
+    let background = SandboxAction::Exec { command: "make".into(), cwd: None, timeout_ms: None, background: true };
+    let brain = ScriptedBrain::new(vec![
+        step(vec![
+            intent(Intent::Act { request: sandbox_request("bg", background) }),
+            intent(Intent::Act { request: exec_request("denied", "rm -rf /") }),
+        ]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]);
+    let sandbox = Arc::new(UndoSandbox::default());
+    let approvals = ScriptedApprovals::answering(vec![Verdict::Allow, Verdict::Deny("no".into())]);
+    let rig = Rig::start(brain, approvals, sandbox.clone(), 8).await;
+    rig.turn("go").await;
+    assert_eq!(sandbox.log(), vec!["checkpoint c1", "checkpoint c2", "execute bg"]);
+}
+
+#[tokio::test]
+async fn past_the_cap_the_action_still_runs_and_the_user_and_the_agent_are_told() {
+    let sandbox = Arc::new(UndoSandbox { full: true, ..UndoSandbox::default() });
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: exec_request("run", "make") })]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]);
+    let rig = Rig::start(brain.clone(), ScriptedApprovals::allowing(), sandbox.clone(), 8).await;
+    rig.turn("go").await;
+    assert_eq!(sandbox.log(), vec!["checkpoint refused", "checkpoint refused", "execute run"]);
+    let refused: Vec<_> = rig
+        .sink
+        .all()
+        .into_iter()
+        .filter_map(|e| match e {
+            Event::NotUndoable { before, reason, .. } => Some((before.map(|b| b.as_str().to_string()), reason)),
+            _ => None,
+        })
+        .collect();
+    let full = "the checkpoint store is full".to_string();
+    assert_eq!(refused, vec![(None, full.clone()), (Some("run".into()), full)]);
+    // The agent hears it at its next step, never between the action and its result.
+    let last = brain.contexts().last().unwrap().messages.clone();
+    let note =
+        last.iter().rposition(|m| matches!(&m.content, Content::Text { text } if text.contains("can't undo it")));
+    let result = last.iter().rposition(|m| matches!(m.content, Content::Observation { .. }));
+    assert!(note.unwrap() > result.unwrap(), "{last:#?}");
+    assert!(rig.store.record("s1").actions[0].checkpoint.is_none());
+}
+
+#[tokio::test]
+async fn undo_restores_between_turns_and_tells_the_agent_once() {
+    let sandbox = Arc::new(UndoSandbox::default());
+    let mut steps = every_kind();
+    steps.push(step(vec![intent(Intent::Done { summary: "done".into() })]));
+    let brain = ScriptedBrain::new(steps);
+    let rig = Rig::start(brain.clone(), ScriptedApprovals::allowing(), sandbox.clone(), 8).await;
+    rig.turn("go").await;
+    let to = nixxa_contracts::CheckpointId::new("c2");
+    rig.tx.send(Command::Undo { to: to.clone(), seen: Some(nixxa_contracts::CheckpointId::new("c4")) }).await.unwrap();
+    rig.sink.wait(1, |e| matches!(e, Event::Restored { .. })).await;
+    let log = sandbox.log();
+    assert_eq!(&log[log.len() - 2..], ["checkpoint c5", "restore c2"], "the undo can itself be undone");
+    assert!(rig.sink.all().iter().any(
+        |e| matches!(e, Event::Restored { checkpoint, undone } if *checkpoint == to && undone.changes.len() == 2)
+    ));
+    // The next turn's context has the note, once, after the earlier turn's results.
+    rig.turn("and now?").await;
+    let messages = brain.contexts().last().unwrap().messages.clone();
+    let notes: Vec<_> = messages
+        .iter()
+        .filter_map(|m| match &m.content {
+            Content::Text { text } if m.role == Role::System && text.contains("The user undid changes") => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(notes.len(), 1, "{messages:#?}");
+    let note = &notes[0];
+    for words in
+        ["src/main.rs (restored: it had been deleted)", "new.txt (removed: it was created after", "stale", "target/"]
+    {
+        assert!(note.contains(words), "{words}: {note}");
+    }
+}
+
+#[tokio::test]
+async fn an_undo_chosen_before_the_agent_changed_more_restores_nothing() {
+    let sandbox = Arc::new(UndoSandbox::default());
+    let rig = Rig::start(ScriptedBrain::new(every_kind()), ScriptedApprovals::allowing(), sandbox.clone(), 8).await;
+    rig.turn("go").await;
+    // The user looked when c2 was the newest; c3 and c4 came after.
+    let undo = Command::Undo {
+        to: nixxa_contracts::CheckpointId::new("c1"),
+        seen: Some(nixxa_contracts::CheckpointId::new("c2")),
+    };
+    rig.tx.send(undo).await.unwrap();
+    rig.sink.wait(1, |e| matches!(e, Event::Error { message, .. } if message.contains("nothing was undone"))).await;
+    assert!(!sandbox.log().iter().any(|e| e.starts_with("restore")), "{:?}", sandbox.log());
+}
+
+#[tokio::test]
+async fn undo_waits_for_an_open_approval_and_its_turn() {
+    let sandbox = Arc::new(UndoSandbox::default());
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act {
+            request: sandbox_request("read", SandboxAction::ReadFile { path: "a".into() }),
+        })]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]);
+    let approvals = ScriptedApprovals::holding();
+    let rig = Rig::start(brain, approvals.clone(), sandbox.clone(), 8).await;
+    rig.say("go").await;
+    approvals.wait_asked(1).await;
+    let c1 = Some(nixxa_contracts::CheckpointId::new("c1"));
+    rig.tx.send(Command::Undo { to: nixxa_contracts::CheckpointId::new("c1"), seen: c1 }).await.unwrap();
+    sleep(Duration::from_millis(100)).await;
+    assert!(!sandbox.log().iter().any(|e| e.starts_with("restore")), "never while an approval is open");
+    approvals.release(Verdict::Allow);
+    rig.sink.wait(1, |e| matches!(e, Event::Restored { .. })).await;
+    let events = rig.sink.all();
+    let done = events.iter().position(turn_done).unwrap();
+    let restored = events.iter().position(|e| matches!(e, Event::Restored { .. })).unwrap();
+    assert!(done < restored, "the undo runs once the turn is over");
+    let log = sandbox.log();
+    assert!(sandbox.position("execute read") < sandbox.position("restore c1"), "{log:?}");
+}
+
+#[tokio::test]
+async fn undo_stops_the_agents_running_jobs_first() {
+    let background =
+        SandboxAction::Exec { command: "cargo build".into(), cwd: None, timeout_ms: None, background: true };
+    let brain = ScriptedBrain::new(vec![
+        step(vec![intent(Intent::Act { request: sandbox_request("bg", background) })]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+        step(vec![intent(Intent::Done { summary: "done".into() })]),
+    ]);
+    let sandbox = Arc::new(UndoSandbox::default());
+    let rig = Rig::start(brain.clone(), ScriptedApprovals::allowing(), sandbox.clone(), 8).await;
+    rig.turn("build").await;
+    let undo = Command::Undo {
+        to: nixxa_contracts::CheckpointId::new("c1"),
+        seen: Some(nixxa_contracts::CheckpointId::new("c2")),
+    };
+    rig.tx.send(undo).await.unwrap();
+    rig.sink.wait(1, |e| matches!(e, Event::Restored { .. })).await;
+    assert!(sandbox.position("execute undo-stop-j1") < sandbox.position("restore c1"), "{:?}", sandbox.log());
+    rig.turn("next").await;
+    let messages = brain.contexts().last().unwrap().messages.clone();
+    assert!(
+        messages.iter().any(
+            |m| matches!(&m.content, Content::Text { text } if text.contains("stopped first: j1 (`cargo build`)"))
+        ),
+        "{messages:#?}"
+    );
 }

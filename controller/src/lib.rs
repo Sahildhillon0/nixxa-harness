@@ -7,6 +7,11 @@
 //! Stage 6 (D-068): the loop also hears the sandbox. The end of a background job the agent
 //! started is noted for the agent once, at its next think step; if the agent is idle and was
 //! waiting on the job, the controller starts a turn for it (a wake-up), a few at most in a row.
+//!
+//! Stage 7 (D-072): before every action that can change files (a patch, a write, a command) and
+//! at the start of every turn, the controller asks the sandbox for a checkpoint, and records it
+//! with the action. [`Command::Undo`] puts the workspace back as it was at one of them, between
+//! turns only, and tells the agent which files went back.
 
 #![warn(missing_docs)]
 
@@ -22,10 +27,10 @@ use futures::StreamExt;
 use tokio::sync::{mpsc, watch};
 
 use nixxa_contracts::{
-    AccountRef, Action, ActionId, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, Content, Context,
-    Event, EventSink, Intent, JobId, Knowledge, KnowledgeAction, Limits, Message, NewSession, Observation, Outcome,
-    Primer, Role, Sandbox, SandboxAction, SandboxEvent, SessionId, SessionInfo, Store, StoreError, Timestamp, TurnId,
-    Verdict, WorkspaceInfo,
+    AccountRef, Action, ActionId, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, CheckpointId, Content,
+    Context, Event, EventSink, Intent, JobId, Knowledge, KnowledgeAction, Limits, Message, NewSession, Observation,
+    Outcome, Primer, Role, Sandbox, SandboxAction, SandboxError, SandboxEvent, SessionId, SessionInfo, Store,
+    StoreError, Timestamp, TurnId, Verdict, WorkspaceDiff, WorkspaceInfo,
 };
 
 /// The default hard cap on brain steps per turn.
@@ -67,6 +72,18 @@ pub enum Command {
     /// user changed the network policy). Kept until the in-flight turn ends, so it never lands
     /// between an action and its result.
     Note(String),
+    /// The user's undo: put the workspace back as it was at checkpoint `to`. Runs between turns
+    /// only (kept until the in-flight turn ends). `seen` is the newest checkpoint the user had
+    /// heard of when they chose: if one was taken since, the agent changed things the user
+    /// hasn't looked at, so nothing is restored and an error says so. The agent's running
+    /// background jobs are stopped first, a checkpoint is taken (so the undo can be undone), and
+    /// the agent is told which files went back.
+    Undo {
+        /// The checkpoint to go back to.
+        to: CheckpointId,
+        /// The newest checkpoint the user had seen.
+        seen: Option<CheckpointId>,
+    },
 }
 
 /// Tunables for the agent loop.
@@ -183,6 +200,10 @@ pub struct Controller {
     cancel: watch::Receiver<bool>,
     /// The agent's background jobs (D-068).
     jobs: jobs::Shared,
+    /// Notices for the agent at its next think step (an action that can't be undone).
+    notes: Vec<String>,
+    /// The newest checkpoint taken (D-072).
+    newest: Option<CheckpointId>,
 }
 
 impl Controller {
@@ -208,6 +229,8 @@ impl Controller {
             next_turn: 0,
             cancel: watch::channel(false).1,
             jobs: jobs::Shared::default(),
+            notes: Vec::new(),
+            newest: None,
         }
     }
 
@@ -295,7 +318,7 @@ impl Controller {
         self.session = Some(Session { id: record.info.id.clone(), primer, conversation });
         for request in unanswered {
             let observation = Observation::failed(request.id.clone(), QUIT_MID_ACTION);
-            self.finish_action(&turn, request, Verdict::Deny(QUIT_MID_ACTION.into()), observation).await;
+            self.finish_action(&turn, request, Verdict::Deny(QUIT_MID_ACTION.into()), observation, None).await;
         }
         let mut notice = RESUMED.to_string();
         if record.info.account != self.config.account {
@@ -365,6 +388,10 @@ impl Controller {
                     self.note(text).await;
                     continue;
                 }
+                Next::Command(Command::Undo { to, seen }) => {
+                    self.undo(to, seen).await;
+                    continue;
+                }
                 Next::Command(Command::Interrupt) => continue,
                 Next::Command(Command::Shutdown) => break,
                 Next::Wake => {
@@ -388,7 +415,9 @@ impl Controller {
                     tokio::select! {
                         () = &mut turn_future => break,
                         command = commands.recv(), if listening => match command {
-                            Some(command @ (Command::UserMessage(_) | Command::Note(_))) => queued.push_back(command),
+                            Some(command @ (Command::UserMessage(_) | Command::Note(_) | Command::Undo { .. })) => {
+                                queued.push_back(command)
+                            }
                             Some(Command::Interrupt) => {
                                 cancel_tx.send_replace(true);
                             }
@@ -461,6 +490,94 @@ impl Controller {
         self.record_message(&turn, message, true).await;
     }
 
+    /// Takes a checkpoint before `before` (an action that can change files) or, without one, at
+    /// the start of a turn, when the sandbox keeps checkpoints (D-072). When none can be taken
+    /// (the store's cap, or a failure) the action still runs: the user is told it can't be
+    /// undone, and the agent at its next step.
+    async fn checkpoint(&mut self, turn: &TurnId, before: Option<&ActionRequest>) -> Option<CheckpointId> {
+        if !self.sandbox.capabilities().checkpoints {
+            return None;
+        }
+        let action = before.map(|request| request.id.clone());
+        match self.sandbox.checkpoint().await {
+            Ok(checkpoint) => {
+                self.newest = Some(checkpoint.clone());
+                self.emit(Event::Checkpoint { turn: turn.clone(), checkpoint: checkpoint.clone(), before: action });
+                Some(checkpoint)
+            }
+            Err(err) => {
+                let reason = match err {
+                    SandboxError::LimitExceeded(why) => why,
+                    other => other.to_string(),
+                };
+                let what = before.map_or_else(|| "this turn".to_string(), |request| format!("action `{}`", request.id));
+                self.notes.push(format!(
+                    "Nixxa couldn't take a checkpoint before {what} ({reason}), so the user can't undo it."
+                ));
+                self.emit(Event::NotUndoable { turn: turn.clone(), before: action, reason });
+                None
+            }
+        }
+    }
+
+    /// The user's undo (D-072): between turns, back to `to`.
+    async fn undo(&mut self, to: CheckpointId, seen: Option<CheckpointId>) {
+        if self.session.is_none() {
+            return;
+        }
+        if self.newest != seen {
+            self.emit(Event::Error {
+                turn: None,
+                message:
+                    "nothing was undone: the workspace has changed since the undo was shown. Open it again to see \
+                          what it would do now"
+                        .into(),
+            });
+            return;
+        }
+        // The user leads now: nothing ended so far wakes the agent.
+        jobs::lock(&self.jobs).user_spoke();
+        // Running jobs would go on changing files: they are stopped first.
+        let running = jobs::lock(&self.jobs).running();
+        let mut stopped = Vec::new();
+        for (job, command) in running {
+            jobs::lock(&self.jobs).stopping(&job);
+            let id = ActionId::new(format!("undo-stop-{job}"));
+            match self.sandbox.execute(id, SandboxAction::JobStop { job: job.clone() }).await {
+                Ok(_) => stopped.push(format!("{job} (`{command}`)")),
+                Err(err) => self.emit(Event::Error { turn: None, message: format!("could not stop job {job}: {err}") }),
+            }
+        }
+        let turn = TurnId::new(format!("undo-{}", self.next_turn));
+        // So the undo can itself be undone.
+        self.checkpoint(&turn, None).await;
+        let text = match self.sandbox.restore(&to).await {
+            Ok(undone) => {
+                let text = undo_note(&undone, &stopped);
+                self.emit(Event::Restored { checkpoint: to, undone });
+                text
+            }
+            Err(err) => {
+                self.emit(Event::Error { turn: None, message: format!("the undo failed: {err}") });
+                format!(
+                    "The user tried to undo changes in the workspace, but it failed ({err}). Files may be partly \
+                     restored: read them again before relying on what you read before."
+                )
+            }
+        };
+        self.note(text).await;
+    }
+
+    /// Gives the agent the notices it hasn't been told about, at a step.
+    async fn give_notes(&mut self, turn: &TurnId) {
+        if self.notes.is_empty() {
+            return;
+        }
+        let text = std::mem::take(&mut self.notes).join("\n");
+        let message = Message::text(Role::System, text, self.now());
+        self.record_message(turn, message, true).await;
+    }
+
     /// Records a notice between turns. Without a session there is nothing to record it in.
     async fn note(&mut self, text: String) {
         if self.session.is_none() {
@@ -488,6 +605,13 @@ impl Controller {
             }
         };
         self.record_message(turn, message, true).await;
+        // "Undo this turn" goes back to here.
+        let cancel = self.cancel.clone();
+        if cancellable(&cancel, self.checkpoint(turn, None)).await.is_none() {
+            let message = Message::text(Role::System, INTERRUPTED, self.now());
+            self.record_message(turn, message, true).await;
+            return;
+        }
         for _ in 0..self.config.max_steps {
             match self.step(turn).await {
                 Flow::Continue => {}
@@ -511,7 +635,9 @@ impl Controller {
     /// follow together. That keeps the model's message whole in the history, which providers
     /// that sign their reasoning require (D-028).
     async fn step(&mut self, turn: &TurnId) -> Flow {
-        // Between steps, never between an action and its result: jobs that ended meanwhile.
+        // Between steps, never between an action and its result: notices, and jobs that ended
+        // meanwhile.
+        self.give_notes(turn).await;
         self.give_ended(Some(turn), None).await;
         let context = self.build_context().await;
         let mut stream = match cancellable(&self.cancel, self.brain.think(context)).await {
@@ -607,7 +733,7 @@ impl Controller {
     async fn close_unrun(&mut self, turn: &TurnId, unrun: VecDeque<ActionRequest>, reason: &str) {
         for request in unrun {
             let observation = Observation::denied(request.id.clone(), reason);
-            self.finish_action(turn, request, Verdict::Deny(reason.into()), observation).await;
+            self.finish_action(turn, request, Verdict::Deny(reason.into()), observation, None).await;
         }
     }
 
@@ -629,13 +755,32 @@ impl Controller {
                     Some(Verdict::Deny(reason) | Verdict::Ask(reason)) => Verdict::Deny(reason),
                     None => {
                         let observation = Observation::denied(request.id.clone(), INTERRUPTED);
-                        self.finish_action(turn, request, Verdict::Deny(INTERRUPTED.into()), observation).await;
+                        self.finish_action(turn, request, Verdict::Deny(INTERRUPTED.into()), observation, None).await;
                         return Flow::Cancelled;
                     }
                 }
             }
             verdict => verdict,
         };
+
+        // A checkpoint before anything that can change files, once it may run (D-072).
+        let mut checkpoint = None;
+        if verdict == Verdict::Allow {
+            if let Action::Sandbox { action } = &request.action {
+                if action.changes_files() {
+                    let cancel = self.cancel.clone();
+                    match cancellable(&cancel, self.checkpoint(turn, Some(&request))).await {
+                        Some(taken) => checkpoint = taken,
+                        None => {
+                            let observation = Observation::denied(request.id.clone(), INTERRUPTED);
+                            let verdict = Verdict::Deny(INTERRUPTED.into());
+                            self.finish_action(turn, request, verdict, observation, None).await;
+                            return Flow::Cancelled;
+                        }
+                    }
+                }
+            }
+        }
 
         let (observation, flow) = match &verdict {
             Verdict::Allow => {
@@ -659,7 +804,7 @@ impl Controller {
                 (Observation::denied(request.id.clone(), reason.clone()), Flow::Continue)
             }
         };
-        self.finish_action(turn, request, verdict, observation).await;
+        self.finish_action(turn, request, verdict, observation, checkpoint).await;
         flow
     }
 
@@ -699,9 +844,11 @@ impl Controller {
         request: ActionRequest,
         verdict: Verdict,
         observation: Observation,
+        checkpoint: Option<CheckpointId>,
     ) {
         self.emit(Event::ActionFinished { turn: turn.clone(), observation: observation.clone() });
-        let record = ActionRecord { request, verdict, observation: Some(observation.clone()), at: self.now() };
+        let record =
+            ActionRecord { request, verdict, observation: Some(observation.clone()), checkpoint, at: self.now() };
         let message =
             Message { role: Role::Observation, content: Content::Observation { observation }, at: self.now() };
         self.record_message(turn, message, false).await;
@@ -791,4 +938,42 @@ fn observe(watch: &jobs::Shared, sink: &dyn EventSink, event: Option<SandboxEven
     if let Some(event) = jobs::lock(watch).observe(event) {
         sink.emit(event);
     }
+}
+
+/// The paths an undo note lists; the rest are counted.
+const NOTE_PATHS: usize = 40;
+
+/// What the agent is told after the user's undo: which paths went back, and that what it read
+/// before may be stale.
+fn undo_note(undone: &WorkspaceDiff, stopped: &[String]) -> String {
+    let mut text = String::from("The user undid changes: the workspace is back as it was at an earlier checkpoint.");
+    if undone.changes.is_empty() {
+        text.push_str(" Nothing had changed since, so no file changed.");
+    } else {
+        text.push_str(" These paths went back:");
+        for change in undone.changes.iter().take(NOTE_PATHS) {
+            let how = match (&change.before, &change.after) {
+                (None, _) => "removed: it was created after the checkpoint",
+                (_, None) => "restored: it had been deleted",
+                _ => "changed back",
+            };
+            text.push_str(&format!("\n- {} ({how})", change.path));
+        }
+        if undone.changes.len() > NOTE_PATHS {
+            text.push_str(&format!("\n- … and {} more", undone.changes.len() - NOTE_PATHS));
+        }
+        text.push_str(
+            "\nWhat you read before may be stale: read files again before you edit them (an edit with an old hash fails).",
+        );
+    }
+    if !stopped.is_empty() {
+        text.push_str(&format!("\nYour background jobs were stopped first: {}.", stopped.join(", ")));
+    }
+    if !undone.not_covered.is_empty() {
+        text.push_str(&format!(
+            "\nCheckpoints leave these out, so they were left as they are: {}.",
+            undone.not_covered.join(", ")
+        ));
+    }
+    text
 }
