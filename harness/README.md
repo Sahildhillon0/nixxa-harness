@@ -129,7 +129,7 @@ can be found, logging is off and the conversation says so.
 
 Keys: `enter` send · `alt-enter` / `shift-enter` newline · `tab` focus · `shift-tab` Ask/Auto ·
 `j` `k` / arrows move · `end` back to newest · `ctrl-t` terminal · `ctrl-s` sessions · `ctrl-n` network ·
-`ctrl-c` interrupt (twice: quit).
+`ctrl-z` (or `/undo`) undo · `ctrl-c` interrupt (twice: quit).
 
 **The terminal (`ctrl+t`, D-066, D-067):** a shell in the same place as the agent (in the
 sandbox, a PTY job in the daemon; in This directory, your `$SHELL`), in place of the detail pane
@@ -150,5 +150,19 @@ away (the window lost focus, you're typing in the `ctrl+t` terminal, or no key f
 `notify-send` or `osascript`, and the bell), `bell`, or `off`. The text is one line, never output
 or model text, and safe.
 
+**Undo (D-071, D-073, `undo.rs`):** every place but the demo gets a checkpoint store at
+`<data dir>/nixxa/checkpoints/<run>` (`workplace.rs`), which the sandbox creates (0700) and
+removes when Nixxa quits; stores a crash left behind are removed after 3 days. Without a data
+directory, the conversation says undo is off. The controller's `Event::Checkpoint`s build the
+list of points to go back to, each labelled with what it comes before (an action, the start of a
+turn, an undo). `/undo` in the message input or `ctrl-z` opens the view between turns only (it
+says why during a turn or an approval). The view shows the sandbox's `diff` to now from the
+checkpoint before the last action; `←`/`→` move to earlier ones and back. It also lists what an
+undo can't bring back: network requests, anything outside the workspace, what checkpoints leave
+out, actions without a checkpoint, and that the agent's jobs are stopped first. Two `enter`s send
+`Command::Undo` with the newest checkpoint the user had seen. A new checkpoint or turn closes a
+stale view. Patches show `+added -removed` in the activity pane and their diff in the details;
+reads show their hash. Everything from the workspace goes through `safe::line`.
+
 Not yet: plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
-knowledge panel (Stage 10), slash commands (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.
+knowledge panel (Stage 10), slash commands other than `/undo` (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.

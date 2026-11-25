@@ -14,7 +14,16 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 7 — Safe edits: next.** Stage 6 is done.
+**Stage 7 — Safe edits: in progress.** Stage 6 is done.
+
+**Stage 7 so far:**
+- PR A, patches and undo: `SandboxAction::Patch` against the file's SHA-256 (the `edit_file`
+  tool), all edits or none, never through a link, in every backend (D-070); checkpoints in a
+  content-addressed store on the host, outside the workspace, with a cap, a fixed list of build
+  directories left out and nothing followed (D-071); the controller takes one before every
+  file-changing action and every turn, and runs `Command::Undo` between turns (D-072); `/undo`
+  and `ctrl-z` show the diff and restore (D-073).
+- Next: PR B, secret redaction (#3); then PR C, the `AGENTS.md` policy (#5).
 
 **Stage 6 — Working in the sandbox: done.** Stage 3's Anthropic live checks are still
 pending. The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each
