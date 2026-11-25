@@ -111,6 +111,8 @@ mod tests {
         assert!(apply(old, &[edit("aa", "b")], &h).unwrap_err().contains("more than one place"));
         assert!(apply(old, &[edit("aaa", "b"), edit("", "c")], &h).unwrap_err().contains("edit 2 of 2"));
         assert!(apply(old, &[], &h).is_err());
+        // All or nothing: a later edit failing leaves no earlier one applied.
+        assert!(apply(old, &[edit("aaa", "b"), edit("nope", "c")], &h).unwrap_err().contains("edit 2 of 2"));
         // The hash compares case-insensitively and ignores surrounding blanks.
         assert!(apply(old, &[edit("aaa", "b")], &format!(" {} ", h.to_uppercase())).is_ok());
     }
