@@ -84,6 +84,43 @@ impl Drop for Scratch {
     }
 }
 
+/// The bound while copying, on its own: a file that grew after its size was read (here, a
+/// `Meta` that says it is empty) gets past the check before reading, so only the bound while
+/// streaming stops it.
+#[test]
+fn a_file_that_grows_after_its_size_was_read_is_cut_off_while_copied() {
+    let s = Scratch::new();
+    std::fs::File::create(s.at("grown")).unwrap().set_len(4 * 1024 * 1024).unwrap();
+    let checkpoints = s.store(1024 * 1024);
+    let mut guard = checkpoints.store.lock().unwrap();
+    let store = guard.as_mut().unwrap();
+    let root = Dir::open_root(&s.ws()).unwrap();
+    let (name, mut meta) = root.list().unwrap().into_iter().find(|(name, _)| name == "grown").unwrap();
+    meta.size = 0;
+    for keep in [Keep::Store, Keep::Peek] {
+        let mut walk = Walk {
+            store: &mut *store,
+            keep,
+            added: Vec::new(),
+            peeked: HashMap::new(),
+            known: HashMap::new(),
+            not_covered: BTreeSet::new(),
+            started: SystemTime::now(),
+            store_id: None,
+        };
+        match (keep, walk.file(&root, &name, meta, b"grown")) {
+            (Keep::Store, Err(Failure::Cap(why))) => assert!(why.contains("`grown`"), "{why}"),
+            (Keep::Peek, Ok(Some(Node::Unreadable { size, .. }))) => {
+                assert!(size > 1024 * 1024 && size < 2 * 1024 * 1024, "stopped just past the cap: {size}");
+            }
+            (_, other) => panic!("{other:?}"),
+        }
+    }
+    let temp = s.base.join("store").join("run-1").join("tmp");
+    assert_eq!(std::fs::read_dir(temp).unwrap().count(), 0, "the partial copy was deleted");
+    assert!(s.blobs().is_empty(), "and nothing kept");
+}
+
 fn find<'d>(diff: &'d WorkspaceDiff, path: &str) -> &'d FileChange {
     diff.changes.iter().find(|c| c.path == path).unwrap_or_else(|| panic!("{path} not in {diff:#?}"))
 }
