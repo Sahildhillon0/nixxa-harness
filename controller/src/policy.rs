@@ -1,10 +1,25 @@
-//! The policy gate. Stage 2 policy: ask the human before every action.
+//! The policy gate. Stage 2 policy: ask the human before every action. Stage 7 (D-076): reading
+//! a file that usually holds secrets asks even in Auto, and says why.
 
-use nixxa_contracts::{Action, ActionRequest, KnowledgeAction, SandboxAction, Verdict};
+use nixxa_contracts::{Action, ActionRequest, Asking, KnowledgeAction, SandboxAction, Verdict};
 
-/// Decides what happens to a proposed action before it runs.
-pub(crate) fn gate(request: &ActionRequest) -> Verdict {
-    Verdict::Ask(format!("approval needed to {}", describe(&request.action)))
+use crate::sensitive;
+
+/// Decides what happens to a proposed action before it runs, and whether Auto may answer.
+pub(crate) fn gate(request: &ActionRequest) -> (Verdict, Asking) {
+    if let Action::Sandbox { action: SandboxAction::ReadFile { path } } = &request.action {
+        if let Some(pattern) = sensitive::pattern(path) {
+            return (
+                Verdict::Ask(format!(
+                    "approval needed to read `{path}`, asked even in Auto: files like this (`{pattern}`) usually hold \
+                     secrets. Known kinds of secret are replaced before the agent sees the file, but others would \
+                     reach the model provider"
+                )),
+                Asking::Always,
+            );
+        }
+    }
+    (Verdict::Ask(format!("approval needed to {}", describe(&request.action))), Asking::ByMode)
 }
 
 /// A short, human-readable description of an action for approval prompts.
@@ -72,8 +87,24 @@ mod tests {
             },
         ];
         for action in actions {
-            assert!(matches!(gate(&request(action)), Verdict::Ask(_)));
+            assert!(matches!(gate(&request(action)), (Verdict::Ask(_), Asking::ByMode)));
         }
+    }
+
+    #[test]
+    fn reading_a_file_that_holds_secrets_asks_even_in_auto() {
+        let read = |path: &str| request(Action::Sandbox { action: SandboxAction::ReadFile { path: path.into() } });
+        let (verdict, asking) = gate(&read("app/.env"));
+        assert_eq!(asking, Asking::Always);
+        assert!(
+            matches!(&verdict, Verdict::Ask(why) if why.contains("`.env`") && why.contains("even in Auto")),
+            "{verdict:?}"
+        );
+        assert_eq!(gate(&read("src/main.rs")).1, Asking::ByMode);
+        // Writing one is an ordinary write: nothing leaves.
+        let write =
+            Action::Sandbox { action: SandboxAction::WriteFile { path: ".env".into(), content: String::new() } };
+        assert_eq!(gate(&request(write)).1, Asking::ByMode);
     }
 
     #[test]
@@ -81,6 +112,6 @@ mod tests {
         let exec = Action::Sandbox {
             action: SandboxAction::Exec { command: "ls".into(), cwd: None, timeout_ms: None, background: false },
         };
-        assert_eq!(gate(&request(exec)), Verdict::Ask("approval needed to run `ls` in the sandbox".into()));
+        assert_eq!(gate(&request(exec)).0, Verdict::Ask("approval needed to run `ls` in the sandbox".into()));
     }
 }

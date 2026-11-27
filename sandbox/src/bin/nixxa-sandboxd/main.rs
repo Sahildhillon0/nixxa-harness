@@ -5,6 +5,9 @@
 //! It runs as `--limited` too: that is the supervisor at the top of every job (see `exec.rs`).
 
 #[cfg(target_os = "linux")]
+#[path = "../../cut.rs"]
+mod cut;
+#[cfg(target_os = "linux")]
 mod exec;
 #[cfg(target_os = "linux")]
 mod files;

@@ -206,10 +206,14 @@ impl Tail {
         self.cut
     }
 
-    /// The last `n` kept bytes, as text.
+    /// The last `n` kept bytes, as text. When that isn't everything the job printed, it starts
+    /// after the first token, which may be the end of one cut through (D-074).
     pub(crate) fn last(&self, n: usize) -> String {
         let skip = self.bytes.len().saturating_sub(n);
-        let bytes: Vec<u8> = self.bytes.iter().skip(skip).copied().collect();
+        let mut bytes: Vec<u8> = self.bytes.iter().skip(skip).copied().collect();
+        if skip > 0 || self.cut {
+            bytes.drain(..crate::cut::start(&bytes));
+        }
         String::from_utf8_lossy(&bytes).into_owned()
     }
 }
@@ -271,14 +275,16 @@ mod tests {
 
     #[test]
     fn a_tail_keeps_the_last_bytes() {
-        let mut tail = Tail::new(5);
-        tail.push(b"abc");
-        assert_eq!((tail.last(10).as_str(), tail.cut()), ("abc", false));
-        tail.push(b"defg");
-        assert_eq!((tail.last(10).as_str(), tail.cut()), ("cdefg", true));
+        let mut tail = Tail::new(8);
+        tail.push(b"ab cd");
+        assert_eq!((tail.last(10).as_str(), tail.cut()), ("ab cd", false));
+        tail.push(b" efg hi");
+        // "d efg hi" is kept; its first token may be the end of one cut through, so it goes.
+        assert_eq!((tail.last(10).as_str(), tail.cut()), (" efg hi", true));
+        assert_eq!(tail.last(3), " hi");
+        assert_eq!(tail.last(2), "", "all one token, maybe cut");
         tail.push(b"0123456789");
-        assert_eq!(tail.last(10), "56789");
-        assert_eq!(tail.last(2), "89");
+        assert_eq!(tail.last(10), "", "a token longer than the tail is never shown in part");
     }
 
     #[test]
@@ -321,13 +327,16 @@ mod tests {
     #[test]
     fn the_output_shows_both_streams() {
         let (mut out, mut err) = (Tail::new(100), Tail::new(100));
-        out.push(b"hello\n");
-        err.push(b"warn\n");
-        let text = output_text("job j1 is running (0.0 s so far)", &out, &err, 3);
+        out.push(b"hello world\n");
+        err.push(b"first warning: x\n");
+        out.push(b"second line\n");
+        let text = output_text("job j1 is running (0.0 s so far)", &out, &err, 16);
+        // The last 16 bytes: a line that may have been cut through goes ("ld\n"), and a token
+        // when the only line break ends the output ("irst").
         assert_eq!(
             text,
-            "job j1 is running (0.0 s so far)\n--- stdout (last 3 bytes, earlier output dropped) ---\nlo\n\
-             \n--- stderr (last 3 bytes, earlier output dropped) ---\nrn\n"
+            "job j1 is running (0.0 s so far)\n--- stdout (last 12 bytes, earlier output dropped) ---\n\
+             second line\n\n--- stderr (last 12 bytes, earlier output dropped) ---\n warning: x\n"
         );
     }
 }

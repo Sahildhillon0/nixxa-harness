@@ -66,10 +66,8 @@ pub(crate) fn unified(path: &str, old: &[u8], new: &[u8]) -> String {
     let diff = similar::TextDiff::from_lines(old.as_ref(), new.as_ref());
     let mut text = diff.unified_diff().context_radius(3).header(&format!("a/{path}"), &format!("b/{path}")).to_string();
     if text.len() > DIFF_CAP {
-        let mut cut = DIFF_CAP;
-        while !text.is_char_boundary(cut) {
-            cut -= 1;
-        }
+        // Never through a token (D-074), and so never through a character.
+        let cut = crate::cut::end(&text.as_bytes()[..DIFF_CAP]);
         text.truncate(cut);
         text.push_str("\n[diff truncated]\n");
     }

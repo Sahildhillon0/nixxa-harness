@@ -12,12 +12,20 @@
 //! at the start of every turn, the controller asks the sandbox for a checkpoint, and records it
 //! with the action. [`Command::Undo`] puts the workspace back as it was at one of them, between
 //! turns only, and tells the agent which files went back.
+//!
+//! Stage 7 (D-074 to D-077): everything entering the agent's context passes the
+//! [`scrub::Scrubber`] first, and is stored in its scrubbed form: the user's message, every
+//! observation (file reads, command and job output, network URLs, knowledge results), Nixxa's
+//! notes, the primer, and a resumed session's history. Each secret found is an
+//! [`Event::SecretRedacted`]. Reading a file that usually holds secrets asks even in Auto.
 
 #![warn(missing_docs)]
 
 mod jobs;
 mod network;
 mod policy;
+pub mod scrub;
+mod sensitive;
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -29,9 +37,11 @@ use tokio::sync::{mpsc, watch};
 use nixxa_contracts::{
     AccountRef, Action, ActionId, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, CheckpointId, Content,
     Context, Event, EventSink, Intent, JobId, Knowledge, KnowledgeAction, Limits, Message, NewSession, Observation,
-    Outcome, Primer, Role, Sandbox, SandboxAction, SandboxError, SandboxEvent, SessionId, SessionInfo, Store,
-    StoreError, Timestamp, TurnId, Verdict, WorkspaceDiff, WorkspaceInfo,
+    Outcome, Primer, RedactionSource, Role, Sandbox, SandboxAction, SandboxError, SandboxEvent, SessionId, SessionInfo,
+    Store, StoreError, Timestamp, TurnId, Verdict, WorkspaceDiff, WorkspaceInfo,
 };
+
+use scrub::Scrubber;
 
 /// The default hard cap on brain steps per turn.
 pub const DEFAULT_MAX_STEPS: u32 = 8;
@@ -49,6 +59,9 @@ const WAKE: &str = "This turn started without a message from the user: backgroun
 const INTERRUPTED: &str = "interrupted by the user";
 /// What an action that never ran is told when the turn stopped before it.
 const NOT_RUN: &str = "not run: the turn stopped before this action";
+
+/// Told when a message can't be checked for secrets: it isn't kept rather than kept unchecked.
+const UNCHECKED: &str = "a message was not kept: Nixxa could not check it for secrets";
 /// What an action left without a result in a stored session (Nixxa quit or crashed while it
 /// was waiting for approval or running) is told on resume (D-057).
 const QUIT_MID_ACTION: &str =
@@ -59,11 +72,35 @@ const RESUMED: &str = "This session was resumed. The workspace may have changed 
      edited, another place to work in, or a fresh copy), so check it again before relying on what the history says \
      about it.";
 
+/// A message from the human.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UserMessage {
+    /// What they wrote.
+    pub text: String,
+    /// Placeholders of secrets in it that the user chose, one by one, to send as they are
+    /// (D-077). The agent gets those values; the session's record keeps the placeholders.
+    pub send_anyway: Vec<String>,
+    /// Whether it holds lines the user shared from the terminal (the redaction warnings say so).
+    pub from_terminal: bool,
+}
+
+impl From<&str> for UserMessage {
+    fn from(text: &str) -> Self {
+        Self { text: text.to_string(), ..Self::default() }
+    }
+}
+
+impl From<String> for UserMessage {
+    fn from(text: String) -> Self {
+        Self { text, ..Self::default() }
+    }
+}
+
 /// A command the harness sends to the controller's loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     /// The human submitted a message. Runs a turn now, or after the in-flight turn ends.
-    UserMessage(String),
+    UserMessage(UserMessage),
     /// Cancel the in-flight turn (brain stream, approval prompt, action). No-op when idle.
     Interrupt,
     /// Cancel the in-flight turn and end the session.
@@ -103,11 +140,19 @@ pub struct ControllerConfig {
     pub max_wakes: u32,
     /// How long it waits for other jobs ending close behind one before it starts that turn.
     pub wake_delay: Duration,
+    /// The session's secret scrubber (D-074). The harness keeps the same one to show the user,
+    /// before they send, what their message will have replaced.
+    pub scrubber: Arc<Scrubber>,
 }
 
 impl ControllerConfig {
     /// A config with the default step cap and the system clock.
-    pub fn new(workspace: WorkspaceInfo, account: AccountRef, instructions: impl Into<String>) -> Self {
+    pub fn new(
+        workspace: WorkspaceInfo,
+        account: AccountRef,
+        instructions: impl Into<String>,
+        scrubber: Arc<Scrubber>,
+    ) -> Self {
         Self {
             workspace,
             account,
@@ -116,6 +161,7 @@ impl ControllerConfig {
             clock: system_clock,
             max_wakes: DEFAULT_MAX_WAKES,
             wake_delay: DEFAULT_WAKE_DELAY,
+            scrubber,
         }
     }
 }
@@ -145,7 +191,7 @@ struct Session {
 /// What opens a turn.
 enum Opening {
     /// The user's message.
-    User(String),
+    User(UserMessage),
     /// Jobs the agent was waiting on ended; these woke it.
     Wake(Vec<JobId>),
 }
@@ -271,7 +317,12 @@ impl Controller {
         // Background jobs it started, with their commands, and the job notes it was given, in order.
         let mut history: Vec<jobs::Seen> = Vec::new();
         let mut commands: Vec<(ActionId, String)> = Vec::new();
+        // Stored sessions from before Stage 7 were never scrubbed, and a session's own record
+        // was scrubbed with another session's key: all of it is scrubbed again on the way back
+        // to the agent (D-074). Each secret is told once.
+        let mut found: Vec<scrub::Found> = Vec::new();
         for message in record.messages {
+            let Some(message) = self.scrub_resumed(message, &mut found) else { continue };
             match &message.content {
                 Content::Action { request } => {
                     if let Action::Sandbox { action: SandboxAction::Exec { command, background: true, .. } } =
@@ -314,6 +365,7 @@ impl Controller {
             }
             conversation.push(message);
         }
+        self.warn(None, &found, &RedactionSource::ResumedHistory, &[]);
         self.next_turn = turns;
         self.session = Some(Session { id: record.info.id.clone(), primer, conversation });
         for request in unanswered {
@@ -336,6 +388,31 @@ impl Controller {
         Ok(record.info)
     }
 
+    /// A stored message, scrubbed for the agent and the UI; what was found is added to `found`.
+    /// `None` drops it: reasoning that holds a secret (stored before reasoning was checked, see
+    /// [`Self::for_record`]), or a message that can't be checked.
+    fn scrub_resumed(&self, message: Message, found: &mut Vec<scrub::Found>) -> Option<Message> {
+        let scrubber = &self.config.scrubber;
+        let mut clean = |text: &str| {
+            let scrubbed = scrubber.scrub(text);
+            found.extend(scrubbed.found);
+            scrubbed.text
+        };
+        let content = match message.content {
+            Content::Text { text } => Content::Text { text: clean(&text) },
+            Content::Summary { text } => Content::Summary { text: clean(&text) },
+            Content::Action { request } => {
+                Content::Action { request: self.checked(scrub_strings(&request, &mut clean))? }
+            }
+            Content::Observation { observation } => {
+                Content::Observation { observation: self.checked(scrub_strings(&observation, &mut clean))? }
+            }
+            Content::Reasoning { data, .. } if holds_secret(scrubber, &data) => return None,
+            reasoning @ Content::Reasoning { .. } => reasoning,
+        };
+        Some(Message { content, ..message })
+    }
+
     /// Emits the session start events and gathers the primer. A failing primer is reported as
     /// an [`Event::Error`] and the session starts unprimed.
     async fn begin(&mut self, session: &SessionId) -> Primer {
@@ -349,7 +426,15 @@ impl Controller {
             self.emit(Event::SourceStatus { source });
         }
         match self.knowledge.primer(&self.config.workspace).await {
-            Ok(primer) => primer,
+            Ok(mut primer) => {
+                // It goes into every request's instructions (D-074).
+                for section in &mut primer.sections {
+                    let source = RedactionSource::Knowledge { source: section.source.clone() };
+                    section.title = self.scrubbed(None, &section.title, &source);
+                    section.body = self.scrubbed(None, &section.body, &source);
+                }
+                primer
+            }
             Err(err) => {
                 self.emit(Event::Error { turn: None, message: format!("could not load the session primer: {err}") });
                 Primer::default()
@@ -379,10 +464,10 @@ impl Controller {
                 None => self.idle(&mut commands, &mut sandbox, wakes).await,
             };
             let opening = match next {
-                Next::Command(Command::UserMessage(text)) => {
+                Next::Command(Command::UserMessage(message)) => {
                     jobs::lock(&self.jobs).user_spoke();
                     wakes = 0;
-                    Opening::User(text)
+                    Opening::User(message)
                 }
                 Next::Command(Command::Note(text)) => {
                     self.note(text).await;
@@ -406,7 +491,7 @@ impl Controller {
             let turn = TurnId::new(format!("turn-{}", self.next_turn));
             self.next_turn += 1;
             cancel_tx.send_replace(false);
-            let (watch, sink) = (self.jobs.clone(), self.events.clone());
+            let (watch, sink, scrubber) = (self.jobs.clone(), self.events.clone(), self.config.scrubber.clone());
             {
                 let turn_future = self.run_turn(opening, &turn);
                 tokio::pin!(turn_future);
@@ -427,7 +512,7 @@ impl Controller {
                                 listening = false;
                             }
                         },
-                        event = next_event(&mut sandbox) => observe(&watch, &*sink, event),
+                        event = next_event(&mut sandbox) => observe(&watch, &*sink, &scrubber, event),
                     }
                 }
             }
@@ -465,7 +550,7 @@ impl Controller {
             };
             tokio::select! {
                 command = commands.recv() => return Next::Command(command.unwrap_or(Command::Shutdown)),
-                event = next_event(sandbox) => observe(&self.jobs, &*self.events, event),
+                event = next_event(sandbox) => observe(&self.jobs, &*self.events, &self.config.scrubber, event),
                 () = timer => return Next::Wake,
             }
         }
@@ -593,18 +678,18 @@ impl Controller {
     /// system message saying so (recorded, so a resumed session reads naturally); the job notes
     /// follow at its first step.
     async fn run_turn(&mut self, opening: Opening, turn: &TurnId) {
-        let message = match opening {
-            Opening::User(text) => {
+        match opening {
+            Opening::User(message) => {
                 self.emit(Event::TurnStarted { turn: turn.clone() });
-                Message::text(Role::User, text, self.now())
+                self.record_user(turn, message).await;
             }
             Opening::Wake(jobs) => {
                 self.emit(Event::WakeUp { turn: turn.clone(), jobs });
                 self.emit(Event::TurnStarted { turn: turn.clone() });
-                Message::text(Role::System, WAKE, self.now())
+                let message = Message::text(Role::System, WAKE, self.now());
+                self.record_message(turn, message, true).await;
             }
-        };
-        self.record_message(turn, message, true).await;
+        }
         // "Undo this turn" goes back to here.
         let cancel = self.cancel.clone();
         if cancellable(&cancel, self.checkpoint(turn, None)).await.is_none() {
@@ -742,14 +827,15 @@ impl Controller {
     /// interrupt while asking or running still closes the action with an observation, so the
     /// history never holds a proposal without its result.
     async fn act(&mut self, turn: &TurnId, request: ActionRequest) -> Flow {
-        let verdict = match policy::gate(&request) {
+        let (verdict, asking) = policy::gate(&request);
+        let verdict = match verdict {
             Verdict::Ask(reason) => {
                 self.emit(Event::ApprovalNeeded {
                     turn: turn.clone(),
                     request: request.clone(),
                     reason: reason.clone(),
                 });
-                match cancellable(&self.cancel, self.approvals.ask(&request, &reason)).await {
+                match cancellable(&self.cancel, self.approvals.ask(&request, &reason, asking)).await {
                     Some(Verdict::Allow) => Verdict::Allow,
                     // The port must answer Allow or Deny; anything else counts as a denial.
                     Some(Verdict::Deny(reason) | Verdict::Ask(reason)) => Verdict::Deny(reason),
@@ -790,8 +876,11 @@ impl Controller {
                 }
                 match cancellable(&self.cancel, self.route(&request)).await {
                     None => (Observation::failed(request.id.clone(), INTERRUPTED), Flow::Cancelled),
-                    Some(Ok(observation)) => {
+                    Some(Ok(mut observation)) => {
                         self.watch_started(&request, &observation);
+                        if let Some(warning) = placeholder_warning(&request, &observation) {
+                            observation.warnings.push(warning);
+                        }
                         (observation, Flow::Continue)
                     }
                     Some(Err(message)) => {
@@ -846,13 +935,20 @@ impl Controller {
         observation: Observation,
         checkpoint: Option<CheckpointId>,
     ) {
+        // Scrubbed before anyone sees it: the UI, the agent and the record (D-074).
+        let observation = self.scrub_observation(Some(turn), &request, observation);
         self.emit(Event::ActionFinished { turn: turn.clone(), observation: observation.clone() });
-        let record =
-            ActionRecord { request, verdict, observation: Some(observation.clone()), checkpoint, at: self.now() };
+        let record = self.request_for_record(&request).map(|request| ActionRecord {
+            request,
+            verdict,
+            observation: Some(observation.clone()),
+            checkpoint,
+            at: self.now(),
+        });
         let message =
             Message { role: Role::Observation, content: Content::Observation { observation }, at: self.now() };
         self.record_message(turn, message, false).await;
-        if let Some(id) = self.session_id() {
+        if let (Some(id), Some(record)) = (self.session_id(), record) {
             if let Err(err) = self.store.append_action(&id, record).await {
                 let message = format!("could not save the action: {err}");
                 self.emit(Event::Error { turn: Some(turn.clone()), message });
@@ -863,22 +959,163 @@ impl Controller {
     /// Saves a message to the store only: the brain never sees it.
     async fn store_message(&mut self, turn: &TurnId, message: &Message) {
         let Some(id) = self.session_id() else { return };
-        if let Err(err) = self.store.append_message(&id, message.clone()).await {
+        let Some(message) = self.for_record(message) else { return };
+        if let Err(err) = self.store.append_message(&id, message).await {
             self.emit(Event::Error { turn: Some(turn.clone()), message: format!("could not save the message: {err}") });
         }
     }
 
     /// Adds a message to the conversation and the store; optionally announces it.
+    ///
+    /// Nixxa's own notes are scrubbed here (they can quote a path or an error); observations
+    /// were scrubbed in [`Self::finish_action`]. The agent's own output isn't scrubbed for the
+    /// agent (it knows only what it was given), but its stored form is, in case it repeats a
+    /// value the user chose to send as it is.
     async fn record_message(&mut self, turn: &TurnId, message: Message, announce: bool) {
+        let message = match (&message.role, &message.content) {
+            (Role::System | Role::User, Content::Text { text }) => {
+                let source = if text.contains(jobs::NOTE) {
+                    RedactionSource::JobNote
+                } else if message.role == Role::User {
+                    RedactionSource::UserMessage
+                } else {
+                    RedactionSource::Notice
+                };
+                let scrubbed = self.config.scrubber.scrub(text);
+                self.warn(Some(turn), &scrubbed.found, &source, &[]);
+                Message { content: Content::Text { text: scrubbed.text }, ..message }
+            }
+            _ => message,
+        };
+        let record = self.for_record(&message);
+        self.keep(turn, message, record, announce).await;
+    }
+
+    /// The user's message: scrubbed for the agent but for the values they chose to send, and
+    /// fully for the record (D-077).
+    async fn record_user(&mut self, turn: &TurnId, message: UserMessage) {
+        let source = if message.from_terminal { RedactionSource::TerminalShare } else { RedactionSource::UserMessage };
+        let for_agent = self.config.scrubber.scrub_except(&message.text, &message.send_anyway);
+        self.warn(Some(turn), &for_agent.found, &source, &message.send_anyway);
+        let record = self.config.scrubber.scrub(&message.text).text;
+        let now = self.now();
+        let (for_agent, record) =
+            (Message::text(Role::User, for_agent.text, now), Message::text(Role::User, record, now));
+        self.keep(turn, for_agent, Some(record), true).await;
+    }
+
+    /// Adds `for_agent` to the conversation and `for_record` to the store; optionally announces
+    /// the record's form.
+    async fn keep(&mut self, turn: &TurnId, for_agent: Message, for_record: Option<Message>, announce: bool) {
         let Some(session) = self.session.as_mut() else { return };
-        session.conversation.push(message.clone());
+        session.conversation.push(for_agent);
         let id = session.id.clone();
-        if let Err(err) = self.store.append_message(&id, message.clone()).await {
+        let Some(for_record) = for_record else { return };
+        if let Err(err) = self.store.append_message(&id, for_record.clone()).await {
             self.emit(Event::Error { turn: Some(turn.clone()), message: format!("could not save the message: {err}") });
         }
         if announce {
-            self.emit(Event::Message { turn: turn.clone(), message });
+            self.emit(Event::Message { turn: turn.clone(), message: for_record });
         }
+    }
+
+    /// Tells the UI about each secret found, once per placeholder.
+    fn warn(&self, turn: Option<&TurnId>, found: &[scrub::Found], source: &RedactionSource, sent: &[String]) {
+        let mut told: Vec<&str> = Vec::new();
+        for found in found {
+            if told.contains(&found.placeholder.as_str()) {
+                continue;
+            }
+            told.push(&found.placeholder);
+            self.events.emit(Event::SecretRedacted {
+                turn: turn.cloned(),
+                kind: found.kind.clone(),
+                source: source.clone(),
+                placeholder: found.placeholder.clone(),
+                sent: sent.contains(&found.placeholder),
+            });
+        }
+    }
+
+    /// `text` scrubbed, each secret told to the UI as coming from `source`.
+    fn scrubbed(&self, turn: Option<&TurnId>, text: &str, source: &RedactionSource) -> String {
+        let scrubbed = self.config.scrubber.scrub(text);
+        self.warn(turn, &scrubbed.found, source, &[]);
+        scrubbed.text
+    }
+
+    /// An observation with every text in it scrubbed: what the action returned, and the URLs
+    /// its commands requested (D-074).
+    fn scrub_observation(
+        &self,
+        turn: Option<&TurnId>,
+        request: &ActionRequest,
+        mut observation: Observation,
+    ) -> Observation {
+        let source = &observation_source(request);
+        let clean = |text: &mut String| *text = self.scrubbed(turn, text, source);
+        match &mut observation.outcome {
+            Outcome::Exec { stdout, stderr, .. } => {
+                clean(stdout);
+                clean(stderr);
+            }
+            Outcome::Text { content } | Outcome::File { content, .. } => clean(content),
+            Outcome::Patched { diff, .. } => clean(diff),
+            Outcome::Listing { entries } => entries.iter_mut().for_each(|entry| clean(&mut entry.name)),
+            Outcome::Recorded { location: Some(text) }
+            | Outcome::Denied { reason: text }
+            | Outcome::Failed { message: text } => clean(text),
+            Outcome::Recorded { location: None } | Outcome::Written { .. } | Outcome::Started { .. } => {}
+        }
+        let network = RedactionSource::NetworkRequest { action: observation.action_id.clone() };
+        for request in &mut observation.network {
+            if let Some(url) = request.url.as_mut() {
+                *url = self.scrubbed(turn, url, &network);
+            }
+        }
+        observation
+    }
+
+    /// The stored form of a message: every text in it scrubbed, without telling the UI (what
+    /// enters the agent's context was scrubbed, and told, on the way in). `None` when it isn't
+    /// stored at all:
+    ///
+    /// * Reasoning is opaque provider data, signed by some providers, so it can't be scrubbed;
+    ///   a block that holds a secret (the model repeating a value the user chose to send as it
+    ///   is) is not stored (D-077), and a resumed session goes without it (D-024).
+    /// * A message that can't be checked for secrets is not stored either, and the UI is told.
+    fn for_record(&self, message: &Message) -> Option<Message> {
+        let scrubber = &self.config.scrubber;
+        let content = match &message.content {
+            Content::Text { text } => Content::Text { text: scrubber.scrub(text).text },
+            Content::Summary { text } => Content::Summary { text: scrubber.scrub(text).text },
+            Content::Action { request } => Content::Action { request: self.request_for_record(request)? },
+            Content::Observation { observation } => {
+                let observation = scrub_strings(observation, |text| scrubber.scrub(text).text);
+                Content::Observation { observation: self.checked(observation)? }
+            }
+            Content::Reasoning { data, .. } => {
+                if holds_secret(scrubber, data) {
+                    return None;
+                }
+                message.content.clone()
+            }
+        };
+        Some(Message { content, ..message.clone() })
+    }
+
+    /// The stored form of a request: the agent may repeat a value the user sent as it is.
+    fn request_for_record(&self, request: &ActionRequest) -> Option<ActionRequest> {
+        self.checked(scrub_strings(request, |text| self.config.scrubber.scrub(text).text))
+    }
+
+    /// `scrubbed`, or the UI told that something couldn't be checked for secrets and so was
+    /// not kept.
+    fn checked<T>(&self, scrubbed: Option<T>) -> Option<T> {
+        if scrubbed.is_none() {
+            self.emit(Event::Error { turn: None, message: UNCHECKED.into() });
+        }
+        scrubbed
     }
 
     /// Everything the brain needs for one think step.
@@ -913,7 +1150,19 @@ impl Controller {
         (self.config.clock)()
     }
 
+    /// Sends `event` to the UI. Error words can quote what failed, so they are scrubbed.
     fn emit(&self, event: Event) {
+        let event = match event {
+            Event::Error { turn, message } => {
+                let message = self.scrubbed(turn.as_ref(), &message, &RedactionSource::Notice);
+                Event::Error { turn, message }
+            }
+            Event::NotUndoable { turn, before, reason } => {
+                let reason = self.scrubbed(Some(&turn), &reason, &RedactionSource::Notice);
+                Event::NotUndoable { turn, before, reason }
+            }
+            other => other,
+        };
         self.events.emit(event);
     }
 }
@@ -933,10 +1182,91 @@ async fn next_event(sandbox: &mut Option<futures::stream::BoxStream<'static, San
 }
 
 /// Notes the end of a job the agent started, and tells the UI.
-fn observe(watch: &jobs::Shared, sink: &dyn EventSink, event: Option<SandboxEvent>) {
+/// The UI's event is scrubbed (the sandbox's words can quote the job's output); the note the
+/// agent gets is scrubbed, and its redactions told, when it is given.
+fn observe(watch: &jobs::Shared, sink: &dyn EventSink, scrubber: &Scrubber, event: Option<SandboxEvent>) {
     let Some(event) = event else { return };
-    if let Some(event) = jobs::lock(watch).observe(event) {
+    if let Some(mut event) = jobs::lock(watch).observe(event) {
+        if let Event::JobFinished { command, status, .. } = &mut event {
+            *command = scrubber.scrub(command).text;
+            *status = scrubber.scrub(status).text;
+        }
         sink.emit(event);
+    }
+}
+
+/// When the agent wrote a secret's placeholder into a file: the file holds the placeholder, not
+/// the secret, and the agent is told so (D-074).
+fn placeholder_warning(request: &ActionRequest, observation: &Observation) -> Option<String> {
+    let (path, count) = match (&request.action, &observation.outcome) {
+        (Action::Sandbox { action: SandboxAction::WriteFile { path, content } }, Outcome::Written { .. }) => {
+            (path, scrub::placeholders_in(content))
+        }
+        (Action::Sandbox { action: SandboxAction::Patch { path, edits, .. } }, Outcome::Patched { .. }) => {
+            (path, edits.iter().map(|edit| scrub::placeholders_in(&edit.replace)).sum())
+        }
+        _ => return None,
+    };
+    (count > 0).then(|| {
+        format!(
+            "`{path}` now contains {count} secret placeholder{} (‹secret:…›), not the secret{}: Nixxa replaced the \
+             value before you saw it, so you never had it. If the file needs the real value, tell the user, who can put \
+             it in themselves",
+            if count == 1 { "" } else { "s" },
+            if count == 1 { "" } else { "s" },
+        )
+    })
+}
+
+/// Where an action's result comes from, for the redaction warnings.
+fn observation_source(request: &ActionRequest) -> RedactionSource {
+    let action = request.id.clone();
+    match &request.action {
+        Action::Sandbox { action: SandboxAction::ReadFile { path } } => {
+            RedactionSource::FileRead { path: path.clone() }
+        }
+        Action::Sandbox { action: SandboxAction::Patch { path, .. } } => {
+            RedactionSource::FileEdit { path: path.clone() }
+        }
+        Action::Sandbox { action: SandboxAction::Exec { .. } } => RedactionSource::CommandOutput { action },
+        Action::Sandbox { action: SandboxAction::JobOutput { job, .. } | SandboxAction::JobStatus { job } } => {
+            RedactionSource::JobOutput { job: job.clone() }
+        }
+        Action::Knowledge { action: KnowledgeAction::Call { source, .. } | KnowledgeAction::Record { source, .. } } => {
+            RedactionSource::Knowledge { source: source.clone() }
+        }
+        Action::Sandbox { .. } => RedactionSource::ActionResult { action },
+    }
+}
+
+/// `value` with `scrub` applied to every string inside it (through its JSON form), keys aside.
+/// `None` when it doesn't round-trip through JSON: the caller then keeps nothing rather than the
+/// value unscrubbed. Contract types always do (they are stored that way).
+fn scrub_strings<T: serde::Serialize + serde::de::DeserializeOwned>(
+    value: &T,
+    mut scrub: impl FnMut(&str) -> String,
+) -> Option<T> {
+    let mut json = serde_json::to_value(value).ok()?;
+    scrub_json(&mut json, &mut scrub);
+    serde_json::from_value(json).ok()
+}
+
+fn scrub_json(value: &mut serde_json::Value, scrub: &mut dyn FnMut(&str) -> String) {
+    match value {
+        serde_json::Value::String(text) => *text = scrub(text),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(|item| scrub_json(item, scrub)),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(|field| scrub_json(field, scrub)),
+        _ => {}
+    }
+}
+
+/// Whether any string inside `value` holds a secret.
+fn holds_secret(scrubber: &scrub::Scrubber, value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => !scrubber.find(text).is_empty(),
+        serde_json::Value::Array(items) => items.iter().any(|item| holds_secret(scrubber, item)),
+        serde_json::Value::Object(fields) => fields.values().any(|field| holds_secret(scrubber, field)),
+        _ => false,
     }
 }
 

@@ -53,6 +53,10 @@ claude-mem or the model's context. See [ARCHITECTURE.md § 6](../ARCHITECTURE.md
   is a `Credential::BearerToken` (no expiry) stored under `openrouter` with method `SignIn`, like
   an API key. OpenRouter keys can only be revoked with a management key, so removing the account
   deletes the keychain entry and the user revokes the key in OpenRouter's settings.
+- **Fingerprints (Stage 7, D-075):** `fingerprints()` gives the controller's scrubber salted
+  fingerprints of every API key and token held, environment ones included (`src/fingerprint.rs`,
+  a fresh salt from `ring` per call), never the secrets; a base URL or a cloud profile name isn't
+  a secret and isn't included.
 - **Threading:** keychain calls run on tokio's blocking pool, so use it inside a tokio runtime.
 - **In memory:** `KeychainCredentials::in_memory` behaves the same but keeps everything in
   memory, for tests and offline demos.

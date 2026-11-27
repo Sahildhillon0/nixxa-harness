@@ -172,11 +172,13 @@ async fn only_the_last_part_of_a_jobs_output_is_kept() {
     config.jobs.output_cap = 1000;
     let Some(sb) = sandbox_with(config) else { return };
     let mut events = sb.subscribe();
-    let job = start(&sb, "head -c 50000 /dev/zero | tr '\\0' a; echo END").await;
+    let job = start(&sb, "yes 'abcd efgh' | head -c 50002; echo END").await;
     assert_eq!(finished(&mut events, &job).await, (Some(0), true), "the job runs on, its output cut");
     let output = text(&sb, SandboxAction::JobOutput { job, tail_bytes: 1_000_000 }).await;
-    assert!(output.contains("--- stdout (last 1000 bytes, earlier output dropped) ---\n"), "{output}");
-    assert!(output.contains(&format!("{}END\n", "a".repeat(996))), "{output}");
+    // The last 1000 bytes start inside a line: that line may hold the end of a secret, or a
+    // value without its name, so it goes (D-074).
+    assert!(output.contains("--- stdout (last 996 bytes, earlier output dropped) ---\nabcd efgh\n"), "{output}");
+    assert!(output.contains("abcd efgh\nabEND\n"), "{output}");
 }
 
 #[tokio::test]

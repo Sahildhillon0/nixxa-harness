@@ -164,5 +164,14 @@ out, actions without a checkpoint, and that the agent's jobs are stopped first. 
 stale view. Patches show `+added -removed` in the activity pane and their diff in the details;
 reads show their hash. Everything from the workspace goes through `safe::line`.
 
+**Secrets (D-075, D-077):** each session gets its own `Scrubber` (`tui.rs`), given the
+fingerprints of every key the accounts hold, and again after an account is saved; the app keeps
+the same one. While the user writes, the message pane lists each secret and its placeholder;
+`alt+1`…`alt+9` lets one go as it is, for that message only, and a terminal share is marked as
+one. Each `Event::SecretRedacted` is a conversation note and a `⚠ secret` activity line. The
+approval port asks even in Auto when the controller says `Asking::Always`. Logs hold the kind and
+where from; free text in them is scrubbed again. `stage_seven_a_planted_key_never_reaches_the_provider_or_the_database`
+is the exit criterion against the real SQLite file.
+
 Not yet: plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
 knowledge panel (Stage 10), slash commands other than `/undo` (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.

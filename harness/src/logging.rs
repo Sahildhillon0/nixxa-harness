@@ -3,11 +3,16 @@
 //!
 //! Only metadata is logged (ids, kinds, verdicts, error messages), never message text or action
 //! output, which can hold file contents. Secrets cannot reach a log: `Credential` redacts
-//! itself, and the controller never sees one.
+//! itself, and the controller never sees one. The free text that is logged (error words, the
+//! reason an action can't be undone) comes scrubbed from the controller, and is scrubbed again
+//! here, with a scrubber of the log's own (D-074): a log outlives the session.
 
 use std::path::{Path, PathBuf};
 
-use nixxa_contracts::{Action, Event, KnowledgeAction, Outcome, Verdict};
+use std::sync::OnceLock;
+
+use nixxa_contracts::{Action, Event, KnowledgeAction, Outcome, RedactionSource, Verdict};
+use nixxa_controller::scrub::Scrubber;
 use tracing::Level;
 
 use crate::safe;
@@ -68,7 +73,7 @@ pub(crate) fn event(event: &Event) {
         ),
         Event::Error { turn, message } => {
             let turn = turn.as_ref().map(ToString::to_string).unwrap_or_default();
-            tracing::warn!(turn, message = %safe::line(message), "controller error");
+            tracing::warn!(turn, message = %clean(message), "controller error");
         }
         Event::Usage { account, usage } => tracing::debug!(
             account = %safe::line(&account.to_string()),
@@ -93,7 +98,7 @@ pub(crate) fn event(event: &Event) {
         }
         Event::NotUndoable { turn, before, reason } => {
             let before = before.as_ref().map(|id| safe::line(id.as_str())).unwrap_or_default();
-            tracing::warn!(%turn, before, reason = %safe::line(reason), "no checkpoint: can't be undone");
+            tracing::warn!(%turn, before, reason = %clean(reason), "no checkpoint: can't be undone");
         }
         // How many paths, never which (paths are the agent's).
         Event::Restored { checkpoint, undone } => tracing::info!(
@@ -101,6 +106,12 @@ pub(crate) fn event(event: &Event) {
             paths = undone.changes.len(),
             "workspace restored"
         ),
+        // The kind and where from; never the placeholder, a path or the value.
+        Event::SecretRedacted { turn, kind, source, sent, .. } => {
+            let turn = turn.as_ref().map(ToString::to_string).unwrap_or_default();
+            let from = source_kind(source);
+            tracing::info!(turn, kind = %safe::line(kind), from, sent, "secret redacted");
+        }
         // Message text and streamed tokens are content, not metadata.
         Event::Message { .. } | Event::TextDelta { .. } | Event::ApprovalNeeded { .. } => {}
     }
@@ -130,6 +141,33 @@ fn action_kind(action: &Action) -> &'static str {
         },
         Action::Knowledge { action: KnowledgeAction::Call { .. } } => "knowledge-call",
         Action::Knowledge { action: KnowledgeAction::Record { .. } } => "knowledge-record",
+    }
+}
+
+/// Free text for the log: scrubbed, on one line. Without a scrubber (no random source) it is
+/// left out rather than written as it is.
+fn clean(text: &str) -> String {
+    static SCRUBBER: OnceLock<Option<Scrubber>> = OnceLock::new();
+    match SCRUBBER.get_or_init(|| Scrubber::new().ok()) {
+        Some(scrubber) => safe::line(&scrubber.scrub(text).text),
+        None => "[left out: no secret scrubber]".to_string(),
+    }
+}
+
+fn source_kind(source: &RedactionSource) -> &'static str {
+    match source {
+        RedactionSource::UserMessage => "user-message",
+        RedactionSource::TerminalShare => "terminal-share",
+        RedactionSource::FileRead { .. } => "file-read",
+        RedactionSource::FileEdit { .. } => "file-edit",
+        RedactionSource::CommandOutput { .. } => "command-output",
+        RedactionSource::JobOutput { .. } => "job-output",
+        RedactionSource::JobNote => "job-note",
+        RedactionSource::NetworkRequest { .. } => "network-request",
+        RedactionSource::Knowledge { .. } => "knowledge",
+        RedactionSource::ActionResult { .. } => "action-result",
+        RedactionSource::Notice => "notice",
+        RedactionSource::ResumedHistory => "resumed-history",
     }
 }
 
@@ -258,6 +296,20 @@ pub(crate) mod tests {
                 ),
             });
             event(&Event::Error { turn: Some(turn.clone()), message: "boom\x1b]0;x\x07".into() });
+            // Free text that is logged is scrubbed here too, whatever the controller did.
+            event(&Event::Error { turn: None, message: "bad key AKIAIOSFODNN7EXAMPLE".into() });
+            event(&Event::NotUndoable {
+                turn: turn.clone(),
+                before: None,
+                reason: "can't read postgres://app:hunter5@db/x".into(),
+            });
+            event(&Event::SecretRedacted {
+                turn: Some(turn.clone()),
+                kind: "aws-access-key".into(),
+                source: nixxa_contracts::RedactionSource::FileRead { path: "secret-plans.env".into() },
+                placeholder: "‹secret:aws-access-key#abcd›".into(),
+                sent: false,
+            });
             // A patch's diff and a restore's paths are the agent's content.
             event(&Event::ActionFinished {
                 turn: turn.clone(),
@@ -299,11 +351,26 @@ pub(crate) mod tests {
             "checkpoint=run.1",
             "workspace restored",
             "paths=1",
+            "secret redacted",
+            "kind=aws-access-key",
+            "from=\"file-read\"",
+            "‹secret:aws-access-key#",
         ] {
             assert!(log.contains(expected), "missing {expected:?} in:\n{log}");
         }
-        for leaked in ["my password", "cat secret.txt", "hunter2", "hunter3", "hunter4", "secret-plans", "\x1b", "\x07"]
-        {
+        for leaked in [
+            "my password",
+            "cat secret.txt",
+            "hunter2",
+            "hunter3",
+            "hunter4",
+            "hunter5",
+            "IOSFODNN7",
+            "secret-plans",
+            "#abcd",
+            "\x1b",
+            "\x07",
+        ] {
             assert!(!log.contains(leaked), "{leaked:?} reached the log:\n{log}");
         }
     }

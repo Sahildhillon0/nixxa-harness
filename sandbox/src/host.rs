@@ -478,6 +478,12 @@ async fn capped(mut stream: impl AsyncRead + Unpin) -> String {
             }
         }
     }
+    if dropped > 0 {
+        // Never through a token (D-074).
+        let keep = crate::cut::end(&kept);
+        dropped += kept.len() - keep;
+        kept.truncate(keep);
+    }
     let mut text = String::from_utf8_lossy(&kept).into_owned();
     if dropped > 0 {
         text.push_str(&format!("\n… [{dropped} more bytes not shown]"));
@@ -975,15 +981,14 @@ mod tests {
     #[tokio::test]
     async fn long_output_is_cut() {
         let sandbox = host(&scratch());
-        let Outcome::Exec { stdout, .. } = run_action(&sandbox, exec("head -c 100000 /dev/zero | tr '\\0' a")).await
-        else {
+        let Outcome::Exec { stdout, .. } = run_action(&sandbox, exec("yes 'abcd efgh' | head -c 100000")).await else {
             panic!("expected exec")
         };
-        assert!(stdout.starts_with(&"a".repeat(OUTPUT_CAP)));
-        assert!(
-            stdout.ends_with(&format!("[{} more bytes not shown]", 100_000 - OUTPUT_CAP)),
-            "{}",
-            &stdout[OUTPUT_CAP..]
-        );
+        let (kept, note) = stdout.split_once("\n… [").expect("a note on what was cut");
+        assert!(kept.starts_with("abcd efgh\nabcd efgh\n"));
+        // The cap falls inside a line: the cut moves back to the line break (D-074).
+        assert_eq!(kept.len(), OUTPUT_CAP / 10 * 10);
+        assert!(kept.ends_with("abcd efgh\n"), "{}", &kept[kept.len() - 20..]);
+        assert_eq!(note, format!("{} more bytes not shown]", 100_000 - kept.len()));
     }
 }

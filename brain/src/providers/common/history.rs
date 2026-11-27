@@ -76,6 +76,9 @@ pub(crate) fn observation_text(observation: &Observation) -> (String, bool) {
         text = "(no output)".to_string();
     }
     text.push_str(&network_text(&observation.network));
+    for warning in &observation.warnings {
+        text.push_str(&format!("\n[nixxa: {warning}]"));
+    }
     (text, is_error)
 }
 
@@ -176,6 +179,9 @@ mod tests {
             o(Outcome::Recorded { location: Some("Sessions/a.md".into()) }),
             ("Recorded at Sessions/a.md.".into(), false)
         );
+        let mut warned = Observation::new(ActionId::new("x"), Outcome::Written { bytes: 3 });
+        warned.warnings.push("the file holds a placeholder".into());
+        assert_eq!(observation_text(&warned).0, "Wrote 3 bytes.\n[nixxa: the file holds a placeholder]");
         let mut truncated = Observation::new(ActionId::new("x"), Outcome::Text { content: "abc".into() });
         truncated.truncated = true;
         assert_eq!(observation_text(&truncated).0, "abc\n[output truncated]");

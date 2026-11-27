@@ -178,10 +178,13 @@ internal is `pub(crate)`.
 | `Primer` | Context gathered at session start from knowledge sources (recent memory, project note) |
 | `AccountRef` | Which account to use: provider id + account label (e.g. `anthropic:work`). Not a secret |
 | `Credential` | A secret wrapper (`ApiKey`, `BearerToken`, `CloudProfile`, `None`) whose `Debug`/`Display` print `***`; zeroised on drop |
-| `Observation` | A result: output, error, timing, truncation flag, source. A file read is `Outcome::File { content, hash }`; a patch is `Outcome::Patched { diff, hash }` |
+| `Observation` | A result: output, error, timing, truncation flag, source, and Nixxa's warnings about it. A file read is `Outcome::File { content, hash }`; a patch is `Outcome::Patched { diff, hash }` |
 | `CheckpointId`, `WorkspaceDiff` | A workspace checkpoint (for undo), and what changed between two states: per path, what was there before and after (`File { size, mode, hash }`, `Dir`, `Symlink { target }`) and a unified diff for text |
 | `Verdict` | The policy gate's answer: `Allow`, `Ask(reason)`, `Deny(reason)` |
-| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, a background job finished, a wake-up, a checkpoint taken (or not), a restore, turn done |
+| `Asking` | Whether the approval mode may answer for the human (`ByMode`), or the human is asked even in Auto (`Always`) |
+| `SecretFingerprints` | Salted fingerprints of the secrets Nixxa holds, built by `accounts`; `find(text)` gives where one occurs, exactly. Holds no secret |
+| `RedactionSource` | Where a redacted secret came from: the user's message, a terminal share, a file read or edit, command or job output, a job note, a network URL, a knowledge result, a notice, resumed history |
+| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, a background job finished, a wake-up, a checkpoint taken (or not), a restore, a secret redacted, turn done |
 
 ### Traits
 
@@ -191,9 +194,9 @@ internal is `pub(crate)`.
 | `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request); open_terminal(size) → `OpenTerminal` (the user's `ctrl+t` shell); checkpoint() → `CheckpointId`; restore(id) → what it undid; diff(from, to or now) → `WorkspaceDiff` |
 | `Terminal` | `sandbox` | write(input); resize(size); close(). Dropping it closes the terminal |
 | `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
-| `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
+| `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method); fingerprints() → `SecretFingerprints` of every secret held |
 | `Knowledge` | `knowledge` | sources() → status of each; tools() → tool specs of ready sources; primer(workspace) → `Primer`; call(id, source, tool, args) → observation; record(id, source, entry) → observation |
-| `ApprovalPort` | `harness` | ask the human about an action → `Verdict` |
+| `ApprovalPort` | `harness` | ask the human about an action (`Asking::Always`: even in Auto) → `Verdict` |
 | `EventSink` | `harness` | receive `Event`s from the controller |
 
 The controller consumes `Brain`, `Sandbox`, `Store`, `Knowledge`, `ApprovalPort` and
@@ -279,6 +282,15 @@ removes what was created since; an older checkpoint restores after a newer one; 
   taken just before the action; serde default). Events: `Checkpoint { turn, checkpoint, before }`
   (`before` = the action, `None` = the start of the turn), `NotUndoable { turn, before, reason }`,
   and `Restored { checkpoint, undone }` (D-070 to D-073).
+- **Secret redaction (#3):** `Event::SecretRedacted { turn, kind, source: RedactionSource,
+  placeholder, sent }` (never the value; the placeholder's tag is a keyed hash);
+  `Credentials::fingerprints()` → `SecretFingerprints` (salted SHA-256 plus a keyed rolling hash
+  per secret, a random salt per run; `find(text)` is a Rabin–Karp scan confirmed by the salted
+  hash; the algorithm lives with the type so the side that builds and the side that matches
+  hash alike); `ApprovalPort::ask(request, reason, Asking)`, where `Asking::Always` asks even in
+  Auto; `Observation.warnings` (serde default), what Nixxa adds about a result. The credentials
+  suite checks that every key held is found exactly, that nothing of it shows in `Debug`, and
+  that a replaced or removed key is no longer found (D-074 to D-077).
 
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
@@ -289,7 +301,7 @@ These aren't in `contracts` yet. Each lands with the stage that needs it, as its
 | `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
 | `Verdict` provenance (`user`, `auto`, `plan`, `policy:<rule>`, `ci`) on every `ActionRecord` | audit (#4), CI (#12) |
-| `Event::SecretRedacted { kind, source }`, `Event::CheckResult`, `Event::NetworkRequest` | redaction (#3), test loop (#7), network log (#1) |
+| `Event::CheckResult`, `Event::NetworkRequest` | test loop (#7), network log (#1) |
 | `ProjectPolicy` (typed rules from `AGENTS.md`) in `ControllerConfig` | policy file (#5) |
 
 ---
@@ -333,6 +345,10 @@ sandbox action or knowledge call and records the interruption.
 ### Planned changes to the loop (§11)
 - **Before step 2:** everything entering the context (user text, observations, knowledge
   results) passes the **secret scrubber** (#3). What's stored is the scrubbed form too.
+  *Done in Stage 7 (D-074 to D-077):* the user's message (with the values they chose to send as
+  they are), every observation and its network URLs, Nixxa's notes, the primer, error words and a
+  resumed session's history; each secret found is an `Event::SecretRedacted`. Step 3 asks even
+  in Auto before reading a file that usually holds secrets.
 - **Step 3** gains two checks that run *before* any approval:
   - the **project policy** (#5): protected paths, denied commands;
   - in plan mode, **"is this in the approved plan?"** (#2). Anything outside the plan falls
@@ -511,7 +527,8 @@ recorded in the DESIGN.md decision log before it is built.
   shown, and approved, the first time they're used.
 - **Secret redaction is defence in depth, not a guarantee** (#3). The scrubber catches known
   key formats, high-entropy assignments and the exact secrets Nixxa itself holds (as
-  fingerprints from `accounts`). Reading files such as `.env` or `*.pem` asks first.
+  fingerprints from `accounts`). Reading files such as `.env` or `*.pem` asks first, even in
+  Auto. Encoded, split or computed secrets get through (D-074 to D-077).
 - **The ctrl+t terminal is the user, not the agent** (#16). It runs in the same place as the
   agent (inside the same sandbox for sandboxed places), so it has the same reach. What's typed
   there isn't approved or sent to the provider; it's recorded in the session log and shared
@@ -678,7 +695,7 @@ their stage.
   - in This directory, the user's own shell in that directory.
 - **It's you, not the agent:** nothing typed there is approved, scrubbed or sent to the
   provider. The session log records that a terminal was used, and a "share with the agent"
-  action sends a chosen part of its output as a message.
+  action sends a chosen part of its output as a message, scrubbed like any message (D-077).
 - **Daemon change:** it can't kill the user's shell when the agent's command ends, which is why
   Stage 6 moves the daemon to per-job tracking (§7).
 - **Done (D-066, D-067):** `Sandbox::open_terminal`; a PTY job in the daemon, the user's
@@ -716,8 +733,9 @@ their stage.
 - **What's scrubbed:** everything entering the brain's context: user messages, file reads,
   command output, knowledge results.
 - **Detectors:**
-  - known key formats: Anthropic, OpenAI, GitHub, AWS, GCP, Slack, Stripe, JWTs, PEM private
-    keys, connection strings with passwords;
+  - known key formats: Anthropic, OpenAI, GitHub, GitLab, Hugging Face, AWS, GCP, Slack,
+    Stripe, SendGrid, JWTs, PEM private keys (also base64-encoded), `Authorization` header
+    credentials, connection strings with passwords or account keys;
   - high-entropy values in `KEY=…`-style assignments;
   - exact matches of secrets Nixxa holds. `accounts` gives the controller salted fingerprints,
     never the secrets.
@@ -729,6 +747,12 @@ their stage.
 - **Sensitive files:** reading `.env`, `*.pem`, `id_*` and similar asks first, even in Auto.
 - **If the agent writes a placeholder into a file,** it's warned that the file contains a
   placeholder, not the secret.
+- **Done (D-074 to D-077):** the scrubber in `controller/src/scrub/` at every way into the
+  context and the record; cuts to fit the sandbox's caps keep whole lines and never split a
+  token (`sandbox/src/cut.rs`); reasoning that repeats a secret isn't stored; `SecretFingerprints` from `accounts`; `Asking::Always` for the files in
+  `controller/src/sensitive.rs`; in the harness, the message's secrets shown before sending with
+  `alt+1`…`alt+9` to send one as it is, a warning per redaction in the conversation and the
+  activity pane, and logs holding only the kind and where from.
 
 ### #5 Project policy file: `AGENTS.md` (harness + controller + sandbox)
 - **Where it's read:** the harness reads `AGENTS.md` at the workspace root (the cross-tool
@@ -989,6 +1013,10 @@ Every stage ends with something that runs and a checklist that must be true befo
     content-addressed store, taken by the controller before every file-changing action and at
     every turn; `/undo` and `ctrl-z` show the diff to now and restore between turns.
 - **Secret scrubbing and warnings (#3).**
+  - PR B (D-074 to D-077): done. The scrubber at every way into the context and the record,
+    fingerprints of the keys Nixxa holds, cuts that never split a token, `.env` and the like
+    asking even in Auto, the message preview with send-anyway per item, and a warning per
+    redaction.
 - **`AGENTS.md` policy (#5):** the prose goes into the agent's instructions, and the
   `nixxa-policy` block is enforced, including read-only mounts for protected paths.
 - **Exit:**
@@ -999,7 +1027,14 @@ Every stage ends with something that runs and a checklist that must be true befo
     restores in Sandbox (empty), This directory, Work on my files and Work on a copy; and the
     live run did it through `/undo`;
   - a fake key planted in a file never reaches the provider (checked with a recording brain) and
-    the user is warned;
+    the user is warned: met by PR B. `tests/redaction.rs` plants an AWS key pair at every way in
+    (message, terminal share, file read, command and job output, job note, patch diff, listing,
+    error, network URL, knowledge result, primer, a resumed unscrubbed session) and checks every
+    request the brain got, the store and the events; the harness's
+    `stage_seven_a_planted_key_never_reaches_the_provider_or_the_database` reads a planted `.env`
+    in This directory with `read_file` and `cat` against the real SQLite file; and the live run
+    did it through a recording proxy in front of LM Studio (`read_file`, `cat`, a background job,
+    a terminal share);
   - with `protect = ["migrations/**"]`, both a patch and a `rm` command fail to change
     `migrations/`.
 

@@ -3,14 +3,17 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use nixxa_contracts::RedactionSource;
 use nixxa_contracts::{
     AccountRef, ActionRequest, ApprovalMode, BrainInfo, Content, Event, Observation, Outcome, Role,
     SandboxCapabilities, SessionId, SourceInfo, Verdict,
 };
-use nixxa_controller::Command;
+use nixxa_controller::scrub::{Found, Scrubber};
+use nixxa_controller::{Command, UserMessage};
 
 use crate::ports::{AutoApprove, PendingApproval};
 use nixxa_accounts::methods::openrouter::KEYS_PAGE;
@@ -101,6 +104,27 @@ pub(crate) enum Happening {
     NotUndoable { label: String, reason: String },
     /// The user's undo put the workspace back (D-073).
     Restored { label: String, paths: usize },
+    /// A secret was replaced before it reached the agent, or sent as it is at the user's choice
+    /// (D-077).
+    Redacted { kind: String, from: String, placeholder: String, sent: bool },
+}
+
+/// Where a redacted secret was, in words.
+fn redaction_from(source: &RedactionSource) -> String {
+    match source {
+        RedactionSource::UserMessage => "your message".into(),
+        RedactionSource::TerminalShare => "the terminal lines in your message".into(),
+        RedactionSource::FileRead { path } => format!("`{path}`"),
+        RedactionSource::FileEdit { path } => format!("the edit of `{path}`"),
+        RedactionSource::CommandOutput { action } => format!("the output of command {action}"),
+        RedactionSource::JobOutput { job } => format!("the output of job {job}"),
+        RedactionSource::JobNote => "a note that a job ended".into(),
+        RedactionSource::NetworkRequest { action } => format!("a URL that command {action} requested"),
+        RedactionSource::Knowledge { source } => format!("what {source} returned"),
+        RedactionSource::ActionResult { action } => format!("the result of action {action}"),
+        RedactionSource::Notice => "a note from Nixxa".into(),
+        RedactionSource::ResumedHistory => "the resumed session's history".into(),
+    }
 }
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
@@ -212,6 +236,14 @@ pub(crate) struct App {
     pub(crate) checkpoints: Checkpoints,
     /// The undo view (`/undo`, `ctrl+z`), when open.
     pub(crate) undo: Option<UndoView>,
+    /// The session's secret scrubber, the controller's own, to show what a message will have
+    /// replaced before it is sent (D-077).
+    pub(crate) scrubber: Option<Arc<Scrubber>>,
+    /// Placeholders of secrets in the message that the user chose to send as they are, one by
+    /// one, for this message only.
+    pub(crate) send_anyway: Vec<String>,
+    /// Whether the message holds lines shared from the terminal.
+    pub(crate) shared: bool,
 }
 
 impl App {
@@ -254,7 +286,15 @@ impl App {
             woken: false,
             checkpoints: Checkpoints::default(),
             undo: None,
+            scrubber: None,
+            send_anyway: Vec::new(),
+            shared: false,
         }
+    }
+
+    /// The secrets in the message being written, with what will replace each (D-077).
+    pub(crate) fn input_secrets(&self) -> Vec<Found> {
+        self.scrubber.as_ref().map_or_else(Vec::new, |scrubber| scrubber.find(&self.input))
     }
 
     /// The host terminal window gained or lost focus.
@@ -457,6 +497,7 @@ impl App {
                     self.input.push('\n');
                 }
                 self.input.push_str(&text);
+                self.shared = true;
                 self.focus = Focus::Input;
                 self.notice =
                     Some("The terminal's lines are in your message: edit it as you like; enter sends it.".into());
@@ -637,6 +678,19 @@ impl App {
                 self.conversation.push(Entry { speaker: Speaker::System, text });
                 self.happenings.push((self.activity.len(), Happening::Restored { label, paths }));
                 self.undo = None;
+            }
+            Event::SecretRedacted { kind, source, placeholder, sent, .. } => {
+                let from = redaction_from(&source);
+                let text = if sent {
+                    format!(
+                        "Sent a {kind} in {from} as it is, as you chose: the agent has the value; the session's record \
+                         keeps {placeholder}."
+                    )
+                } else {
+                    format!("Redacted a {kind} in {from}: the agent sees {placeholder} instead.")
+                };
+                self.conversation.push(Entry { speaker: Speaker::System, text });
+                self.happenings.push((self.activity.len(), Happening::Redacted { kind, from, placeholder, sent }));
             }
             Event::SessionEnded { .. } => self.ended = true,
         }
@@ -922,16 +976,41 @@ impl App {
         match key.code {
             KeyCode::Enter if newline => self.input.push('\n'),
             KeyCode::Enter => {
+                let secrets = self.input_secrets();
                 let text = std::mem::take(&mut self.input);
+                let send_anyway: Vec<String> = std::mem::take(&mut self.send_anyway)
+                    .into_iter()
+                    .filter(|placeholder| secrets.iter().any(|found| &found.placeholder == placeholder))
+                    .collect();
+                let from_terminal = std::mem::take(&mut self.shared);
                 if text.trim() == undo::COMMAND {
                     return self.open_undo();
                 }
                 if !text.trim().is_empty() {
                     if self.busy {
-                        // The controller runs it after the current turn; show it until then.
-                        self.queued.push_back(text.clone());
+                        // The controller runs it after the current turn; show it until then, as
+                        // the controller will record it.
+                        let shown = self.scrubber.as_ref().map_or_else(|| text.clone(), |s| s.scrub(&text).text);
+                        self.queued.push_back(shown);
                     }
-                    return vec![Effect::Send(Command::UserMessage(text))];
+                    return vec![Effect::Send(Command::UserMessage(UserMessage { text, send_anyway, from_terminal }))];
+                }
+            }
+            // alt+1…9: send that secret as it is, or not, after all (D-077).
+            KeyCode::Char(digit @ '1'..='9')
+                if key.modifiers.contains(KeyModifiers::ALT) && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                let secrets = self.input_secrets();
+                let n = digit as usize - '1' as usize;
+                match secrets.get(n) {
+                    Some(found) => {
+                        if let Some(at) = self.send_anyway.iter().position(|p| *p == found.placeholder) {
+                            self.send_anyway.remove(at);
+                        } else {
+                            self.send_anyway.push(found.placeholder.clone());
+                        }
+                    }
+                    None => self.input.push(digit),
                 }
             }
             KeyCode::Char(c) if types_text(&key) => self.input.push(c),
@@ -1448,6 +1527,69 @@ pub(crate) mod tests {
         assert_eq!(key_form(&app).masked(), "•");
     }
 
+    /// D-077: the user sees what their message will have replaced before sending, and chooses,
+    /// one by one, to send a secret as it is.
+    #[test]
+    fn secrets_in_the_message_are_shown_and_can_be_sent_one_by_one() {
+        let mut app = App::new(false);
+        app.scrubber = Some(Arc::new(Scrubber::with_key([5; 32])));
+        let (id, secret) = ("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        type_text(&mut app, &format!("use {id} and {secret}"));
+        let found = app.input_secrets();
+        assert_eq!(found.iter().map(|f| f.kind.as_str()).collect::<Vec<_>>(), ["aws-access-key", "aws-secret-key"]);
+        let alt = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        app.handle_key(alt('2'));
+        assert_eq!(app.send_anyway, [found[1].placeholder.clone()]);
+        app.handle_key(alt('1'));
+        app.handle_key(alt('1'));
+        assert_eq!(app.send_anyway, [found[1].placeholder.clone()], "alt+1 twice: back to replaced");
+        app.handle_key(alt('9'));
+        assert!(app.input.ends_with('9'), "no ninth secret: alt+9 types as before");
+        app.input.pop();
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Send(Command::UserMessage(message))] = &effects[..] else { panic!("{effects:?}") };
+        assert_eq!(message.send_anyway, [found[1].placeholder.clone()]);
+        assert!(!message.from_terminal);
+        assert!(app.send_anyway.is_empty(), "the choice was for that message only");
+    }
+
+    #[test]
+    fn a_message_with_shared_terminal_lines_says_so() {
+        let mut app = App::new(false);
+        app.shared = true;
+        type_text(&mut app, "look");
+        let effects = app.handle_key(key(KeyCode::Enter));
+        let [Effect::Send(Command::UserMessage(message))] = &effects[..] else { panic!("{effects:?}") };
+        assert!(message.from_terminal);
+        assert!(!app.shared);
+    }
+
+    #[test]
+    fn each_redaction_is_told_in_the_conversation_and_the_activity_pane() {
+        let mut app = App::new(false);
+        app.apply(Event::SecretRedacted {
+            turn: None,
+            kind: "aws-access-key".into(),
+            source: RedactionSource::FileRead { path: ".env".into() },
+            placeholder: "‹secret:aws-access-key#3f2a›".into(),
+            sent: false,
+        });
+        app.apply(Event::SecretRedacted {
+            turn: None,
+            kind: "github-token".into(),
+            source: RedactionSource::UserMessage,
+            placeholder: "‹secret:github-token#0b1c›".into(),
+            sent: true,
+        });
+        let said: Vec<&str> = app.conversation.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            said[0],
+            "Redacted a aws-access-key in `.env`: the agent sees ‹secret:aws-access-key#3f2a› instead."
+        );
+        assert!(said[1].starts_with("Sent a github-token in your message as it is, as you chose"), "{}", said[1]);
+        assert_eq!(app.happenings.len(), 2);
+    }
+
     #[test]
     fn alt_enter_adds_a_newline() {
         let mut app = App::new(true);
@@ -1662,7 +1804,7 @@ pub(crate) mod tests {
         app.apply(Event::ActionProposed { turn: turn(), request: request("a1") });
         let asking = {
             let approvals = approvals.clone();
-            tokio::spawn(async move { approvals.ask(&request("a1"), "why").await })
+            tokio::spawn(async move { approvals.ask(&request("a1"), "why", nixxa_contracts::Asking::ByMode).await })
         };
         let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("expected a prompt") };
         app.ask(prompt);
@@ -1674,7 +1816,7 @@ pub(crate) mod tests {
 
         // The next action doesn't prompt at all.
         app.apply(Event::ActionProposed { turn: turn(), request: request("a2") });
-        assert_eq!(approvals.ask(&request("a2"), "why").await, Verdict::Allow);
+        assert_eq!(approvals.ask(&request("a2"), "why", nixxa_contracts::Asking::ByMode).await, Verdict::Allow);
         let Some(UiEvent::AutoApproved(id)) = rx.recv().await else { panic!("expected an auto-approval") };
         app.auto_approved(&id);
         assert!(app.activity[1].auto_approved);
@@ -1692,7 +1834,7 @@ pub(crate) mod tests {
         for (answer, expected) in [('y', Verdict::Allow), ('n', Verdict::Deny("denied by the user".into()))] {
             let asking = {
                 let approvals = approvals.clone();
-                tokio::spawn(async move { approvals.ask(&request("a1"), "why").await })
+                tokio::spawn(async move { approvals.ask(&request("a1"), "why", nixxa_contracts::Asking::ByMode).await })
             };
             let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("expected a prompt") };
             app.ask(prompt);

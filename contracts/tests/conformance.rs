@@ -952,6 +952,7 @@ fn knowledge_reference_passes() {
 #[derive(Default)]
 struct MemCredentials {
     accounts: Mutex<Vec<(AccountInfo, Credential)>>,
+    bug: Option<CredBug>,
 }
 
 #[async_trait]
@@ -1005,11 +1006,34 @@ impl Credentials for MemCredentials {
     async fn validate(&self, account: &AccountRef) -> Result<(), CredentialsError> {
         self.get(account).await.map(|_| ())
     }
+    async fn fingerprints(&self) -> Result<SecretFingerprints, CredentialsError> {
+        let mut prints = SecretFingerprints::new([3; 32]);
+        let all = self.accounts.lock().unwrap();
+        // The bug leaves out every account but the first.
+        let kept = if self.bug == Some(CredBug::FirstOnly) { 1 } else { all.len() };
+        for (info, credential) in all.iter().take(kept) {
+            if let Credential::ApiKey(secret) | Credential::BearerToken { token: secret, .. } = credential {
+                prints.add(&format!("{}-key", info.account.provider), secret);
+            }
+        }
+        Ok(prints)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredBug {
+    FirstOnly,
 }
 
 #[test]
 fn credentials_reference_passes() {
     block_on(conformance::credentials::run(MemCredentials::default));
+}
+
+#[test]
+#[should_panic(expected = "every key must be fingerprinted")]
+fn credentials_suite_catches_missing_fingerprints() {
+    block_on(conformance::credentials::run(|| MemCredentials { bug: Some(CredBug::FirstOnly), ..Default::default() }));
 }
 
 // ---------- Brain ----------

@@ -17,6 +17,7 @@ use crate::sessions::ago;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
 use crate::terminal::State as TermState;
 use crate::undo::{self, Diff as UndoDiff};
+use nixxa_controller::scrub::Found;
 use nixxa_sandbox::network::PRESETS;
 
 /// Below this width the panes collapse to one column (Activity behind `tab`).
@@ -54,7 +55,9 @@ impl Theme {
 /// Draws the whole screen.
 pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     let theme = Theme { color: app.color };
-    let input_lines = u16::try_from(app.input.split('\n').count()).unwrap_or(u16::MAX).clamp(1, 4);
+    let secrets = app.input_secrets();
+    let input_lines = u16::try_from(app.input.split('\n').count()).unwrap_or(u16::MAX).clamp(1, 4)
+        + u16::try_from(secret_lines(&secrets, &app.send_anyway).len()).unwrap_or(0);
     let [status, body, input, hints] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(3),
@@ -276,6 +279,12 @@ fn happening_line(happening: &Happening, theme: Theme, width: usize) -> Line<'st
         Happening::Restored { label, paths } => {
             ("↶", theme.accent(), "undo", format!("back as it was {label}"), format!("{paths} paths"))
         }
+        Happening::Redacted { kind, from, placeholder, sent: false } => {
+            ("⚠", theme.pending(), "secret", format!("a {kind} in {from} → {placeholder}"), "redacted".to_string())
+        }
+        Happening::Redacted { kind, from, sent: true, .. } => {
+            ("⚠", theme.bad(), "secret", format!("a {kind} in {from}"), "sent as is".to_string())
+        }
     };
     let target = safe::line(&target);
     let room = width.saturating_sub(2 + 7 + 1 + how.chars().count());
@@ -465,18 +474,46 @@ fn draw_terminal(frame: &mut Frame, app: &mut App, theme: Theme, area: Rect) {
     }
 }
 
+/// The most secrets the message pane lists; the rest are counted.
+const SECRETS_SHOWN: usize = 3;
+
+/// What the message pane says about the secrets in the message: what replaces each, or that it
+/// goes as it is. Safe to draw.
+fn secret_lines(secrets: &[Found], send_anyway: &[String]) -> Vec<String> {
+    let mut lines: Vec<String> = secrets
+        .iter()
+        .take(SECRETS_SHOWN)
+        .enumerate()
+        .map(|(n, found)| {
+            let what = if send_anyway.contains(&found.placeholder) {
+                "goes as it is (you chose; alt+".to_string() + &(n + 1).to_string() + " undoes)"
+            } else {
+                format!("becomes {} (alt+{} sends it as it is)", found.placeholder, n + 1)
+            };
+            safe::line(&format!("⚠ a {} {what}", found.kind))
+        })
+        .collect();
+    if secrets.len() > SECRETS_SHOWN {
+        lines.push(format!("⚠ … and {} more secrets are replaced", secrets.len() - SECRETS_SHOWN));
+    }
+    lines
+}
+
 fn draw_input(frame: &mut Frame, app: &App, theme: Theme, area: Rect) {
     let block = pane("Message", app.focus == Focus::Input, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    let warnings = secret_lines(&app.input_secrets(), &app.send_anyway);
+    let room = usize::from(inner.height).saturating_sub(warnings.len());
     let rows: Vec<&str> = app.input.split('\n').collect();
-    let visible = rows.len().saturating_sub(usize::from(inner.height));
-    let lines: Vec<Line> = rows
+    let visible = rows.len().saturating_sub(room);
+    let mut lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .skip(visible)
         .map(|(i, row)| Line::raw(format!("{}{}", if i == 0 { "> " } else { "  " }, safe::line(row))))
         .collect();
+    lines.extend(warnings.into_iter().map(|warning| Line::styled(warning, theme.pending())));
     frame.render_widget(Paragraph::new(lines), inner);
     if app.focus == Focus::Input && inner.area() > 0 {
         let last = rows.last().map_or(0, |r| safe::line(r).chars().count());
@@ -534,6 +571,8 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         }
     } else if let Some(notice) = &app.notice {
         safe::line(notice)
+    } else if app.focus == Focus::Input && !app.input_secrets().is_empty() {
+        "secrets in your message are replaced before it is sent · alt+1… send one as it is · enter send".to_string()
     } else if app.focus == Focus::Terminal {
         "i type · ↑/↓ pgup/pgdn scroll · s share with the agent · ctrl-t details · tab focus · ctrl+] twice sends ctrl+]"
             .to_string()
@@ -1185,6 +1224,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_message_pane_shows_what_will_replace_each_secret() {
+        let mut app = App::new(false);
+        app.scrubber = Some(std::sync::Arc::new(nixxa_controller::scrub::Scrubber::with_key([5; 32])));
+        app.input = "deploy with AKIAIOSFODNN7EXAMPLE\x1b[2J".into();
+        let shown = screen(&mut app, 140, 20);
+        assert!(shown.contains("⚠ a aws-access-key becomes ‹secret:aws-access-key#"), "{shown}");
+        assert!(shown.contains("(alt+1 sends it as it is)"), "{shown}");
+        assert!(shown.contains("alt+1… send one as it is"), "the hint: {shown}");
+        app.send_anyway = app.input_secrets().into_iter().map(|f| f.placeholder).collect();
+        assert!(screen(&mut app, 140, 20).contains("⚠ a aws-access-key goes as it is (you chose; alt+1 undoes)"));
+    }
+
+    #[test]
     fn the_session_list_groups_rows_and_shows_snippets_safely() {
         let mut app = started();
         app.root = std::env::temp_dir().join("proj");
@@ -1480,6 +1532,7 @@ pub(crate) mod tests {
                 duration_ms: 14,
                 truncated: false,
                 network: Vec::new(),
+                warnings: Vec::new(),
             },
         });
         let screen = screen(&mut app, 120, 20);

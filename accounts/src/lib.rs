@@ -4,6 +4,7 @@
 //! environment-variable keys as read-only accounts. Multi-account switching, sign-in methods
 //! and the encrypted-file fallback arrive in Stage 13.
 
+mod fingerprint;
 mod keychain;
 pub mod memory;
 pub mod methods;

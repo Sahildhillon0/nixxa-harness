@@ -444,6 +444,19 @@ async fn huge_output_is_truncated() {
     assert_eq!(sh(&sb, "echo alive").await.1, "alive\n");
 }
 
+/// A cut never splits a key (D-074): what is kept ends on a token boundary, so the controller's
+/// scrubber sees whole keys or none.
+#[tokio::test]
+async fn cut_output_never_ends_inside_a_key() {
+    let scratch = Scratch::new("output-key");
+    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let obs = run(&sb, exec("yes 'AKIAIOSFODNN7EXAMPLE x' | head -c 200000")).await.unwrap();
+    assert!(obs.truncated);
+    let Outcome::Exec { stdout, .. } = obs.outcome else { panic!("not exec") };
+    assert!(stdout.ends_with('\n'), "{}", &stdout[stdout.len() - 30..]);
+    assert!(stdout.lines().all(|line| line == "AKIAIOSFODNN7EXAMPLE x"), "a line was cut through");
+}
+
 #[tokio::test]
 async fn host_sockets_and_home_are_absent() {
     let scratch = Scratch::new("sockets");

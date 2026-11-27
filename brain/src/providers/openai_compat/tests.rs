@@ -104,6 +104,9 @@ impl Credentials for OneAccount {
     async fn validate(&self, _account: &AccountRef) -> Result<(), CredentialsError> {
         Ok(())
     }
+    async fn fingerprints(&self) -> Result<nixxa_contracts::SecretFingerprints, CredentialsError> {
+        Err(CredentialsError::Unsupported("not needed by the brain".into()))
+    }
 }
 
 fn local() -> AccountRef {

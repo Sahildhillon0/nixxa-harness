@@ -40,7 +40,10 @@ Replace one, and the rest never notice.
 > edit and command, and at the start of every turn, Nixxa takes a **checkpoint** of the
 > workspace; **`/undo`** (or `ctrl-z`) shows what going back would change, and restores it, also
 > after a command like `rm -rf` changed files. Checkpoints live outside the workspace and are
-> removed when Nixxa quits.
+> removed when Nixxa quits. **Secrets** in anything headed for the model (your message, file
+> reads, command and job output, notes) are replaced by placeholders such as
+> `‹secret:aws-access-key#3f2a›`, and what's saved is the redacted form; you see each one, and
+> can send one of your own as it is, explicitly. Reading `.env` and the like asks even in Auto.
 
 ---
 
@@ -128,7 +131,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
 | 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **done** |
-| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | **in progress** (patches and undo done) |
+| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | **in progress** (patches and undo, secret redaction done) |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
 | 10 | Knowledge — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |
