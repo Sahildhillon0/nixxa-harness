@@ -8,10 +8,12 @@ use crossterm::event::{
     DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, Event as TermEvent, EventStream,
 };
 use futures::StreamExt;
+use nixxa_contracts::Credentials;
 use nixxa_contracts::{
     AccountRef, Brain, OpenTerminal, Sandbox, SessionId, Store, TerminalEvent, TerminalSize, WorkspaceInfo,
 };
 use nixxa_controller::Command;
+use nixxa_controller::scrub::Scrubber;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -121,16 +123,16 @@ struct Session {
 /// Starts a controller for `account` and runs its loop in the background: a new session, or
 /// the stored session `resume` (D-057).
 fn start_session(
-    brain: Arc<dyn Brain>,
-    account: AccountRef,
+    (brain, account): (Arc<dyn Brain>, AccountRef),
     workspace: WorkspaceInfo,
     workplace: &Workplace,
     store: Arc<dyn Store>,
     ui: &UiLink,
     resume: Option<SessionId>,
+    scrubber: Arc<Scrubber>,
 ) -> Session {
     let (commands, rx) = mpsc::channel(32);
-    let mut controller = wiring::controller(brain.clone(), account.clone(), workspace, workplace, store, ui);
+    let mut controller = wiring::controller(brain.clone(), account.clone(), workspace, workplace, store, ui, scrubber);
     let ui_tx = ui.tx.clone();
     let task = tokio::spawn(async move {
         let started = match &resume {
@@ -146,6 +148,36 @@ fn start_session(
         controller.run(rx).await;
     });
     Session { commands, task, brain, account }
+}
+
+/// A new session's scrubber (D-074), knowing every secret Nixxa holds (D-075), shared with the
+/// app to show what a message will have replaced. Without one no session starts: nothing would
+/// stand between a key and the provider.
+async fn session_scrubber(models: Option<&Models>, app: &mut App) -> Option<Arc<Scrubber>> {
+    let scrubber = match Scrubber::new() {
+        Ok(scrubber) => Arc::new(scrubber),
+        Err(err) => {
+            app.note(format!("No session can start: {err}."));
+            return None;
+        }
+    };
+    learn_secrets(models, &scrubber, app).await;
+    app.scrubber = Some(scrubber.clone());
+    app.send_anyway.clear();
+    Some(scrubber)
+}
+
+/// Gives `scrubber` the fingerprints of every secret Nixxa holds now. With `--fake` it holds
+/// none.
+async fn learn_secrets(models: Option<&Models>, scrubber: &Scrubber, app: &mut App) {
+    let Some(models) = models else { return };
+    match models.credentials.fingerprints().await {
+        Ok(prints) => scrubber.set_known(prints),
+        Err(err) => app.note(format!(
+            "Nixxa's own keys can't be recognised in text this session ({err}); known kinds of secret are still \
+             replaced before anything reaches the model."
+        )),
+    }
 }
 
 /// With `--continue`, the first session to start is the latest one for this directory. Asked
@@ -421,6 +453,10 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                     };
                     produced.extend(receive(&mut app, event));
                     if let Some((account, found)) = saved {
+                        // The new key is a secret Nixxa holds from now on.
+                        if let Some(scrubber) = app.scrubber.clone() {
+                            learn_secrets(Some(&found), &scrubber, &mut app).await;
+                        }
                         // A key rotation for the account in use needs nothing: the brain reads the
                         // key on every request. Anything else starts a session with the new brain.
                         let rotation = session.as_ref().is_some_and(|s| s.account == account && account.provider.as_str() == wiring::ANTHROPIC);
@@ -435,7 +471,9 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                                     match &workplace {
                                         Some(place) => {
                                             let resume = continue_target(&mut continue_latest, &*store, &workspace, &mut app).await;
-                                            session = Some(start_session(brain, account, workspace.clone(), place, store.clone(), &link, resume));
+                                            if let Some(scrubber) = session_scrubber(models.as_deref(), &mut app).await {
+                                                session = Some(start_session((brain, account), workspace.clone(), place, store.clone(), &link, resume, scrubber));
+                                            }
                                         }
                                         None => waiting = Some((brain, account)),
                                     }
@@ -553,15 +591,17 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                             }
                             if let Some((brain, account)) = waiting.take() {
                                 let resume = continue_target(&mut continue_latest, &*store, &workspace, &mut app).await;
-                                session = Some(start_session(
-                                    brain,
-                                    account,
-                                    workspace.clone(),
-                                    &chosen,
-                                    store.clone(),
-                                    &link,
-                                    resume,
-                                ));
+                                if let Some(scrubber) = session_scrubber(models.as_deref(), &mut app).await {
+                                    session = Some(start_session(
+                                        (brain, account),
+                                        workspace.clone(),
+                                        &chosen,
+                                        store.clone(),
+                                        &link,
+                                        resume,
+                                        scrubber,
+                                    ));
+                                }
                             }
                             watch_sandbox(&chosen, &ui_tx);
                             workplace = Some(chosen);
@@ -606,15 +646,17 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                             continue_latest = false;
                             app.start_over();
                             app.note(place_note(place, &workspace));
-                            session = Some(start_session(
-                                brain,
-                                account,
-                                workspace.clone(),
-                                place,
-                                store.clone(),
-                                &link,
-                                Some(id),
-                            ));
+                            if let Some(scrubber) = session_scrubber(models.as_deref(), &mut app).await {
+                                session = Some(start_session(
+                                    (brain, account),
+                                    workspace.clone(),
+                                    place,
+                                    store.clone(),
+                                    &link,
+                                    Some(id),
+                                    scrubber,
+                                ));
+                            }
                         }
                         _ => app.note("Set up a model first (ctrl-a); then the session can be resumed."),
                     }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use nixxa_contracts::{ActionId, ActionRequest, ApprovalPort, Event, EventSink, Verdict};
+use nixxa_contracts::{ActionId, ActionRequest, ApprovalPort, Asking, Event, EventSink, Verdict};
 use tokio::sync::{mpsc, oneshot};
 
 /// What the UI loop receives from the controller side.
@@ -150,8 +150,9 @@ impl TuiApprovals {
 
 #[async_trait]
 impl ApprovalPort for TuiApprovals {
-    async fn ask(&self, request: &ActionRequest, reason: &str) -> Verdict {
-        if self.auto.is_on() {
+    async fn ask(&self, request: &ActionRequest, reason: &str, asking: Asking) -> Verdict {
+        // Some actions are asked about even in Auto (D-076).
+        if self.auto.is_on() && asking == Asking::ByMode {
             let _ = self.tx.send(UiEvent::AutoApproved(request.id.clone()));
             crate::logging::approval(&request.id, &Verdict::Allow);
             return Verdict::Allow;
@@ -190,7 +191,7 @@ mod tests {
             assert_eq!(prompt.reason, "why");
             prompt.answer(Verdict::Allow);
         });
-        assert_eq!(approvals.ask(&request(), "why").await, Verdict::Allow);
+        assert_eq!(approvals.ask(&request(), "why", Asking::ByMode).await, Verdict::Allow);
         ui.await.unwrap();
     }
 
@@ -198,7 +199,7 @@ mod tests {
     async fn a_closed_ui_denies() {
         let (tx, rx) = mpsc::unbounded_channel();
         drop(rx);
-        let verdict = TuiApprovals::new(tx, AutoApprove::default()).ask(&request(), "why").await;
+        let verdict = TuiApprovals::new(tx, AutoApprove::default()).ask(&request(), "why", Asking::ByMode).await;
         assert_eq!(verdict, Verdict::Deny("the approval prompt is closed".into()));
     }
 
@@ -208,13 +209,22 @@ mod tests {
         let auto = AutoApprove::default();
         let approvals = TuiApprovals::new(tx, auto.clone());
         auto.set(true);
-        assert_eq!(approvals.ask(&request(), "why").await, Verdict::Allow);
+        assert_eq!(approvals.ask(&request(), "why", Asking::ByMode).await, Verdict::Allow);
         match rx.try_recv() {
             Ok(UiEvent::AutoApproved(id)) => assert_eq!(id, ActionId::new("a")),
             _ => panic!("expected the action to be reported as auto-approved, not a prompt"),
         }
+        // Reading a file that holds secrets asks even in Auto.
+        let always = {
+            let approvals = TuiApprovals::new(approvals.tx.clone(), auto.clone());
+            tokio::spawn(async move { approvals.ask(&request(), "a secret file", Asking::Always).await })
+        };
+        let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("Auto asks when it must") };
+        assert_eq!(prompt.reason, "a secret file");
+        prompt.answer(Verdict::Deny("no".into()));
+        assert_eq!(always.await.unwrap(), Verdict::Deny("no".into()));
         auto.set(false);
-        let asking = tokio::spawn(async move { approvals.ask(&request(), "why").await });
+        let asking = tokio::spawn(async move { approvals.ask(&request(), "why", Asking::ByMode).await });
         let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("Ask mode prompts again") };
         prompt.answer(Verdict::Allow);
         asking.await.unwrap();
@@ -224,7 +234,7 @@ mod tests {
     async fn a_prompt_knows_when_the_controller_stopped_waiting() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let approvals = TuiApprovals::new(tx, AutoApprove::default());
-        let asking = tokio::spawn(async move { approvals.ask(&request(), "why").await });
+        let asking = tokio::spawn(async move { approvals.ask(&request(), "why", Asking::ByMode).await });
         let Some(UiEvent::Approval(prompt)) = rx.recv().await else { panic!("expected a prompt") };
         assert!(!prompt.is_abandoned());
         asking.abort();

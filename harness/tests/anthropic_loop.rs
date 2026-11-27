@@ -21,7 +21,7 @@ struct AllowAll;
 
 #[async_trait]
 impl ApprovalPort for AllowAll {
-    async fn ask(&self, _request: &ActionRequest, _reason: &str) -> Verdict {
+    async fn ask(&self, _request: &ActionRequest, _reason: &str, _asking: nixxa_contracts::Asking) -> Verdict {
         Verdict::Allow
     }
 }
@@ -56,7 +56,12 @@ async fn parallel_calls_are_replayed_as_one_assistant_turn() {
         Arc::new(FakeKnowledge),
         Arc::new(AllowAll),
         sink.clone(),
-        ControllerConfig::new(workspace, account, "You are Nixxa."),
+        ControllerConfig::new(
+            workspace,
+            account,
+            "You are Nixxa.",
+            Arc::new(nixxa_controller::scrub::Scrubber::new().unwrap()),
+        ),
     );
     controller.start_session().await.unwrap();
     let (tx, rx) = mpsc::channel(4);

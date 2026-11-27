@@ -16,6 +16,7 @@ use nixxa_contracts::{
     AccountInfo, AccountRef, Brain, BrainError, Credential, Credentials, CredentialsError, ProviderId, Secret,
     SessionId, Store, StoreError, WorkspaceInfo,
 };
+use nixxa_controller::scrub::Scrubber;
 use nixxa_controller::{Controller, ControllerConfig};
 use nixxa_db::SqliteStore;
 use nixxa_db::memory::MemoryStore;
@@ -86,6 +87,7 @@ pub(crate) fn controller(
     workplace: &Workplace,
     store: Arc<dyn Store>,
     ui: &UiLink,
+    scrubber: Arc<Scrubber>,
 ) -> Controller {
     Controller::new(
         brain,
@@ -94,7 +96,7 @@ pub(crate) fn controller(
         Arc::new(FakeKnowledge),
         Arc::new(TuiApprovals::new(ui.tx.clone(), ui.auto.clone())),
         Arc::new(ChannelSink::new(ui.tx.clone(), ui.generation.clone())),
-        ControllerConfig::new(workspace, account, workplace.instructions()),
+        ControllerConfig::new(workspace, account, workplace.instructions(), scrubber),
     )
 }
 
@@ -361,6 +363,11 @@ pub(crate) mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    /// A scrubber with a fixed key, for a controller under test.
+    fn test_scrubber() -> Arc<Scrubber> {
+        Arc::new(Scrubber::with_key([3; 32]))
+    }
     use crate::app::tests::key;
     use crate::app::{ActivityState, App, Effect, Speaker};
     use crate::place::Place;
@@ -454,6 +461,7 @@ pub(crate) mod tests {
             &sandboxed(),
             Arc::new(MemoryStore::default()),
             &UiLink::new(ui_tx, AutoApprove::default()),
+            test_scrubber(),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
@@ -527,6 +535,96 @@ pub(crate) mod tests {
         }
     }
 
+    /// Reads the planted `.env`, prints it with `cat`, then is done; keeps every request.
+    #[derive(Default)]
+    struct PlantedReader {
+        step: std::sync::Mutex<usize>,
+        contexts: std::sync::Mutex<Vec<nixxa_contracts::Context>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Brain for PlantedReader {
+        fn describe(&self) -> nixxa_contracts::BrainInfo {
+            ScriptedBrain.describe()
+        }
+
+        async fn think(&self, context: nixxa_contracts::Context) -> Result<nixxa_contracts::BrainStream, BrainError> {
+            use nixxa_contracts::{Action, ActionId, ActionRequest, BrainEvent, Intent, SandboxAction};
+            self.contexts.lock().unwrap().push(context);
+            let mut step = self.step.lock().unwrap();
+            *step += 1;
+            let act = |action| Intent::Act {
+                request: ActionRequest {
+                    id: ActionId::new(format!("a{step}")),
+                    action: Action::Sandbox { action },
+                    reason: None,
+                },
+            };
+            let intent = match *step {
+                1 => act(SandboxAction::ReadFile { path: ".env".into() }),
+                2 => act(SandboxAction::Exec {
+                    command: "cat .env".into(),
+                    cwd: None,
+                    timeout_ms: None,
+                    background: false,
+                }),
+                _ => Intent::Done { summary: "read it".into() },
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(BrainEvent::Intent { intent })])))
+        }
+    }
+
+    /// Stage 7 exit criterion (#3): a fake key planted in a file never reaches the provider (a
+    /// recording brain gets every request) nor the history database, and the user is warned.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_seven_a_planted_key_never_reaches_the_provider_or_the_database() {
+        let scratch = Scratch::new("e2e7-secret");
+        let (id, secret) = ("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let planted = format!("AWS_ACCESS_KEY_ID={id}\nAWS_SECRET_ACCESS_KEY={secret}\n");
+        std::fs::write(scratch.0.join("project").join(".env"), planted).unwrap();
+        let (store, history_off) = store(false, Some(scratch.db())).await;
+        assert!(history_off.is_none(), "{history_off:?}");
+        let workspace = scratch.workspace();
+        let place = Workplace::new(crate::place::Place::Here, &workspace).unwrap();
+        let brain = Arc::new(PlantedReader::default());
+        let (ui_tx, mut ui) = mpsc::unbounded_channel();
+        let link = UiLink::new(ui_tx, AutoApprove::default());
+        let scrubber = test_scrubber();
+        let (_, account) = scripted();
+        let mut controller =
+            controller(brain.clone(), account, workspace, &place, store.clone(), &link, scrubber.clone());
+        controller.start_session().await.unwrap();
+        let (commands, rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move { controller.run(rx).await });
+        let mut app = App::new(false);
+        app.scrubber = Some(scrubber);
+        drive(&mut app, &mut ui, &commands, &format!("deploy with {id}")).await;
+        commands.send(Command::Shutdown).await.unwrap();
+        task.await.unwrap();
+        drop(store);
+
+        let leaks = |text: &str| text.contains("IOSFODNN7") || text.contains("K7MDENG");
+        let requests = brain.contexts.lock().unwrap().clone();
+        assert_eq!(requests.len(), 3);
+        for request in &requests {
+            assert!(!leaks(&serde_json::to_string(request).unwrap()), "the provider got the key: {request:#?}");
+        }
+        let last = serde_json::to_string(requests.last().unwrap()).unwrap();
+        assert!(last.contains("‹secret:aws-secret-key#") && last.contains("‹secret:aws-access-key#"), "{last}");
+        // Nor the database, in any of its files.
+        for entry in std::fs::read_dir(scratch.db().parent().unwrap()).unwrap().flatten() {
+            let bytes = std::fs::read(entry.path()).unwrap();
+            assert!(!leaks(&String::from_utf8_lossy(&bytes)), "{} holds the key", entry.path().display());
+        }
+        // And the user was told what was replaced, and where from.
+        let warned: Vec<&str> =
+            app.conversation.iter().map(|e| e.text.as_str()).filter(|t| t.starts_with("Redacted")).collect();
+        for from in ["in your message", "in `.env`", "in the output of command a2"] {
+            assert!(warned.iter().any(|w| w.contains(from)), "no warning {from:?}: {warned:#?}");
+        }
+        assert!(app.happenings.iter().any(|(_, h)| matches!(h, crate::app::Happening::Redacted { .. })));
+    }
+
     /// One run of Nixxa against `store`: a controller (new or resumed) and a fresh screen.
     struct Run {
         app: App,
@@ -542,7 +640,8 @@ pub(crate) mod tests {
             let brain = Arc::new(Recording::default());
             let link = UiLink::new(ui_tx, AutoApprove::default());
             let (_, account) = scripted();
-            let mut controller = controller(brain.clone(), account, workspace, &sandboxed(), store, &link);
+            let mut controller =
+                controller(brain.clone(), account, workspace, &sandboxed(), store, &link, test_scrubber());
             match resume {
                 Some(id) => controller.resume_session(id).await.expect("resumes"),
                 None => controller.start_session().await.expect("starts"),
@@ -803,6 +902,7 @@ pub(crate) mod tests {
             &here,
             Arc::new(MemoryStore::default()),
             &UiLink::new(ui_tx, AutoApprove::default()),
+            test_scrubber(),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
@@ -843,6 +943,7 @@ pub(crate) mod tests {
             &sandboxed(),
             Arc::new(MemoryStore::default()),
             &UiLink::new(ui_tx, AutoApprove::default()),
+            test_scrubber(),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
@@ -996,6 +1097,7 @@ pub(crate) mod tests {
             &sandboxed(),
             Arc::new(MemoryStore::default()),
             &UiLink::new(ui_tx, AutoApprove::default()),
+            test_scrubber(),
         );
         controller.start_session().await.expect("session starts");
         let task = tokio::spawn(async move { controller.run(cmd_rx).await });
