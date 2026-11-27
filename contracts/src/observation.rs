@@ -94,12 +94,16 @@ pub struct Observation {
     /// The network requests the action made, allowed or blocked, in order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub network: Vec<NetRequest>,
+    /// What Nixxa adds about the result for the agent (e.g. that a file it wrote now holds a
+    /// secret's placeholder, not the secret).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl Observation {
     /// An observation with no timing or truncation.
     pub fn new(action_id: ActionId, outcome: Outcome) -> Self {
-        Self { action_id, outcome, duration_ms: 0, truncated: false, network: Vec::new() }
+        Self { action_id, outcome, duration_ms: 0, truncated: false, network: Vec::new(), warnings: Vec::new() }
     }
 
     /// A [`Outcome::Denied`] observation.

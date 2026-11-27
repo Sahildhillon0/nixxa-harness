@@ -19,6 +19,7 @@ pub async fn run<C: Credentials, F: Fn() -> C>(fresh: F) {
     defaults(&fresh()).await;
     replace_and_remove(&fresh()).await;
     unknown_is_not_found(&fresh()).await;
+    fingerprints(&fresh()).await;
 }
 
 async fn add_get_list(c: &dyn Credentials) {
@@ -68,4 +69,26 @@ async fn unknown_is_not_found(c: &dyn Credentials) {
     assert!(matches!(c.get(&ghost).await, Err(CredentialsError::NotFound(_))));
     assert!(matches!(c.remove(&ghost).await, Err(CredentialsError::NotFound(_))));
     assert!(matches!(c.set_default(&ghost).await, Err(CredentialsError::NotFound(_))));
+}
+
+/// Every key held is found by its fingerprints, exactly, and nothing of it shows; a replaced or
+/// removed key is no longer found.
+async fn fingerprints(c: &dyn Credentials) {
+    c.add(acct("a"), key("sk-conformance-old-0000")).await.unwrap();
+    c.add(acct("b"), key("sk-conformance-bbbb-2222")).await.unwrap();
+    let prints = c.fingerprints().await.expect("fingerprints");
+    let text = "export KEY=sk-conformance-bbbb-2222\nother sk-conformance-old-0000.";
+    let found = prints.find(text);
+    let shown: Vec<&str> = found.iter().map(|k| &text[k.start..k.end]).collect();
+    assert!(shown.contains(&"sk-conformance-bbbb-2222"), "every key must be fingerprinted: {shown:?}");
+    assert!(shown.contains(&"sk-conformance-old-0000"), "every key must be fingerprinted: {shown:?}");
+    assert!(prints.find("sk-conformance-bbbb-2223").is_empty(), "only the exact key matches");
+    assert!(!format!("{prints:?}").contains("conformance"), "Debug must not reveal a secret");
+
+    c.add(acct("a"), key("sk-conformance-new-9999")).await.unwrap();
+    c.remove(&acct("b")).await.unwrap();
+    let prints = c.fingerprints().await.expect("fingerprints");
+    assert!(prints.find("sk-conformance-old-0000").is_empty(), "a replaced key is no longer held");
+    assert!(prints.find("sk-conformance-bbbb-2222").is_empty(), "a removed key is no longer held");
+    assert_eq!(prints.find("sk-conformance-new-9999").len(), 1, "the new key is");
 }

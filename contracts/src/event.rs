@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     AccountRef, ActionId, ActionRequest, ApprovalMode, BrainInfo, CheckpointId, JobId, Message, Observation,
-    SandboxCapabilities, SessionId, SourceInfo, TurnId, Usage, WorkspaceDiff,
+    RedactionSource, SandboxCapabilities, SessionId, SourceInfo, TurnId, Usage, WorkspaceDiff,
 };
 
 /// An event from the controller to the harness (via [`EventSink`](crate::EventSink)).
@@ -151,6 +151,23 @@ pub enum Event {
         checkpoint: CheckpointId,
         /// What that undid.
         undone: WorkspaceDiff,
+    },
+    /// A secret was found in something about to enter the agent's context, and replaced by a
+    /// placeholder there and in the session's record (#3). Never carries the secret, nor
+    /// anything that would rebuild it: the placeholder's tag is a keyed hash.
+    SecretRedacted {
+        /// The turn, if any.
+        turn: Option<TurnId>,
+        /// What kind of secret (`aws-access-key`, `anthropic-key`, `private-key`, …).
+        kind: String,
+        /// Where it came from.
+        source: RedactionSource,
+        /// What stands in for it: `‹secret:<kind>#<tag>›`, the same for the same value within a
+        /// session.
+        placeholder: String,
+        /// The user chose to send this one, in their own message, as it is: the agent got the
+        /// value; the session's record still holds the placeholder.
+        sent: bool,
     },
     /// A turn finished.
     TurnDone {

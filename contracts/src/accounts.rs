@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
-use crate::{CredentialsError, ProviderId, Timestamp};
+use crate::{CredentialsError, ProviderId, SecretFingerprints, Timestamp};
 
 /// Names an account: provider + label, written `provider:account` (e.g. `anthropic:work`).
 /// Not a secret.
@@ -191,6 +191,10 @@ pub trait Credentials: Send + Sync {
 
     /// Local validity check.
     async fn validate(&self, account: &AccountRef) -> Result<(), CredentialsError>;
+
+    /// Fingerprints of every secret held (keys and tokens of every account, environment ones
+    /// included), for the scrubber to find them in text (#3). Never the secrets themselves.
+    async fn fingerprints(&self) -> Result<SecretFingerprints, CredentialsError>;
 
     /// Runs an interactive sign-in flow. Unsupported unless the implementation and the
     /// provider's terms allow it.
