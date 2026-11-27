@@ -578,7 +578,9 @@ async fn notes_from_nixxa() {
 
 #[tokio::test]
 async fn a_resumed_session_from_before_scrubbing() {
-    // Stored by a Nixxa without scrubbing: the user's text, a command, its output, a summary.
+    // Stored by a Nixxa without scrubbing: the user's text, reasoning that repeats the key (stored
+    // before reasoning was checked, D-077) and reasoning that doesn't, a command, its output, a
+    // summary.
     let store = Arc::new(MemoryStore::default());
     let info = store
         .create_session(NewSession {
@@ -596,6 +598,22 @@ async fn a_resumed_session_from_before_scrubbing() {
     let at = Timestamp(0);
     for message in [
         Message::text(Role::User, format!("my key is {KEY_ID}"), at),
+        Message {
+            role: Role::Agent,
+            content: Content::Reasoning {
+                provider: ProviderId::new("recording"),
+                data: serde_json::json!({"thinking": format!("They gave me {KEY_ID}."), "signature": "c2ln"}),
+            },
+            at,
+        },
+        Message {
+            role: Role::Agent,
+            content: Content::Reasoning {
+                provider: ProviderId::new("recording"),
+                data: serde_json::json!({"thinking": "List the bucket.", "signature": "c2ln"}),
+            },
+            at,
+        },
         Message { role: Role::Agent, content: Content::Action { request: request.clone() }, at },
         Message {
             role: Role::Observation,
@@ -616,12 +634,16 @@ async fn a_resumed_session_from_before_scrubbing() {
     for context in rig.brain.contexts() {
         assert!(!leaks(&context), "the brain got the key from the old session: {context:#?}");
     }
+    // Reasoning can't be scrubbed (it may be signed): the block holding the key is dropped, the
+    // other one goes back as it was.
+    let context = rig.last_context();
+    assert!(context.contains("List the bucket."), "clean reasoning is kept: {context}");
     assert!(!leaks(&rig.sink.all()), "the UI was shown the old key again");
     assert!(rig.sink.redactions().iter().all(|(_, s, _)| *s == RedactionSource::ResumedHistory));
     assert!(!rig.sink.redactions().is_empty());
     // What this session adds to the record is scrubbed; the old rows are as they were.
     let record = rig.store.all().remove(0);
-    assert!(!leaks(&record.messages[4..].to_vec()), "{:#?}", &record.messages[4..]);
+    assert!(!leaks(&record.messages[6..].to_vec()), "{:#?}", &record.messages[6..]);
 }
 
 #[tokio::test]
