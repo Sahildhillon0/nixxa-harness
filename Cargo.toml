@@ -33,6 +33,8 @@ bytes = "1"
 crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 futures-core = "0.3"
+getrandom = "0.2"
+hmac = "0.12"
 keyring = "3.6"
 ratatui = "0.29"
 ring = "0.17"

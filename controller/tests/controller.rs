@@ -14,6 +14,7 @@ use nixxa_contracts::{
     SandboxError, SearchHit, SessionId, SessionInfo, SessionRecord, SourceId, SourceInfo, SourceStatus, Store,
     StoreError, Timestamp, ToolSpec, TurnId, Usage, Verdict, WorkspaceInfo,
 };
+use nixxa_controller::scrub::Scrubber;
 use nixxa_controller::{Command, Controller, ControllerConfig, DEFAULT_MAX_STEPS};
 use tokio::sync::{Notify, mpsc};
 use tokio::task::JoinHandle;
@@ -366,7 +367,7 @@ impl ScriptedApprovals {
 
 #[async_trait]
 impl ApprovalPort for ScriptedApprovals {
-    async fn ask(&self, _request: &ActionRequest, reason: &str) -> Verdict {
+    async fn ask(&self, _request: &ActionRequest, reason: &str, _asking: nixxa_contracts::Asking) -> Verdict {
         self.asked.lock().unwrap().push(reason.to_string());
         if self.hang {
             Notify::new().notified().await;
@@ -473,6 +474,7 @@ impl Rig {
             WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir().join("nixxa-controller-test") },
             AccountRef::new("scripted", "default"),
             "Reply briefly.",
+            Arc::new(Scrubber::with_key([7; 32])),
         );
         config.max_steps = max_steps;
         config.clock = || Timestamp(0);
@@ -1313,6 +1315,7 @@ async fn resuming_an_unknown_session_is_an_error() {
             WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir() },
             AccountRef::new("scripted", "default"),
             "",
+            Arc::new(Scrubber::with_key([7; 32])),
         ),
     );
     let err = controller.resume_session(&SessionId::new("nope")).await.unwrap_err();
@@ -1494,6 +1497,7 @@ async fn job_rig_over(
         WorkspaceInfo { name: "demo".into(), root: std::env::temp_dir().join("nixxa-controller-test") },
         AccountRef::new("scripted", "default"),
         "Reply briefly.",
+        Arc::new(Scrubber::with_key([7; 32])),
     );
     config.clock = || Timestamp(0);
     config.max_wakes = max_wakes;
