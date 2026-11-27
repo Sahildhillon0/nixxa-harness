@@ -47,7 +47,13 @@ async fn appends_keep_order(store: &dyn Store) {
     let observation = Observation::new(id(1), Outcome::Listing { entries: vec![] });
     store.append_message(&s, first.clone()).await.unwrap();
     store.append_message(&s, proposal.clone()).await.unwrap();
-    let record = ActionRecord { request, verdict: Verdict::Allow, observation: Some(observation), at: Timestamp(3) };
+    let record = ActionRecord {
+        request,
+        verdict: Verdict::Allow,
+        observation: Some(observation),
+        checkpoint: Some(crate::CheckpointId::new("c1")),
+        at: Timestamp(3),
+    };
     store.append_action(&s, record.clone()).await.unwrap();
     let loaded = store.load_session(&s).await.unwrap();
     assert_eq!(loaded.messages, vec![first, proposal], "messages must round-trip in order");

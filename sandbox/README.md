@@ -24,7 +24,7 @@ The job table and the words the agent reads live in `src/job.rs`, shared by the 
 
 `bwrap::BwrapSandbox` (Linux, Stage 4) starts `nixxa-sandboxd`
 inside bubblewrap and talks to it over length-prefixed JSON frames on stdio (`src/protocol.rs`,
-protocol VERSION 4: requests carry ids and may overlap, the daemon pushes `Event` frames
+protocol VERSION 5: requests carry ids and may overlap, the daemon pushes `Event` frames
 between replies (D-062), and the user's terminal has its own requests and frames). The daemon applies Landlock (filesystem) and a seccomp deny-list to
 itself at start-up, and does reads, writes and listings itself with `openat2(RESOLVE_BENEATH)`
 beneath `/workspace`. Each command, foreground or background, runs under its own supervisor
@@ -37,6 +37,35 @@ cgroup with memory and task caps when the user's systemd allows it (otherwise th
 named `bubblewrap (rlimits only, no cgroup)`). It reports `isolated: true` only when
 namespaces, Landlock and seccomp are all active; a kernel without Landlock runs degraded and
 the backend name says so. Decisions: D-040 to D-046, D-061 to D-063, D-066.
+
+**Patches (D-070):** `SandboxAction::Patch` applies search/replace edits against the file's
+SHA-256 (every `ReadFile` returns it, as `Outcome::File`). A stale hash fails with the current
+one; each search must match exactly once; all the edits apply or none do. The file is replaced
+by a new one renamed over it, with the same mode, and a symbolic link is never followed, its own
+name included. The logic and the hash are shared (`src/patch.rs`). The daemon opens through
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)`, `HostSandbox` checks `symlink_metadata` first,
+and `FakeSandbox` works in memory.
+
+**Checkpoints (D-071):** `checkpoint()`, `restore(id)` and `diff(from, to)` in every backend.
+`FakeSandbox` copies its files; `HostSandbox` and `BwrapSandbox` use `src/checkpoint/`, a
+content-addressed store of our own in the directory the harness gives
+(`CheckpointConfig { dir, cap }`; created 0700, removed with the sandbox). Blobs are on disk
+under their SHA-256; trees are in memory, shared between checkpoints. Unchanged files are
+recognised by device, inode, size, mtime and ctime, and the first 2 s of a change are always
+re-read: 10,000 files take about 12 ms unchanged and 11 ms with one changed. Past the cap a
+checkpoint is `LimitExceeded` and keeps nothing; the cap is checked from a file's size before it
+is read and again while it is copied, so a sparse file is refused at once. Snapshots go 256
+levels deep at most (a deeper workspace can't be checkpointed, and says why), and removing a
+tree of any depth works in rounds of 64 levels, so nothing recurses with the tree's depth. A fixed list of build directories (`target`,
+`node_modules`, …, `EXCLUDED`) and special files are left out, and `.gitignore` is never read.
+For `BwrapSandbox`, snapshot and restore run **on the host** over the mounted directory, never
+through the daemon, and the store is never mounted. Every entry is hostile:
+- everything is relative to held directory descriptors, one name at a time;
+- `O_NOFOLLOW` everywhere: links are stored as links, their targets never read;
+- FIFOs, sockets and devices are never opened;
+- a restore removes a link where a directory was, without following it, and writes files as
+  new ones renamed into place;
+- on Windows, the checks are by path (`windows.rs`).
 
 **The network (D-064):** `BwrapSandbox` owns a host-side proxy (`src/proxy/`): a Unix socket in a
 private directory mounted read-only at `/run/nixxa`, which the daemon forwards from
@@ -66,7 +95,12 @@ by seccomp. Without Landlock there is no terminal. `HostSandbox` runs the user's
 Unix only; Windows says it needs ConPTY), without the hidden variables, killed in `Drop`.
 `FakeSandbox` has a scripted one.
 
-Tests: `tests/terminal.rs` (the same sandbox, survives everything the agent does, close kills
+Tests: `tests/undo.rs` (patches through the daemon never following a link; links the agent
+makes to host files never entering the store; a directory swapped for a link to the host before
+an undo; `.gitignore` hiding nothing; a FIFO not hanging a checkpoint), the store's own tests
+(`src/checkpoint/tests.rs`: links never read, special files, churn, file and directory swaps,
+hard links, locked directories, the cap, metadata put back, and the 10,000-file timing,
+`--ignored`), `tests/terminal.rs` (the same sandbox, survives everything the agent does, close kills
 its whole tree at once and nothing else, exit / reset / daemon death with reasons, one at a time,
 invisible to the agent's job actions and events, its requests attributed to it, no secret
 environment or host files, unreachable from the agent's commands, TIOCSTI refused),

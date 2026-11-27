@@ -8,6 +8,7 @@
 pub mod accounts;
 pub mod action;
 pub mod brain;
+pub mod checkpoint;
 #[cfg(feature = "conformance")]
 pub mod conformance;
 pub mod context;
@@ -29,6 +30,7 @@ pub use accounts::*;
 pub use action::*;
 pub use async_trait::async_trait;
 pub use brain::*;
+pub use checkpoint::*;
 pub use context::*;
 pub use error::*;
 pub use event::*;

@@ -55,11 +55,40 @@ pub enum SandboxAction {
         /// The full new contents.
         content: String,
     },
+    /// Change a text file by search/replace edits, against the state the agent last read
+    /// ([`Outcome::File`](crate::Outcome::File)'s hash). `WriteFile` stays for new files.
+    ///
+    /// * the file must exist, be a regular file, and not be a symbolic link (never followed);
+    /// * if its hash isn't `expected_hash`, nothing changes and the observation fails with the
+    ///   file's current hash: a stale edit never clobbers;
+    /// * the edits apply in order, each to the result of the ones before; each `search` must
+    ///   match exactly once, and zero or several matches fail, saying which edit;
+    /// * all the edits apply, or none do; the file is replaced at once, with its mode kept.
+    ///
+    /// On success the observation is [`Outcome::Patched`](crate::Outcome::Patched): a unified
+    /// diff of what changed and the file's new hash.
+    Patch {
+        /// Workspace-relative path.
+        path: String,
+        /// The edits, in order.
+        edits: Vec<Edit>,
+        /// The file's hash as the agent last saw it: the lowercase hex SHA-256 of its raw bytes.
+        expected_hash: String,
+    },
     /// List a directory.
     ListDir {
         /// Workspace-relative path. `""` or `"."` = workspace root.
         path: String,
     },
+}
+
+/// One edit of a [`SandboxAction::Patch`]: `search` is replaced by `replace`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Edit {
+    /// Text that must occur exactly once in the file (after the edits before this one).
+    pub search: String,
+    /// What it becomes.
+    pub replace: String,
 }
 
 /// The kind of a [`SandboxAction`], without its arguments.
@@ -72,6 +101,8 @@ pub enum SandboxActionKind {
     ReadFile,
     /// [`SandboxAction::WriteFile`]
     WriteFile,
+    /// [`SandboxAction::Patch`]
+    Patch,
     /// [`SandboxAction::ListDir`]
     ListDir,
     /// [`SandboxAction::JobStatus`]
@@ -84,8 +115,16 @@ pub enum SandboxActionKind {
 
 impl SandboxActionKind {
     /// Every kind, in a stable order.
-    pub const ALL: [SandboxActionKind; 7] =
-        [Self::Exec, Self::ReadFile, Self::WriteFile, Self::ListDir, Self::JobStatus, Self::JobOutput, Self::JobStop];
+    pub const ALL: [SandboxActionKind; 8] = [
+        Self::Exec,
+        Self::ReadFile,
+        Self::WriteFile,
+        Self::Patch,
+        Self::ListDir,
+        Self::JobStatus,
+        Self::JobOutput,
+        Self::JobStop,
+    ];
 }
 
 impl SandboxAction {
@@ -95,6 +134,7 @@ impl SandboxAction {
             Self::Exec { .. } => SandboxActionKind::Exec,
             Self::ReadFile { .. } => SandboxActionKind::ReadFile,
             Self::WriteFile { .. } => SandboxActionKind::WriteFile,
+            Self::Patch { .. } => SandboxActionKind::Patch,
             Self::ListDir { .. } => SandboxActionKind::ListDir,
             Self::JobStatus { .. } => SandboxActionKind::JobStatus,
             Self::JobOutput { .. } => SandboxActionKind::JobOutput,
@@ -104,7 +144,13 @@ impl SandboxAction {
 
     /// Whether the action can change state. `Exec` counts as mutating.
     pub fn is_mutating(&self) -> bool {
-        matches!(self, Self::Exec { .. } | Self::WriteFile { .. })
+        matches!(self, Self::Exec { .. } | Self::WriteFile { .. } | Self::Patch { .. })
+    }
+
+    /// Whether the action can change the workspace's files, so a checkpoint comes before it:
+    /// `WriteFile`, `Patch` and every `Exec`, foreground or background.
+    pub fn changes_files(&self) -> bool {
+        matches!(self, Self::Exec { .. } | Self::WriteFile { .. } | Self::Patch { .. })
     }
 }
 

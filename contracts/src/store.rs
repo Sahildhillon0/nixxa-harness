@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AccountRef, ActionRequest, Message, Observation, SessionId, StoreError, Timestamp, Verdict, WorkspaceInfo,
+    AccountRef, ActionRequest, CheckpointId, Message, Observation, SessionId, StoreError, Timestamp, Verdict,
+    WorkspaceInfo,
 };
 
 /// Input for [`Store::create_session`].
@@ -43,6 +44,10 @@ pub struct ActionRecord {
     pub verdict: Verdict,
     /// The result, if it ran.
     pub observation: Option<Observation>,
+    /// The checkpoint taken just before it ran, for an action that can change files: undoing
+    /// it restores this one. Absent in records written before Stage 7.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointId>,
     /// When the record was written.
     pub at: Timestamp,
 }

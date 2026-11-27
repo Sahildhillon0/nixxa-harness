@@ -251,6 +251,7 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
     app.directory = workspace.root.display().to_string();
     app.root = workspace.root.clone();
     workplace::remove_old_scratch();
+    workplace::remove_old_checkpoints();
     let mut blocked = workplace::blocked(&workspace.root, settings.fake);
     app.ask_place(blocked.clone());
     let mut workplace: Option<Workplace> = None;
@@ -547,6 +548,9 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                             tracing::info!(place = ?chosen.place, "workplace chosen");
                             app.here = chosen.place == Place::Here;
                             app.note(place_note(&chosen, &workspace));
+                            if let Some(why) = &chosen.undo_off {
+                                app.note(format!("Undo is off for this run: {why}."));
+                            }
                             if let Some((brain, account)) = waiting.take() {
                                 let resume = continue_target(&mut continue_latest, &*store, &workspace, &mut app).await;
                                 session = Some(start_session(
@@ -625,6 +629,19 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         });
                     }
                     None => produced_now(&mut app, UiEvent::NetworkSet(Err("choose where to work first".into()))),
+                },
+                Effect::UndoDiff(checkpoint) => match &workplace {
+                    Some(place) => {
+                        let (sandbox, ui_tx) = (place.sandbox.clone(), ui_tx.clone());
+                        tokio::spawn(async move {
+                            let result = sandbox.diff(&checkpoint, None).await.map_err(|err| err.to_string());
+                            let _ = ui_tx.send(UiEvent::UndoDiff { checkpoint, result });
+                        });
+                    }
+                    None => produced_now(
+                        &mut app,
+                        UiEvent::UndoDiff { checkpoint, result: Err("choose where to work first".into()) },
+                    ),
                 },
                 Effect::OpenTerminal(size) => match &workplace {
                     Some(place) => {
@@ -715,6 +732,7 @@ fn receive(app: &mut App, event: UiEvent) -> Vec<Effect> {
         UiEvent::SessionsFound { query, result } => app.sessions_found(&query, result),
         UiEvent::NetworkSet(result) => return app.network_set(result),
         UiEvent::Sandbox(event) => app.sandbox_event(event),
+        UiEvent::UndoDiff { checkpoint, result } => app.undo_diff(&checkpoint, result),
         // Handled in the loop, which holds the sign-in state.
         UiEvent::SignInStarted(_) | UiEvent::SignedIn(_) => {}
     }

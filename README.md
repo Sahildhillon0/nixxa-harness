@@ -34,6 +34,13 @@ Replace one, and the rest never notice.
 > reach it, and it survives everything the agent runs. When a background job the agent started
 > finishes, the agent is told, and if it was waiting it carries on by itself; if you're away, a
 > desktop notification and the bell say so.
+>
+> **Stage 7 — Safe edits: in progress.** The agent edits files with **patches** against the
+> version it read: an edit made on a stale read fails instead of overwriting newer changes. Before every
+> edit and command, and at the start of every turn, Nixxa takes a **checkpoint** of the
+> workspace; **`/undo`** (or `ctrl-z`) shows what going back would change, and restores it, also
+> after a command like `rm -rf` changed files. Checkpoints live outside the workspace and are
+> removed when Nixxa quits.
 
 ---
 
@@ -121,7 +128,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
 | 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **done** |
-| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | planned |
+| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | **in progress** (patches and undo done) |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
 | 10 | Knowledge — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |

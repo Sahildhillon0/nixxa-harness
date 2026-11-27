@@ -427,6 +427,7 @@ pub(crate) mod tests {
                 | UiEvent::SignInStarted(_)
                 | UiEvent::SignedIn(_)
                 | UiEvent::SessionsListed(_)
+                | UiEvent::UndoDiff { .. }
                 | UiEvent::SessionsFound { .. } => panic!("no setup or session list in this test"),
             }
         }

@@ -33,10 +33,25 @@ pub enum Outcome {
         /// The job's id.
         job: JobId,
     },
-    /// Text content: a file read, or a knowledge tool result.
+    /// Text content: a knowledge tool result, a job's status or output.
     Text {
         /// The content.
         content: String,
+    },
+    /// A file read: its contents and its hash, which a [`Patch`](crate::SandboxAction::Patch)
+    /// of it must send back.
+    File {
+        /// The contents.
+        content: String,
+        /// The lowercase hex SHA-256 of the file's raw bytes.
+        hash: String,
+    },
+    /// A patch was applied.
+    Patched {
+        /// What changed, as a unified diff.
+        diff: String,
+        /// The file's new hash, for the next patch.
+        hash: String,
     },
     /// A directory listing.
     Listing {

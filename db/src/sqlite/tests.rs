@@ -112,7 +112,13 @@ async fn reopening_the_file_returns_everything() {
         },
         Message { role: Role::Agent, content: Content::Summary { text: "listed".into() }, at: Timestamp(6) },
     ];
-    let record = ActionRecord { request, verdict: Verdict::Allow, observation: Some(observation), at: Timestamp(5) };
+    let record = ActionRecord {
+        request,
+        verdict: Verdict::Allow,
+        observation: Some(observation),
+        checkpoint: Some(nixxa_contracts::CheckpointId::new("run-1.3")),
+        at: Timestamp(5),
+    };
 
     let id = {
         let store = SqliteStore::open(scratch.db()).await.unwrap();

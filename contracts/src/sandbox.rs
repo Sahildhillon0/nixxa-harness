@@ -5,8 +5,8 @@ use futures_core::stream::BoxStream;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ActionId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, SandboxAction, SandboxActionKind,
-    SandboxError, TerminalSize, Timestamp,
+    ActionId, CheckpointId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, SandboxAction,
+    SandboxActionKind, SandboxError, TerminalSize, Timestamp, WorkspaceDiff,
 };
 
 /// What a sandbox backend can do.
@@ -26,6 +26,9 @@ pub struct SandboxCapabilities {
     /// Whether [`Sandbox::open_terminal`] works: the user's interactive terminal (`ctrl+t`).
     #[serde(default)]
     pub terminal: bool,
+    /// Whether [`Sandbox::checkpoint`], [`Sandbox::restore`] and [`Sandbox::diff`] work: undo.
+    #[serde(default)]
+    pub checkpoints: bool,
     /// Supported action kinds.
     pub actions: Vec<SandboxActionKind>,
 }
@@ -77,6 +80,28 @@ pub struct SandboxCapabilities {
 ///   `resize` fail.
 ///
 /// Without a terminal, `open_terminal` returns [`SandboxError::Unsupported`] with the reason.
+///
+/// Files: a `ReadFile` answers [`Outcome::File`](crate::Outcome::File), with the hash a
+/// [`SandboxAction::Patch`] sends back (the lowercase hex SHA-256 of the file's raw bytes).
+/// Patches, when [`SandboxActionKind::Patch`] is listed, follow [`SandboxAction::Patch`].
+///
+/// Checkpoints, when [`SandboxCapabilities::checkpoints`] is set:
+/// * [`checkpoint`](Sandbox::checkpoint) records the workspace as it is now (files, their
+///   contents and permission bits, directories, symbolic links as links, never followed),
+///   except what the backend leaves out ([`WorkspaceDiff::not_covered`]), and returns its id;
+///   when nothing changed since the last one it may return that one's id;
+/// * [`diff`](Sandbox::diff) says what changed from one checkpoint to another, or to now;
+/// * [`restore`](Sandbox::restore) puts the workspace back as it was at a checkpoint: contents,
+///   deleted files and directories, permission bits, and removes what was created since; it
+///   returns what it undid (the diff from the checkpoint to how things were just before), and
+///   never writes outside the workspace or through a symbolic link;
+/// * any checkpoint can be restored, an older one after a newer one too, and checkpoints
+///   survive [`reset`](Sandbox::reset);
+/// * an id this sandbox never returned, or whose store is gone, is
+///   [`SandboxError::NoCheckpoint`]; a checkpoint that would pass the store's size cap is
+///   [`SandboxError::LimitExceeded`], and nothing is recorded.
+///
+/// Without checkpoints, all three return [`SandboxError::Unsupported`].
 #[async_trait]
 pub trait Sandbox: Send + Sync {
     /// What this backend supports.
@@ -103,6 +128,24 @@ pub trait Sandbox: Send + Sync {
     async fn open_terminal(&self, size: TerminalSize) -> Result<OpenTerminal, SandboxError> {
         let _ = size;
         Err(SandboxError::Unsupported("this sandbox has no terminal".into()))
+    }
+
+    /// Records the workspace as it is now. The default, for backends without checkpoints, is
+    /// [`SandboxError::Unsupported`].
+    async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
+        Err(SandboxError::Unsupported("this sandbox has no checkpoints".into()))
+    }
+
+    /// Puts the workspace back as it was at `checkpoint`, and says what that undid.
+    async fn restore(&self, checkpoint: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {
+        let _ = checkpoint;
+        Err(SandboxError::Unsupported("this sandbox has no checkpoints".into()))
+    }
+
+    /// What changed from `from` to `to`, or to now when `to` is `None`.
+    async fn diff(&self, from: &CheckpointId, to: Option<&CheckpointId>) -> Result<WorkspaceDiff, SandboxError> {
+        let _ = (from, to);
+        Err(SandboxError::Unsupported("this sandbox has no checkpoints".into()))
     }
 
     /// The sandbox's events from now on. Dropping the stream unsubscribes. The default, for

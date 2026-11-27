@@ -21,6 +21,7 @@ mod setup;
 mod terminal;
 mod tui;
 mod ui;
+mod undo;
 mod wiring;
 mod workplace;
 

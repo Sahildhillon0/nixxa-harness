@@ -9,6 +9,7 @@
 
 #[cfg(target_os = "linux")]
 pub mod bwrap;
+pub mod checkpoint;
 mod events;
 pub mod fake;
 pub mod host;
@@ -16,6 +17,7 @@ pub mod host;
 mod host_terminal;
 mod job;
 pub mod network;
+mod patch;
 #[cfg(target_os = "linux")]
 mod protocol;
 #[cfg(target_os = "linux")]

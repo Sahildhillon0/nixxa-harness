@@ -23,6 +23,7 @@ use crate::place::{Place, PlacePicker};
 use crate::sessions::{ListKey, SessionList};
 use crate::setup::Setup;
 use crate::terminal::{self, PaneKey, TerminalPane};
+use crate::undo::{self, Checkpoints, UndoView, ViewKey};
 use nixxa_contracts::TerminalSize;
 
 /// How long a first ctrl-c waits for a second one to quit.
@@ -96,6 +97,10 @@ pub(crate) enum Happening {
     JobEnded { job: nixxa_contracts::JobId, command: String, exit_code: Option<i32>, status: String },
     /// The controller started a turn for these ended jobs.
     WakeUp { jobs: Vec<nixxa_contracts::JobId> },
+    /// No checkpoint could be taken: what it was for can't be undone (D-072).
+    NotUndoable { label: String, reason: String },
+    /// The user's undo put the workspace back (D-073).
+    Restored { label: String, paths: usize },
 }
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
@@ -141,6 +146,8 @@ pub(crate) enum Effect {
     /// Bytes for the terminal's shell: what the user typed or pasted there. Never approved,
     /// never sent to the agent.
     TerminalInput(Vec<u8>),
+    /// Ask the sandbox what changed since this checkpoint, for the undo view.
+    UndoDiff(nixxa_contracts::CheckpointId),
 }
 
 /// Everything the TUI shows.
@@ -201,6 +208,10 @@ pub(crate) struct App {
     pub(crate) notifications: Notifications,
     /// Whether the running turn was started by the controller for ended jobs.
     woken: bool,
+    /// The checkpoints of this run (D-072).
+    pub(crate) checkpoints: Checkpoints,
+    /// The undo view (`/undo`, `ctrl+z`), when open.
+    pub(crate) undo: Option<UndoView>,
 }
 
 impl App {
@@ -241,6 +252,8 @@ impl App {
             happenings: Vec::new(),
             notifications: Notifications::new(Channels::default(), Instant::now()),
             woken: false,
+            checkpoints: Checkpoints::default(),
+            undo: None,
         }
     }
 
@@ -526,6 +539,7 @@ impl App {
             Event::ModeChanged { mode } => self.mode = mode,
             Event::AccountChanged { account } => self.account = Some(account),
             Event::TurnStarted { .. } => {
+                self.close_undo("a turn started while /undo was open: open it again once it is over");
                 self.busy = true;
                 self.streaming = None;
                 self.scroll_back = 0;
@@ -598,7 +612,111 @@ impl App {
                     self.conversation.push(Entry { speaker: Speaker::Agent, text });
                 }
             }
+            Event::Checkpoint { turn, checkpoint, before } => {
+                let label = self.checkpoint_label(&turn, before.as_ref());
+                self.checkpoints.taken(checkpoint, label);
+                self.close_undo("the workspace changed while /undo was open: open it again");
+            }
+            Event::NotUndoable { turn, before, reason } => {
+                let label = self.checkpoint_label(&turn, before.as_ref());
+                self.checkpoints.missing(label.clone(), reason.clone());
+                self.happenings.push((self.activity.len(), Happening::NotUndoable { label, reason }));
+            }
+            Event::Restored { checkpoint, undone } => {
+                let label = self
+                    .checkpoints
+                    .choices()
+                    .into_iter()
+                    .find(|choice| choice.id == checkpoint)
+                    .map_or_else(|| "at a checkpoint".to_string(), |choice| choice.label);
+                let paths = undone.changes.len();
+                let text = format!(
+                    "Undone: the workspace is back as it was {label}. {paths} path{} went back; the agent is told.",
+                    if paths == 1 { "" } else { "s" }
+                );
+                self.conversation.push(Entry { speaker: Speaker::System, text });
+                self.happenings.push((self.activity.len(), Happening::Restored { label, paths }));
+                self.undo = None;
+            }
             Event::SessionEnded { .. } => self.ended = true,
+        }
+    }
+
+    /// What a checkpoint comes before, in words: an action, the start of a turn, or an undo.
+    fn checkpoint_label(&self, turn: &nixxa_contracts::TurnId, before: Option<&nixxa_contracts::ActionId>) -> String {
+        if let Some(id) = before {
+            return match self.activity.iter().rev().find(|a| &a.request.id == id) {
+                Some(activity) => {
+                    let (kind, target) = crate::ui::describe(&activity.request);
+                    format!("before `{kind} {}`", crate::ui::truncate(&target, 60))
+                }
+                None => format!("before action {id}"),
+            };
+        }
+        if turn.as_str().starts_with("undo-") {
+            return "before the last undo".to_string();
+        }
+        if self.woken {
+            return "at the start of a turn the agent was woken for".to_string();
+        }
+        match self.conversation.iter().rev().find(|entry| entry.speaker == Speaker::User) {
+            Some(entry) => format!("at the start of the turn for \"{}\"", crate::ui::truncate(&entry.text, 40)),
+            None => "at the start of a turn".to_string(),
+        }
+    }
+
+    /// Opens the undo view, or says why it can't open.
+    fn open_undo(&mut self) -> Vec<Effect> {
+        if self.busy {
+            self.notice = Some("/undo works between turns: wait for this one to finish, or stop it with ctrl-c".into());
+            return Vec::new();
+        }
+        if !self.sandbox.as_ref().is_some_and(|caps| caps.checkpoints) {
+            self.notice = Some("this place keeps no checkpoints, so there is nothing to undo".into());
+            return Vec::new();
+        }
+        let choices = self.checkpoints.choices();
+        if choices.is_empty() {
+            self.notice = Some("nothing to undo yet: no checkpoint has been taken".into());
+            return Vec::new();
+        }
+        let view = UndoView::new(choices, self.checkpoints.newest().cloned());
+        let first = view.chosen().id.clone();
+        self.undo = Some(view);
+        vec![Effect::UndoDiff(first)]
+    }
+
+    fn close_undo(&mut self, why: &str) {
+        if self.undo.take().is_some() {
+            self.notice = Some(why.into());
+        }
+    }
+
+    fn undo_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let Some(view) = self.undo.as_mut() else { return Vec::new() };
+        match view.key(key) {
+            ViewKey::Nothing => Vec::new(),
+            ViewKey::Diff(id) => vec![Effect::UndoDiff(id)],
+            ViewKey::Close => {
+                self.undo = None;
+                Vec::new()
+            }
+            ViewKey::Undo { to, seen } => {
+                self.undo = None;
+                self.notice = Some("undoing…".into());
+                vec![Effect::Send(Command::Undo { to, seen })]
+            }
+        }
+    }
+
+    /// The diff the undo view asked for.
+    pub(crate) fn undo_diff(
+        &mut self,
+        id: &nixxa_contracts::CheckpointId,
+        result: Result<nixxa_contracts::WorkspaceDiff, String>,
+    ) {
+        if let Some(view) = self.undo.as_mut() {
+            view.diff_ready(id, result);
         }
     }
 
@@ -649,6 +767,12 @@ impl App {
         }
         if self.network.open {
             return self.network_key(key);
+        }
+        if self.undo.is_some() {
+            return self.undo_key(key);
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
+            return self.open_undo();
         }
         // Over an approval prompt too: allowing a host may be the answer to it.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
@@ -799,6 +923,9 @@ impl App {
             KeyCode::Enter if newline => self.input.push('\n'),
             KeyCode::Enter => {
                 let text = std::mem::take(&mut self.input);
+                if text.trim() == undo::COMMAND {
+                    return self.open_undo();
+                }
                 if !text.trim().is_empty() {
                     if self.busy {
                         // The controller runs it after the current turn; show it until then.
@@ -1433,6 +1560,7 @@ pub(crate) mod tests {
                 network: NetworkAccess::default(),
                 jobs: false,
                 terminal: true,
+                checkpoints: false,
                 actions: Vec::new(),
             },
         });
@@ -1458,6 +1586,7 @@ pub(crate) mod tests {
                 network: NetworkAccess::default(),
                 jobs: true,
                 terminal: true,
+                checkpoints: false,
                 actions: Vec::new(),
             },
         });
@@ -1574,5 +1703,139 @@ pub(crate) mod tests {
             assert!(app.approval().is_none());
             assert_eq!(asking.await.unwrap(), expected);
         }
+    }
+
+    // ---- /undo (D-073) ----
+
+    fn with_checkpoints() -> App {
+        let mut app = App::new(false);
+        app.apply(Event::SandboxStatus {
+            capabilities: SandboxCapabilities {
+                backend: "bubblewrap".into(),
+                isolated: true,
+                network: NetworkAccess::Controlled(NetworkPolicy::Off),
+                jobs: true,
+                terminal: true,
+                checkpoints: true,
+                actions: nixxa_contracts::SandboxActionKind::ALL.to_vec(),
+            },
+        });
+        app
+    }
+
+    fn checkpoint(app: &mut App, id: &str, before: Option<&str>) {
+        app.apply(Event::Checkpoint {
+            turn: turn(),
+            checkpoint: nixxa_contracts::CheckpointId::new(id),
+            before: before.map(ActionId::new),
+        });
+    }
+
+    /// One turn: the user's message, a checkpoint at its start, one action with its own.
+    fn one_turn(app: &mut App) {
+        app.apply(Event::TurnStarted { turn: turn() });
+        app.apply(Event::Message { turn: turn(), message: Message::text(Role::User, "clean up", Timestamp(0)) });
+        checkpoint(app, "c1", None);
+        app.apply(Event::ActionProposed { turn: turn(), request: request("a1") });
+        checkpoint(app, "c2", Some("a1"));
+        app.apply(Event::TurnDone { turn: turn() });
+    }
+
+    #[test]
+    fn ctrl_z_and_slash_undo_open_the_view_on_the_last_checkpoint() {
+        let mut app = with_checkpoints();
+        one_turn(&mut app);
+        let effects = app.handle_key(ctrl('z'));
+        assert_eq!(effects, vec![Effect::UndoDiff(nixxa_contracts::CheckpointId::new("c2"))]);
+        let view = app.undo.as_ref().expect("open");
+        assert_eq!(view.chosen().label, "before `exec ls`");
+        assert_eq!(view.choices[1].label, "at the start of the turn for \"clean up\"");
+        app.handle_key(key(KeyCode::Esc));
+        assert!(app.undo.is_none());
+        type_text(&mut app, "/undo");
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(effects, vec![Effect::UndoDiff(nixxa_contracts::CheckpointId::new("c2"))], "not sent as a message");
+        assert!(app.input.is_empty() && app.undo.is_some());
+    }
+
+    #[test]
+    fn undo_sends_the_checkpoint_and_what_the_user_saw_after_a_second_enter() {
+        let mut app = with_checkpoints();
+        one_turn(&mut app);
+        app.handle_key(ctrl('z'));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Left)),
+            vec![Effect::UndoDiff(nixxa_contracts::CheckpointId::new("c1"))]
+        );
+        let change = nixxa_contracts::FileChange {
+            path: "src/main.rs".into(),
+            before: Some(nixxa_contracts::EntryState::Dir { mode: 0o755 }),
+            after: None,
+            diff: None,
+        };
+        let diff = nixxa_contracts::WorkspaceDiff { changes: vec![change], not_covered: Vec::new() };
+        app.undo_diff(&nixxa_contracts::CheckpointId::new("c1"), Ok(diff));
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty(), "the first enter asks");
+        let effects = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(
+            effects,
+            vec![Effect::Send(Command::Undo {
+                to: nixxa_contracts::CheckpointId::new("c1"),
+                seen: Some(nixxa_contracts::CheckpointId::new("c2")),
+            })]
+        );
+        assert!(app.undo.is_none());
+    }
+
+    #[test]
+    fn undo_is_refused_during_a_turn_or_an_approval_and_without_checkpoints() {
+        let mut app = with_checkpoints();
+        one_turn(&mut app);
+        app.apply(Event::TurnStarted { turn: turn() });
+        assert!(app.handle_key(ctrl('z')).is_empty());
+        assert!(app.undo.is_none());
+        assert!(app.notice.as_deref().unwrap().contains("between turns"), "{:?}", app.notice);
+        // Typed as a message during a turn, it still isn't sent to the agent.
+        type_text(&mut app, "/undo");
+        assert!(app.handle_key(key(KeyCode::Enter)).is_empty());
+        let mut none = App::new(false);
+        assert!(none.handle_key(ctrl('z')).is_empty());
+        assert!(none.notice.as_deref().unwrap().contains("keeps no checkpoints"));
+        let mut early = with_checkpoints();
+        assert!(early.handle_key(ctrl('z')).is_empty());
+        assert!(early.notice.as_deref().unwrap().contains("nothing to undo yet"));
+    }
+
+    #[test]
+    fn a_new_checkpoint_or_turn_closes_a_stale_view() {
+        let mut app = with_checkpoints();
+        one_turn(&mut app);
+        app.handle_key(ctrl('z'));
+        checkpoint(&mut app, "c3", None);
+        assert!(app.undo.is_none(), "what it showed is stale");
+        assert!(app.notice.as_deref().unwrap().contains("changed while /undo was open"));
+        app.notice = None;
+        app.handle_key(ctrl('z'));
+        app.apply(Event::TurnStarted { turn: turn() });
+        assert!(app.undo.is_none());
+    }
+
+    #[test]
+    fn restores_and_actions_without_a_checkpoint_show_in_the_panes() {
+        let mut app = with_checkpoints();
+        one_turn(&mut app);
+        app.apply(Event::NotUndoable {
+            turn: turn(),
+            before: Some(ActionId::new("a1")),
+            reason: "the store is full".into(),
+        });
+        let undone = nixxa_contracts::WorkspaceDiff::default();
+        app.apply(Event::Restored { checkpoint: nixxa_contracts::CheckpointId::new("c1"), undone });
+        assert!(matches!(&app.happenings[0].1, Happening::NotUndoable { reason, .. } if reason == "the store is full"));
+        assert!(
+            matches!(&app.happenings[1].1, Happening::Restored { paths: 0, label } if label.contains("start of the turn"))
+        );
+        let note = &app.conversation.last().unwrap().text;
+        assert!(note.starts_with("Undone: the workspace is back as it was at the start of the turn"), "{note}");
     }
 }

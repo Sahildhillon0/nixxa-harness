@@ -10,6 +10,9 @@
 //! (D-008); the in-memory `FakeSandbox` is only used with `--fake` and in tests. The workspace
 //! guard ([`guard`], D-049) keeps the agent out of the home directory and the places that hold
 //! keys and Nixxa's own data.
+//!
+//! Every place but the demo keeps checkpoints for undo (D-071) in a store of its own under
+//! `<data dir>/nixxa/checkpoints/<run>`, on the host, removed when Nixxa quits.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -17,6 +20,7 @@ use std::sync::Arc;
 
 use nixxa_contracts::{Sandbox, WorkspaceInfo};
 use nixxa_sandbox::JobLimits;
+use nixxa_sandbox::checkpoint::{CheckpointConfig, DEFAULT_CAP};
 use nixxa_sandbox::fake::FakeSandbox;
 use nixxa_sandbox::host::{HostConfig, HostSandbox};
 
@@ -84,30 +88,37 @@ pub(crate) struct Workplace {
     pub(crate) sandbox: Arc<dyn Sandbox>,
     /// For "Work on a copy": where the copy is, to tell the user when Nixxa quits.
     pub(crate) copy: Option<PathBuf>,
+    /// Why there is no undo here, when there isn't (no data directory for its store).
+    pub(crate) undo_off: Option<String>,
     fake: bool,
 }
 
 impl Workplace {
     /// The in-memory sandbox, for `--fake` and tests.
     pub(crate) fn fake() -> Self {
-        Self { place: Place::Sandbox, sandbox: Arc::new(FakeSandbox::default()), copy: None, fake: true }
+        Self {
+            place: Place::Sandbox,
+            sandbox: Arc::new(FakeSandbox::default()),
+            copy: None,
+            undo_off: None,
+            fake: true,
+        }
     }
 
     /// Sets up `place` for the launch directory in `workspace`. Blocking: it may copy a
     /// directory and probe systemd, so the UI loop runs it on a blocking thread.
     pub(crate) fn new(place: Place, workspace: &WorkspaceInfo) -> Result<Self, String> {
-        if place == Place::Here {
-            let config = HostConfig {
-                root: workspace.root.clone(),
-                hidden_env: SECRET_ENV.iter().map(|name| (*name).to_string()).collect(),
-                jobs: job_limits(),
-                // The terminal runs the user's own shell.
-                shell: std::env::var_os("SHELL").filter(|shell| !shell.is_empty()).map(PathBuf::from),
-            };
-            let sandbox = HostSandbox::new(config).map_err(|err| format!("can't work in this directory: {err}"))?;
-            return Ok(Self { place, sandbox: Arc::new(sandbox), copy: None, fake: false });
-        }
-        sandboxed(place, workspace)
+        let (checkpoints, undo_off) = match checkpoint_config() {
+            Ok(config) => (Some(config), None),
+            Err(why) => (None, Some(why)),
+        };
+        let mut workplace = if place == Place::Here {
+            here(workspace, checkpoints)?
+        } else {
+            sandboxed(place, workspace, checkpoints)?
+        };
+        workplace.undo_off = undo_off;
+        Ok(workplace)
     }
 
     /// Whether this is the in-memory demo sandbox (`--fake`).
@@ -129,22 +140,100 @@ impl Workplace {
     }
 }
 
+/// "This directory": the real files through `HostSandbox`.
+fn here(workspace: &WorkspaceInfo, checkpoints: Option<CheckpointConfig>) -> Result<Workplace, String> {
+    let config = HostConfig {
+        root: workspace.root.clone(),
+        hidden_env: SECRET_ENV.iter().map(|name| (*name).to_string()).collect(),
+        jobs: job_limits(),
+        // The terminal runs the user's own shell.
+        shell: std::env::var_os("SHELL").filter(|shell| !shell.is_empty()).map(PathBuf::from),
+        checkpoints,
+    };
+    let sandbox = HostSandbox::new(config).map_err(|err| format!("can't work in this directory: {err}"))?;
+    Ok(Workplace { place: Place::Here, sandbox: Arc::new(sandbox), copy: None, undo_off: None, fake: false })
+}
+
+/// `<data dir>/nixxa/checkpoints`, where each run's checkpoint store goes.
+fn checkpoints_root() -> Option<PathBuf> {
+    paths::data_dir(Platform::current(), &|name| std::env::var_os(name))
+        .map(|dir| dir.join("nixxa").join("checkpoints"))
+}
+
+/// A new checkpoint store for this run (the sandbox creates it, 0700), or why there is none.
+fn checkpoint_config() -> Result<CheckpointConfig, String> {
+    let root = checkpoints_root().ok_or("there is no data directory to keep checkpoints in")?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis());
+    Ok(CheckpointConfig { dir: root.join(format!("{stamp}-{}", std::process::id())), cap: DEFAULT_CAP })
+}
+
+/// Checkpoint stores older than this are left from a run that didn't end cleanly.
+const OLD_STORE: std::time::Duration = std::time::Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Removes checkpoint stores left by earlier runs that crashed (a clean quit removes its own).
+pub(crate) fn remove_old_checkpoints() {
+    if let Some(root) = checkpoints_root() {
+        remove_old_stores(&root, std::time::SystemTime::now(), &running);
+    }
+}
+
+/// Whether the Nixxa with this pid may still be running: on Linux, whether `/proc` has it;
+/// elsewhere unknown, so only the store's age decides.
+fn running(pid: u32) -> bool {
+    cfg!(target_os = "linux") && Path::new("/proc").join(pid.to_string()).exists()
+}
+
+/// Removes the stores under `root` that are old by `now`: the store and its `alive` file
+/// (rewritten at every checkpoint) both older than [`OLD_STORE`], and the Nixxa whose pid ends
+/// its name (`<millis>-<pid>`) not running.
+fn remove_old_stores(root: &Path, now: std::time::SystemTime, running: &dyn Fn(u32) -> bool) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let Some(cutoff) = now.checked_sub(OLD_STORE) else { return };
+    for entry in entries.flatten() {
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let path = entry.path();
+        let modified = |path: &Path| std::fs::metadata(path).and_then(|m| m.modified()).ok();
+        let newest =
+            [modified(&path), modified(&path.join(nixxa_sandbox::checkpoint::ALIVE))].into_iter().flatten().max();
+        let pid = entry.file_name().to_str().and_then(|name| name.rsplit('-').next()?.parse::<u32>().ok());
+        if newest.is_some_and(|newest| newest < cutoff) && !pid.is_some_and(running) {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
-fn sandboxed(_place: Place, _workspace: &WorkspaceInfo) -> Result<Workplace, String> {
+fn sandboxed(
+    _place: Place,
+    _workspace: &WorkspaceInfo,
+    _checkpoints: Option<CheckpointConfig>,
+) -> Result<Workplace, String> {
     Err(NOT_LINUX.into())
 }
 
 #[cfg(target_os = "linux")]
-fn sandboxed(place: Place, workspace: &WorkspaceInfo) -> Result<Workplace, String> {
+fn sandboxed(
+    place: Place,
+    workspace: &WorkspaceInfo,
+    checkpoints: Option<CheckpointConfig>,
+) -> Result<Workplace, String> {
     let exe_dir = std::env::current_exe().ok().and_then(|exe| exe.parent().map(Path::to_path_buf));
     let daemon = find_daemon(exe_dir.as_deref(), std::env::var_os("PATH")).ok_or(DAEMON_MISSING)?;
     let scratch = scratch_root().ok_or("there is no data directory for the sandbox's scratch folders")?;
-    sandboxed_with(place, workspace, &daemon, &scratch)
+    sandboxed_with(place, workspace, &daemon, &scratch, checkpoints)
 }
 
 /// A sandboxed place, with the daemon binary and scratch root given.
 #[cfg(target_os = "linux")]
-fn sandboxed_with(place: Place, workspace: &WorkspaceInfo, daemon: &Path, scratch: &Path) -> Result<Workplace, String> {
+fn sandboxed_with(
+    place: Place,
+    workspace: &WorkspaceInfo,
+    daemon: &Path,
+    scratch: &Path,
+    checkpoints: Option<CheckpointConfig>,
+) -> Result<Workplace, String> {
     use crate::copy;
 
     let new_scratch = || {
@@ -164,19 +253,20 @@ fn sandboxed_with(place: Place, workspace: &WorkspaceInfo, daemon: &Path, scratc
         }
         Place::Here => unreachable!("handled by Workplace::new"),
     };
-    let sandbox = bwrap(&dir, daemon).inspect_err(|_| {
+    let sandbox = bwrap(&dir, daemon, checkpoints).inspect_err(|_| {
         if place != Place::SandboxHere {
             let _ = std::fs::remove_dir_all(&dir);
         }
     })?;
-    Ok(Workplace { place, sandbox, copy, fake: false })
+    Ok(Workplace { place, sandbox, copy, undo_off: None, fake: false })
 }
 
 #[cfg(target_os = "linux")]
-fn bwrap(dir: &Path, daemon: &Path) -> Result<Arc<dyn Sandbox>, String> {
+fn bwrap(dir: &Path, daemon: &Path, checkpoints: Option<CheckpointConfig>) -> Result<Arc<dyn Sandbox>, String> {
     use nixxa_sandbox::bwrap::{BwrapConfig, BwrapSandbox};
 
     let mut config = BwrapConfig::new(dir, daemon);
+    config.checkpoints = checkpoints;
     if let Some(path) = std::env::var_os("PATH") {
         config.search_path = std::env::split_paths(&path).collect();
     }
@@ -412,6 +502,29 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn only_stores_that_are_old_and_whose_nixxa_is_gone_are_removed() {
+        use std::time::{Duration, SystemTime};
+        let root = std::env::temp_dir().join(format!("nixxa-stores-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for name in ["100-11", "200-22", "300-33"] {
+            std::fs::create_dir_all(root.join(name)).unwrap();
+            std::fs::write(root.join(name).join(nixxa_sandbox::checkpoint::ALIVE), "x").unwrap();
+        }
+        // In four days: all three look old; 22's Nixxa still runs; 33's store was touched then.
+        let later = SystemTime::now() + Duration::from_secs(4 * 24 * 60 * 60);
+        let touched = std::fs::File::options()
+            .write(true)
+            .open(root.join("300-33").join(nixxa_sandbox::checkpoint::ALIVE))
+            .unwrap();
+        touched.set_modified(later).unwrap();
+        remove_old_stores(&root, later, &|pid| pid == 22);
+        let mut left: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name()).collect();
+        left.sort();
+        assert_eq!(left, vec![std::ffi::OsString::from("200-22"), std::ffi::OsString::from("300-33")]);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The places against the real sandbox: the daemon this workspace built, and `bwrap`.
     /// Skipped loudly when either is missing, like the sandbox crate's own tests.
     #[cfg(target_os = "linux")]
@@ -468,7 +581,7 @@ mod tests {
         async fn work_on_my_files_changes_the_real_files() {
             let Some(daemon) = daemon() else { return };
             let (_s, workspace, scratch) = setup("mount");
-            let place = sandboxed_with(Place::SandboxHere, &workspace, &daemon, &scratch).expect("starts");
+            let place = sandboxed_with(Place::SandboxHere, &workspace, &daemon, &scratch, None).expect("starts");
             place.sandbox.health().await.expect("the daemon answers");
             assert!(place.sandbox.capabilities().isolated, "{:?}", place.sandbox.capabilities());
             assert!(matches!(run(&place, write("notes.txt")).await, Outcome::Written { .. }));
@@ -480,7 +593,7 @@ mod tests {
         async fn work_on_a_copy_leaves_the_original_alone() {
             let Some(daemon) = daemon() else { return };
             let (_s, workspace, scratch) = setup("copy");
-            let place = sandboxed_with(Place::SandboxCopy, &workspace, &daemon, &scratch).expect("starts");
+            let place = sandboxed_with(Place::SandboxCopy, &workspace, &daemon, &scratch, None).expect("starts");
             let copy = place.copy.clone().expect("the copy's path");
             assert!(copy.starts_with(&scratch));
             assert!(matches!(run(&place, write("notes.txt")).await, Outcome::Written { .. }));
@@ -495,13 +608,43 @@ mod tests {
         async fn the_empty_sandbox_starts_empty() {
             let Some(daemon) = daemon() else { return };
             let (_s, workspace, scratch) = setup("empty");
-            let place = sandboxed_with(Place::Sandbox, &workspace, &daemon, &scratch).expect("starts");
+            let place = sandboxed_with(Place::Sandbox, &workspace, &daemon, &scratch, None).expect("starts");
             match run(&place, SandboxAction::ListDir { path: ".".into() }).await {
                 Outcome::Listing { entries } => assert!(entries.is_empty(), "{entries:?}"),
                 other => panic!("{other:?}"),
             }
             assert!(matches!(run(&place, write("x.txt")).await, Outcome::Written { .. }));
             assert!(!workspace.root.join("x.txt").exists(), "the project is untouched");
+        }
+
+        /// The stage's exit check, in every place: a command deletes and creates files, and
+        /// restoring the checkpoint before it puts them back.
+        #[tokio::test]
+        async fn undo_restores_after_a_command_in_every_place() {
+            let Some(daemon) = daemon() else { return };
+            for place in [Place::Sandbox, Place::Here, Place::SandboxHere, Place::SandboxCopy] {
+                let (s, workspace, scratch) = setup(&format!("undo-{place:?}"));
+                let store = CheckpointConfig { dir: s.0.join("checkpoints"), cap: DEFAULT_CAP };
+                let chosen = match place {
+                    Place::Here => here(&workspace, Some(store)),
+                    _ => sandboxed_with(place, &workspace, &daemon, &scratch, Some(store)),
+                };
+                let place_ = chosen.expect("starts");
+                let sandbox = &place_.sandbox;
+                assert!(sandbox.capabilities().checkpoints, "{place:?}");
+                let made = exec("mkdir -p src && printf 'fn main() {}\\n' > src/main.rs");
+                assert!(matches!(run(&place_, made).await, Outcome::Exec { exit_code: Some(0), .. }));
+                let before = sandbox.checkpoint().await.expect("checkpoint");
+                let gone = exec("rm -rf src && echo x > new.txt");
+                assert!(matches!(run(&place_, gone).await, Outcome::Exec { exit_code: Some(0), .. }));
+                let undone = sandbox.restore(&before).await.expect("restore");
+                assert!(undone.changes.iter().any(|c| c.path == "src/main.rs"), "{place:?}: {undone:?}");
+                let check = exec("cat src/main.rs && test ! -e new.txt && echo restored");
+                let Outcome::Exec { stdout, .. } = run(&place_, check).await else { panic!("{place:?}") };
+                assert_eq!(stdout, "fn main() {}\nrestored\n", "{place:?}");
+                drop(place_);
+                assert!(!s.0.join("checkpoints").exists(), "{place:?}: the store goes with the sandbox");
+            }
         }
     }
 }

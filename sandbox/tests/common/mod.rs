@@ -47,6 +47,13 @@ pub fn config(workspace: &Path) -> BwrapConfig {
     config.memory_max = 256 * 1024 * 1024;
     config.data_max = 1024 * 1024 * 1024;
     config.pids_max = 64;
+    // Checkpoints beside the workspace, so they go with the scratch tree.
+    static STORES: AtomicU32 = AtomicU32::new(0);
+    let parent = workspace.parent().unwrap_or(workspace);
+    config.checkpoints = Some(nixxa_sandbox::checkpoint::CheckpointConfig {
+        dir: parent.join(format!("checkpoints-{}", STORES.fetch_add(1, Ordering::SeqCst))),
+        cap: nixxa_sandbox::checkpoint::DEFAULT_CAP,
+    });
     config
 }
 

@@ -78,7 +78,28 @@ user's terminal, other sessions' jobs).
   the agent never hears of (the cancel stops only foreground commands); reset and the session's
   end stop it.
 
-Not yet: secret redaction and `AGENTS.md` policy (Stage 7), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
+## Stage 7: checkpoints and undo (D-072)
+
+- **Checkpoints:** when the sandbox keeps them, one is taken before every patch, write and
+  command (foreground or background) that passed the gate, and one at the start of every turn
+  (so "undo the last turn" is one step). Each is announced (`Event::Checkpoint { turn,
+  checkpoint, before }`) and stored on the action's `ActionRecord.checkpoint`.
+- **None taken** (the store's cap, a failure): the action runs anyway. The user gets
+  `Event::NotUndoable`, and the agent a note at its next step.
+- **`Command::Undo { to, seen }`:** between turns only (kept while a turn or approval is open).
+  It is refused if a checkpoint newer than `seen` was taken (the user didn't see those changes).
+  Otherwise, in order:
+  1. it counts as the user leading, so nothing wakes the agent;
+  2. the agent's running background jobs are stopped;
+  3. a checkpoint is taken, so the undo can itself be undone;
+  4. the restore runs, and `Event::Restored` follows;
+  5. one note between turns tells the agent which paths went back, that its reads are stale,
+     and which jobs were stopped.
+- **Tests:** the order (checkpoint, then action; reads and listings get none; a denied action
+  none), the cap, undo between turns only and after an open approval, a stale `seen`, jobs
+  stopped first, and the note given once.
+
+Not yet: secret redaction and `AGENTS.md` policy (Stage 7, PRs B and C), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
 
 Tests: `cargo test -p nixxa-controller`. The fakes live in `tests/controller.rs` because the
 controller may depend only on `contracts`.

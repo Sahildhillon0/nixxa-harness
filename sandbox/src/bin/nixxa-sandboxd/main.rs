@@ -18,6 +18,9 @@ mod landlock;
 #[cfg(target_os = "linux")]
 mod network;
 #[cfg(target_os = "linux")]
+#[path = "../../patch.rs"]
+mod patch;
+#[cfg(target_os = "linux")]
 #[path = "../../protocol.rs"]
 #[allow(dead_code)]
 mod protocol;
@@ -437,6 +440,11 @@ mod daemon {
                 SandboxAction::WriteFile { path, content } => {
                     let outcome = files::write(&self.root, &path, &content, self.limits.write_cap);
                     log(format_args!("write id={id} ok={}", !matches!(outcome, Outcome::Failed { .. })));
+                    self.outcome(id, outcome);
+                }
+                SandboxAction::Patch { path, edits, expected_hash } => {
+                    let outcome = files::patch(&self.root, &path, &edits, &expected_hash, self.limits.write_cap);
+                    log(format_args!("patch id={id} ok={}", !matches!(outcome, Outcome::Failed { .. })));
                     self.outcome(id, outcome);
                 }
                 SandboxAction::ListDir { path } => {

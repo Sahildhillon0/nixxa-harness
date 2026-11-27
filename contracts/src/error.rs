@@ -1,7 +1,7 @@
 //! One error enum per contract trait. Implementations map their internal errors into these;
 //! internal error types never cross a module boundary.
 
-use crate::{AccountRef, SessionId, SourceId};
+use crate::{AccountRef, CheckpointId, SessionId, SourceId};
 
 /// Errors from [`Brain`](crate::Brain).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -41,9 +41,13 @@ pub enum SandboxError {
     /// The action hit the sandbox's hard time limit.
     #[error("timed out")]
     Timeout,
-    /// The action hit another hard limit (memory, output, processes…).
+    /// The action hit another hard limit (memory, output, processes, the checkpoint store's
+    /// size cap…).
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
+    /// No such checkpoint: never taken by this sandbox, or its store is gone.
+    #[error("no such checkpoint: {0}")]
+    NoCheckpoint(CheckpointId),
     /// Anything else.
     #[error("{0}")]
     Other(String),

@@ -172,22 +172,23 @@ internal is `pub(crate)`.
 | `Content` | What a `Message` carries: text, a proposed `ActionRequest`, an `Observation`, `Reasoning` (opaque provider data such as a signed thinking block) — so the brain can rebuild tool-call history exactly — or `Summary` (a turn's `Done` summary: stored, never sent back to the brain or shown, D-056) |
 | `Intent` | What the brain wants: `Say(text)`, `Act(Action)`, `Done(summary)` |
 | `Action` | `Sandbox(SandboxAction)` or `Knowledge(KnowledgeAction)` — the controller routes on this |
-| `SandboxAction` | `Exec` (foreground or background), `ReadFile`, `WriteFile`, `ListDir`, `JobStatus`, `JobOutput`, `JobStop`, … |
+| `SandboxAction` | `Exec` (foreground or background), `ReadFile`, `WriteFile`, `Patch` (search/replace edits against the file's hash), `ListDir`, `JobStatus`, `JobOutput`, `JobStop`, … |
 | `KnowledgeAction` | `Call { source, tool, args }` (a source's tool; its `ToolSpec.mutating` says whether it writes) or `Record { source, entry }` (structured write-back) |
 | `ToolSpec` | A knowledge tool: source, name, description, JSON-Schema input, `mutating` flag |
 | `Primer` | Context gathered at session start from knowledge sources (recent memory, project note) |
 | `AccountRef` | Which account to use: provider id + account label (e.g. `anthropic:work`). Not a secret |
 | `Credential` | A secret wrapper (`ApiKey`, `BearerToken`, `CloudProfile`, `None`) whose `Debug`/`Display` print `***`; zeroised on drop |
-| `Observation` | A result: output, error, timing, truncation flag, source |
+| `Observation` | A result: output, error, timing, truncation flag, source. A file read is `Outcome::File { content, hash }`; a patch is `Outcome::Patched { diff, hash }` |
+| `CheckpointId`, `WorkspaceDiff` | A workspace checkpoint (for undo), and what changed between two states: per path, what was there before and after (`File { size, mode, hash }`, `Dir`, `Symlink { target }`) and a unified diff for text |
 | `Verdict` | The policy gate's answer: `Allow`, `Ask(reason)`, `Deny(reason)` |
-| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, a background job finished, a wake-up, turn done |
+| `Event` | Everything the harness can render: tokens, intent proposed, approval needed, action started/finished, knowledge source status, budget update, error, a background job finished, a wake-up, a checkpoint taken (or not), a restore, turn done |
 
 ### Traits
 
 | Trait | Implemented by | Core operations |
 |---|---|---|
 | `Brain` | `brain` | think(context) → stream of brain events; describe() |
-| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request); open_terminal(size) → `OpenTerminal` (the user's `ctrl+t` shell) |
+| `Sandbox` | `sandbox` | execute(action) → observation; capabilities(); health(); reset(); set_network(policy); subscribe() → `SandboxEvent`s (job finished, network request); open_terminal(size) → `OpenTerminal` (the user's `ctrl+t` shell); checkpoint() → `CheckpointId`; restore(id) → what it undid; diff(from, to or now) → `WorkspaceDiff` |
 | `Terminal` | `sandbox` | write(input); resize(size); close(). Dropping it closes the terminal |
 | `Store` | `db` | create/load session; append message; append action record; list sessions (each with its first user message); search transcripts |
 | `Credentials` | `accounts` | list(provider) → accounts; get(account_ref) → `Credential` (refreshed if needed); add / remove / validate / sign_in(provider, method) |
@@ -236,6 +237,13 @@ backend (the next call works). For a backend with a terminal: input echoes, `stt
 the size before and after a resize, the terminal outlives a command and a background job,
 `close`, a dropped handle and `reset` each end it (`Closed`, then the end of the stream), and a
 closed terminal refuses input; without one, `open_terminal` is `Unsupported`.
+For files and patches: a read carries the SHA-256 of the file's bytes; a patch applies, fails on
+no match or several matches (saying which edit), fails on a stale hash with the current one,
+applies all its edits or none, and refuses a missing file and a symlink. For checkpoints: a
+checkpoint, then writes, patches and (with a POSIX shell) `rm`, `mv`, `mkdir`, `chmod` and `ln`,
+each shown by `diff`; `restore` brings back contents, deleted files, symlinks and mode bits and
+removes what was created since; an older checkpoint restores after a newer one; unknown ids are
+`NoCheckpoint`; without checkpoints all three are `Unsupported`.
 
 ### Contract changes made in Stage 6
 - **Background jobs (#9):** `Exec { background }` → `Outcome::Started { job: JobId }`; the
@@ -259,14 +267,25 @@ closed terminal refuses input; without one, `open_terminal` is `Unsupported`.
   in the job table, sends no `JobFinished`, outlives the agent's commands, and ends with
   `close`, a dropped handle or `reset` (D-066).
 
+### Contract changes made in Stage 7
+- **Patches and undo (#15):** `SandboxAction::Patch { path, edits: Vec<Edit { search, replace }>,
+  expected_hash }` (each search matches exactly once, a stale hash fails with the current one and
+  changes nothing, all edits or none) → `Outcome::Patched { diff, hash }`; `ReadFile` →
+  `Outcome::File { content, hash }` (lowercase hex SHA-256 of the raw bytes);
+  `SandboxAction::changes_files()`. `Sandbox::checkpoint()` → `CheckpointId`,
+  `Sandbox::restore(&id)` → `WorkspaceDiff` (what it undid), `Sandbox::diff(&from, to)` (`None` =
+  now), `SandboxCapabilities.checkpoints`, `SandboxError::NoCheckpoint`, and
+  `SandboxError::LimitExceeded` past the store's cap. `ActionRecord.checkpoint` (the checkpoint
+  taken just before the action; serde default). Events: `Checkpoint { turn, checkpoint, before }`
+  (`before` = the action, `None` = the start of the turn), `NotUndoable { turn, before, reason }`,
+  and `Restored { checkpoint, undone }` (D-070 to D-073).
+
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
 `feat(contracts)` commit with conformance tests.
 
 | Change | For |
 |---|---|
-| `SandboxAction::Patch { path, edits, expected_hash }` (search/replace hunks against a known file state) | precise edits, plan diffs, undo (#15, #2) |
-| `Sandbox::checkpoint()` → `CheckpointId`, `Sandbox::restore(CheckpointId)`, `Sandbox::diff(from, to)` | undo (#15), worktree review (#6) |
 | `SandboxAction::{Diagnostics, Definition, References, RepoMap}` | LSP and repo map (#8) |
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
 | `Verdict` provenance (`user`, `auto`, `plan`, `policy:<rule>`, `ci`) on every `ActionRecord` | audit (#4), CI (#12) |
@@ -319,6 +338,12 @@ sandbox action or knowledge call and records the interruption.
   - in plan mode, **"is this in the approved plan?"** (#2). Anything outside the plan falls
     back to Ask.
 - **Before step 4:** a **checkpoint** is taken before any action that can change files (#15).
+  *Done in Stage 7 (D-072):* before every patch, write and command (foreground or background)
+  that passed the gate, and at the start of every turn; recorded on the action's record. When
+  none can be taken the action still runs, and the user and the agent are told it can't be
+  undone. **Undo** (`Command::Undo`) runs between turns only: it stops the agent's running jobs,
+  takes a checkpoint (so it can itself be undone), restores, and tells the agent once, between
+  turns, which files went back.
 - **After a turn that changed files:** the **verify loop** runs the project's checks (#7) and
   LSP diagnostics (#8). Failures go back to step 2, until they pass or the loop budget runs out.
 - **Plan mode** inserts a phase before execution. The agent investigates read-only (reads,
@@ -516,6 +541,9 @@ recorded in the DESIGN.md decision log before it is built.
   supervisor adds a second layer without them, so the agent's commands can't open the user's
   terminal or reach its shell's `/proc` entries. Its output has its own flow-controlled stream
   in protocol version 4.
+- **Stage 7:** checkpoints are taken and restored on the host, over the directory the sandbox
+  mounts, through descriptor-relative calls that never follow a link (D-071). The store is
+  never mounted into the sandbox. Patches stay in the daemon (protocol version 5).
 - **Stage 12:** background sessions. A long-running `nixxa` service hosts the controllers, and
   the TUI becomes a client that can detach and re-attach. Until then, background work lives
   inside a running TUI.
@@ -675,9 +703,10 @@ their stage.
   a stale edit fails instead of clobbering. It's what the agent uses for edits, what plan mode
   shows as diffs, and what makes edits exactly reversible. `WriteFile` stays for new files.
 - **Checkpoints:** before any action that can change files (patch, write, or exec), the sandbox
-  backend snapshots the workspace into a shadow store outside it
-  (`<data dir>/nixxa/checkpoints/<session>`: a separate git object store that honours
-  `.gitignore`, with a size cap).
+  backend snapshots the workspace into a store outside it
+  (`<data dir>/nixxa/checkpoints/<run>`: a content-addressed store of Nixxa's own, 0700, never
+  mounted, with a size cap; a fixed list of build directories is left out and `.gitignore` is
+  never read, since the agent controls it; D-071).
 - **Undo:** `/undo` (or a key) shows the diff back to the checkpoint before the last action or
   turn, and restores it on confirmation. This works in every place, including the real files in
   This directory and Work on my files. Effects outside the workspace (network calls, `/tmp`)
@@ -955,12 +984,20 @@ Every stage ends with something that runs and a checklist that must be true befo
 
 ### Stage 7 — Safe edits: patches, undo, secrets, project policy
 - **Patches and undo (#15):** `SandboxAction::Patch`, checkpoints and `/undo` in every place.
+  - PR A (D-070 to D-073): done. The `edit_file` tool is `Patch` against the file's SHA-256, in
+    every backend (the daemon through `openat2`, protocol version 5); checkpoints in a host-side
+    content-addressed store, taken by the controller before every file-changing action and at
+    every turn; `/undo` and `ctrl-z` show the diff to now and restore between turns.
 - **Secret scrubbing and warnings (#3).**
 - **`AGENTS.md` policy (#5):** the prose goes into the agent's instructions, and the
   `nixxa-policy` block is enforced, including read-only mounts for protected paths.
 - **Exit:**
   - edits arrive as patches, and `/undo` restores the files, including after a command changed
-    them;
+    them: met by PR A. The conformance suite runs the patch rules and checkpoints over writes,
+    patches and `rm`/`mv`/`mkdir`/`chmod`/`ln` on all three backends;
+    `undo_restores_after_a_command_in_every_place` runs `rm -rf src && echo x > new.txt` and
+    restores in Sandbox (empty), This directory, Work on my files and Work on a copy; and the
+    live run did it through `/undo`;
   - a fake key planted in a file never reaches the provider (checked with a recording brain) and
     the user is warned;
   - with `protect = ["migrations/**"]`, both a patch and a `rm` command fail to change

@@ -34,6 +34,8 @@ pub(crate) enum UiEvent {
     NetworkSet(Result<nixxa_contracts::NetworkPolicy, String>),
     /// Something happened in the sandbox (a network request; later, jobs ending).
     Sandbox(nixxa_contracts::SandboxEvent),
+    /// What changed since a checkpoint, for the undo view, or why it couldn't be told.
+    UndoDiff { checkpoint: nixxa_contracts::CheckpointId, result: Result<nixxa_contracts::WorkspaceDiff, String> },
 }
 
 /// Which session the UI shows. Each controller's sink is tied to the generation it was made in;
