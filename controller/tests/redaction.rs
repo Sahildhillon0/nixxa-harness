@@ -3,6 +3,7 @@
 //! every redaction is told to the UI with where it came from.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,16 +40,19 @@ fn leaks(value: &impl serde::Serialize) -> bool {
 // Fakes
 // ---------------------------------------------------------------------------------------------
 
-/// Replays one intent per step (then `Done`), and keeps every context.
+/// Replays one intent per step (then `Done`), and keeps every context. Told to `echo`, it
+/// repeats the user's last message in reasoning, the live stream and its answer, as a model
+/// given a key tends to.
 #[derive(Default)]
 struct RecordingBrain {
     steps: Mutex<VecDeque<Vec<Intent>>>,
     contexts: Mutex<Vec<Context>>,
+    echo: AtomicBool,
 }
 
 impl RecordingBrain {
     fn new(steps: Vec<Vec<Intent>>) -> Arc<Self> {
-        Arc::new(Self { steps: Mutex::new(steps.into()), contexts: Mutex::default() })
+        Arc::new(Self { steps: Mutex::new(steps.into()), contexts: Mutex::default(), echo: AtomicBool::new(false) })
     }
 
     fn contexts(&self) -> Vec<Context> {
@@ -63,6 +67,28 @@ impl Brain for RecordingBrain {
     }
 
     async fn think(&self, context: Context) -> Result<BrainStream, BrainError> {
+        if self.echo.swap(false, Ordering::SeqCst) {
+            let said = context
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match (&m.role, &m.content) {
+                    (Role::User, Content::Text { text }) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            self.contexts.lock().unwrap().push(context);
+            let events = vec![
+                Ok(BrainEvent::Reasoning {
+                    provider: ProviderId::new("recording"),
+                    data: serde_json::json!({ "type": "thinking", "thinking": format!("The user gave me {said}") }),
+                }),
+                Ok(BrainEvent::TextDelta { text: format!("Using {said}") }),
+                Ok(BrainEvent::Intent { intent: Intent::Say { text: format!("Using {said}") } }),
+                Ok(BrainEvent::Intent { intent: Intent::Done { summary: format!("used {said}") } }),
+            ];
+            return Ok(Box::pin(futures::stream::iter(events)));
+        }
         self.contexts.lock().unwrap().push(context);
         let intents =
             self.steps.lock().unwrap().pop_front().unwrap_or_else(|| vec![Intent::Done { summary: "done".into() }]);
@@ -425,6 +451,27 @@ async fn one_item_sent_anyway_reaches_the_agent_but_never_the_record() {
     assert!(!leaks(&rig.store.all()), "the record keeps both placeholders");
     let sent: Vec<_> = rig.sink.redactions().into_iter().map(|(kind, _, sent)| (kind, sent)).collect();
     assert_eq!(sent, [("aws-access-key".to_string(), true), ("aws-secret-key".to_string(), false)]);
+}
+
+#[tokio::test]
+async fn a_value_sent_anyway_and_repeated_by_the_model_never_reaches_the_record() {
+    let rig = Rig::start(Vec::new()).await;
+    let text = format!("use {KEY_ID}");
+    let id = rig.scrubber.find(&text)[0].placeholder.clone();
+    rig.brain.echo.store(true, Ordering::SeqCst);
+    rig.turn(UserMessage { text, send_anyway: vec![id], from_terminal: false }).await;
+    assert!(rig.last_context().contains(KEY_ID), "the agent got the chosen value");
+    // Reasoning can't be scrubbed (it is signed): it isn't stored. Its answer and summary are
+    // stored scrubbed.
+    let record = rig.store.all().remove(0);
+    assert!(!leaks(&record), "the store holds the key: {record:#?}");
+    assert!(!record.messages.iter().any(|m| matches!(m.content, Content::Reasoning { .. })));
+    assert!(
+        record
+            .messages
+            .iter()
+            .any(|m| matches!(&m.content, Content::Text { text } if text.starts_with("Using use ‹secret:")))
+    );
 }
 
 #[tokio::test]

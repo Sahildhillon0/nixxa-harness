@@ -1,5 +1,6 @@
-//! The detectors: known key formats, private-key blocks, passwords in URLs, the AWS secret next
-//! to its key id, and high-entropy values assigned to secret-ish names (D-074). Each gives byte
+//! The detectors: known key formats, private-key blocks (also base64-encoded), passwords in
+//! URLs, `Authorization` credentials, the AWS secret next to its key id, and high-entropy values
+//! assigned to secret-ish names (D-074). Each gives byte
 //! ranges of `text` with a kind; the scrubber resolves overlaps and replaces them.
 //!
 //! Written by hand rather than with a regex engine: every rule is a prefix and a character
@@ -28,6 +29,8 @@ enum Class {
     WordNoDash,
     /// `A-Z a-z 0-9 /`
     SlackPath,
+    /// `A-Z a-z 0-9 _ - .`
+    WordDot,
 }
 
 impl Class {
@@ -39,6 +42,7 @@ impl Class {
             Self::UpperAlnum => b.is_ascii_uppercase() || b.is_ascii_digit(),
             Self::WordNoDash => b.is_ascii_alphanumeric() || b == b'_',
             Self::SlackPath => b.is_ascii_alphanumeric() || b == b'/',
+            Self::WordDot => b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'),
         }
     }
 }
@@ -102,13 +106,19 @@ const FORMATS: &[Format] = &[
         exact: None,
     },
     Format { kind: "google-api-key", prefixes: &["AIza"], class: Class::Word, min: 35, exact: Some(35) },
+    Format { kind: "gitlab-token", prefixes: &["glpat-"], class: Class::Word, min: 20, exact: None },
+    Format { kind: "huggingface-token", prefixes: &["hf_"], class: Class::Alnum, min: 30, exact: None },
+    // `SG.` + 22 + `.` + 43.
+    Format { kind: "sendgrid-key", prefixes: &["SG."], class: Class::WordDot, min: 60, exact: None },
 ];
 
 /// Every detector's hits, unsorted and possibly overlapping.
 pub(crate) fn all(text: &str) -> Vec<Hit> {
     let mut hits = Vec::new();
     private_keys(text, &mut hits);
+    encoded_private_keys(text, &mut hits);
     formats(text, &mut hits);
+    authorizations(text, &mut hits);
     jwts(text, &mut hits);
     url_passwords(text, &mut hits);
     let aws: Vec<Hit> = hits.iter().filter(|h| h.kind == "aws-access-key").cloned().collect();
@@ -227,6 +237,94 @@ fn private_keys(text: &str, hits: &mut Vec<Hit>) {
     }
 }
 
+/// `-----BEGIN ` in base64, as it starts a Kubernetes secret's `tls.key` or any base64-encoded
+/// PEM file: always these characters at the start of the encoding.
+const ENCODED_BEGIN: &str = "LS0tLS1CRUdJTi";
+
+fn base64_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=')
+}
+
+/// A base64-encoded PEM private key, to the end of its encoding (over line breaks, when it is
+/// wrapped). One that decodes to another block (a certificate) is not a secret.
+fn encoded_private_keys(text: &str, hits: &mut Vec<Hit>) {
+    let bytes = text.as_bytes();
+    for at in occurrences(text, ENCODED_BEGIN) {
+        if !boundary_before(bytes, at) || hits.iter().any(|h| at >= h.start && at < h.end) {
+            continue;
+        }
+        let run = |from: usize| bytes[from..].iter().take_while(|&&b| base64_byte(b)).count();
+        let mut line = run(at);
+        let mut end = at + line;
+        // A wrapped encoding (lines of 64 or 76) goes on while the next line is all base64.
+        while line >= 60 {
+            let next = if bytes[end..].starts_with(b"\r\n") {
+                end + 2
+            } else if bytes[end..].starts_with(b"\n") {
+                end + 1
+            } else {
+                break;
+            };
+            let len = run(next);
+            let line_end = next + len;
+            if len == 0 || !(line_end == bytes.len() || matches!(bytes[line_end], b'\r' | b'\n')) {
+                break;
+            }
+            end = line_end;
+            line = len;
+        }
+        let head: Vec<u8> = bytes[at..end].iter().copied().filter(|&b| base64_byte(b)).take(64).collect();
+        if decode_base64(&head).windows(11).any(|w| w == b"PRIVATE KEY") {
+            hits.push(Hit { start: at, end, kind: "private-key" });
+        }
+    }
+}
+
+/// Standard base64, as far as it decodes in whole groups of four.
+fn decode_base64(encoded: &[u8]) -> Vec<u8> {
+    let value = |b: u8| match b {
+        b'A'..=b'Z' => Some(b - b'A'),
+        b'a'..=b'z' => Some(b - b'a' + 26),
+        b'0'..=b'9' => Some(b - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    };
+    let mut out = Vec::with_capacity(encoded.len() / 4 * 3);
+    for group in encoded.chunks_exact(4) {
+        let Some(v) = group.iter().map(|&b| value(b)).collect::<Option<Vec<u8>>>() else { break };
+        let n = (u32::from(v[0]) << 18) | (u32::from(v[1]) << 12) | (u32::from(v[2]) << 6) | u32::from(v[3]);
+        out.extend_from_slice(&n.to_be_bytes()[1..]);
+    }
+    out
+}
+
+/// The credentials after `Authorization: Bearer ` or `Basic ` (a curl `-H`, an `.http` file, a
+/// log, a JSON header map): `authorization` holds no value of its own, and the value follows a
+/// space.
+fn authorizations(text: &str, hits: &mut Vec<Hit>) {
+    let bytes = text.as_bytes();
+    for scheme in ["Bearer ", "bearer ", "Basic ", "basic "] {
+        for at in occurrences(text, scheme) {
+            // `authorization` earlier on the same line, close by.
+            let line = bytes[..at].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+            let before = &text[line.max(at.saturating_sub(40))..at];
+            if !before.to_ascii_lowercase().contains("authorization") {
+                continue;
+            }
+            let from = at + scheme.len();
+            // RFC 6750's token characters.
+            let len =
+                bytes[from..].iter().take_while(|&&b| b.is_ascii_alphanumeric() || b"-._~+/=".contains(&b)).count();
+            let value = &text[from..from + len];
+            let shouting = value.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_' || c == '-');
+            if len >= 12 && !shouting && classes(value) >= 2 {
+                hits.push(Hit { start: from, end: from + len, kind: "authorization" });
+            }
+        }
+    }
+}
+
 /// Passwords that stand for one in docs and tests: never real, and redacting them would only
 /// confuse the agent reading an example.
 const DUMMY_PASSWORDS: &[&str] = &[
@@ -337,8 +435,10 @@ fn classes(s: &str) -> usize {
 /// The kind a secret-ish name gives its value, or `None` for an ordinary name.
 fn secret_name(name: &str) -> Option<&'static str> {
     let flat: String = name.chars().filter(char::is_ascii_alphanumeric).map(|c| c.to_ascii_lowercase()).collect();
-    // Names that hold hashes of public data, not secrets.
-    if ["checksum", "integrity", "hash", "sha", "digest", "nonce"].iter().any(|n| flat.contains(n)) {
+    // Names that hold hashes of public data, not secrets. `sha` only as a hash (`commit_sha`,
+    // `sha256`), not inside a word (`SharedAccessKey`).
+    let sha = flat.ends_with("sha") || ["sha1", "sha2", "sha3", "sha5", "shasum"].iter().any(|n| flat.contains(n));
+    if sha || ["checksum", "integrity", "hash", "digest", "nonce"].iter().any(|n| flat.contains(n)) {
         return None;
     }
     if ["password", "passwd", "passphrase"].iter().any(|n| flat.contains(n)) || flat.ends_with("pwd") {
@@ -347,9 +447,19 @@ fn secret_name(name: &str) -> Option<&'static str> {
     if flat.contains("token") || flat.contains("bearer") {
         return Some("token");
     }
-    if ["apikey", "accesskey", "privatekey", "signingkey", "encryptionkey", "masterkey", "authkey", "secretkey"]
-        .iter()
-        .any(|n| flat.contains(n))
+    if [
+        "apikey",
+        "accesskey",
+        "accountkey",
+        "privatekey",
+        "signingkey",
+        "encryptionkey",
+        "masterkey",
+        "authkey",
+        "secretkey",
+    ]
+    .iter()
+    .any(|n| flat.contains(n))
     {
         return Some("api-key");
     }
@@ -451,14 +561,20 @@ fn assignments(text: &str, hits: &mut Vec<Hit>) {
         };
         let value = &text[from..from + len];
         // Unquoted, a config value (`.env`, shell, YAML, ini) is the rest of its line; in code
-        // (`token: Type,`, `key = call();`) something follows it.
+        // (`token: Type,`, `key = call();`, `x.token = fn_name;`) something follows it.
         let rest_of_line = || {
             let after = &bytes[from + len..];
             let stop = after.iter().position(|&b| b == b'\n').unwrap_or(after.len());
-            // A comment may follow: `TOKEN=… # ci`, `key = … ; prod`.
-            let rest = String::from_utf8_lossy(&after[..stop]);
-            let rest = rest.trim();
-            rest.is_empty() || rest.starts_with('#') || rest.starts_with(';')
+            let raw = String::from_utf8_lossy(&after[..stop]);
+            let rest = raw.trim();
+            // A comment may follow, after a space: `TOKEN=… # ci`, `key = … ; prod`.
+            let comment = raw.starts_with([' ', '\t']) && (rest.starts_with('#') || rest.starts_with(';'));
+            // Or the next pair of a connection string: `AccountKey=…;EndpointSuffix=…`.
+            let pair = rest.strip_prefix(';').is_some_and(|next| {
+                let name = next.bytes().take_while(|&b| b.is_ascii_alphanumeric()).count();
+                name > 0 && next.as_bytes().get(name) == Some(&b'=')
+            });
+            rest.is_empty() || comment || pair
         };
         if value.chars().any(char::is_whitespace) || (quote.is_none() && !rest_of_line()) {
             continue;

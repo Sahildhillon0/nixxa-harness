@@ -81,8 +81,9 @@ impl Scrubber {
         *self.known.write().unwrap_or_else(std::sync::PoisonError::into_inner) = known;
     }
 
-    /// The secrets in `text`, in order, without overlaps. Placeholders already in it are left
-    /// alone.
+    /// The secrets in `text`, in order, without overlaps. A placeholder already in it is left
+    /// alone, but a secret that holds one (a key block or a URL password with a placeholder
+    /// written into it) is still found, the placeholder with it: placeholders get into files.
     pub fn find(&self, text: &str) -> Vec<Found> {
         let placeholders = placeholder_spans(text);
         let mut hits: Vec<(usize, usize, String, u8)> = Vec::new();
@@ -95,13 +96,23 @@ impl Scrubber {
         for hit in detect::all(text) {
             hits.push((hit.start, hit.end, hit.kind.to_string(), 1));
         }
+        // A hit inside a placeholder is that placeholder; one that only overlaps a placeholder
+        // takes all of it, so no piece of a placeholder is left behind.
+        hits.retain(|&(start, end, ..)| !placeholders.iter().any(|&(s, e)| start >= s && end <= e));
+        for hit in &mut hits {
+            for &(s, e) in &placeholders {
+                if hit.0 < e && hit.1 > s {
+                    hit.0 = hit.0.min(s);
+                    hit.1 = hit.1.max(e);
+                }
+            }
+        }
         // Earliest first; at the same start, exact before detected, then the longest.
         hits.sort_by(|a, b| a.0.cmp(&b.0).then(a.3.cmp(&b.3)).then(b.1.cmp(&a.1)));
         let mut found: Vec<Found> = Vec::new();
         for (start, end, kind, _) in hits {
-            let overlaps_placeholder = placeholders.iter().any(|&(s, e)| start < e && end > s);
             let overlaps_found = found.last().is_some_and(|last| start < last.end);
-            if start >= end || overlaps_placeholder || overlaps_found {
+            if start >= end || overlaps_found {
                 continue;
             }
             let placeholder = self.placeholder(&kind, &text[start..end]);

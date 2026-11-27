@@ -41,6 +41,9 @@ fn known_formats_are_found_whole() {
         (fake("sk_live_", "4eC39HqLyjWDarjtT1zdp7dc"), "stripe-key"),
         (fake("whsec_", "MfKQ9r8GKYqrTwjUPD8ILPZIo2LaLaSw"), "stripe-key"),
         (fake("AIza", "SyD-9tSrke72PouQMnMX-a7eZSW0jkFMBWY"), "google-api-key"),
+        (fake("glpat-", "xK29fQpL7mZ0aB3cD4eF"), "gitlab-token"),
+        (fake("hf_", &BODY40[..34]), "huggingface-token"),
+        (fake("SG.", "ngeVfQFYQlKU0ufo8x5d1A.TwL2iGABf9DHoTf-09kqeF8tAmbihYzrnopKc-1s5cr"), "sendgrid-key"),
         (
             fake("eyJhbGciOiJIUzI1NiJ9.", "eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U"),
             "jwt",
@@ -84,6 +87,78 @@ fn private_keys_are_found_raw_escaped_and_cut() {
     assert!(kinds("-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkq\n-----END PUBLIC KEY-----").is_empty());
 }
 
+/// `-----BEGIN PRIVATE KEY-----⏎MIIEvQ…⏎-----END PRIVATE KEY-----⏎` in base64.
+const ENCODED_KEY: &str = "LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0tCk1JSUV2UUlCQURBTkJna3Foa2lHOXcwQkFRRUZBQVNDQktjd2dnU2pBZ0VBQW9JQkFRQzdWSlRVdDlVczhjS2oKLS0tLS1FTkQgUFJJVkFURSBLRVktLS0tLQo=";
+
+#[test]
+fn a_base64_encoded_private_key() {
+    // A Kubernetes secret.
+    let secret = format!("data:\n  tls.crt: LS0tLS1CRUdJTiBDRVJU\n  tls.key: {ENCODED_KEY}\n");
+    assert_eq!(covered(&secret), [ENCODED_KEY]);
+    assert_eq!(kinds(&secret), ["private-key"]);
+    // Wrapped at 64, as `base64` prints it: every line.
+    let lines: Vec<&str> = ENCODED_KEY.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap()).collect();
+    let wrapped = format!("{}\ndone", lines.join("\n"));
+    assert_eq!(covered(&wrapped), [lines.join("\n")]);
+    // A certificate is not a secret.
+    let certificate = "LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0tCk1JSURkekNDQWwrZ0F3SUJBZ0lFQWdBQXVUQU5CZ2txaGtpRzl3MEJBUVVGQURCYU1Rc3dDUVlEVlFRR0V3SkoKLS0tLS1FTkQgQ0VSVElGSUNBVEUtLS0tLQo=";
+    assert!(kinds(certificate).is_empty());
+}
+
+#[test]
+fn credentials_after_an_authorization_header() {
+    let token = "8f3kD92jLq0vXz7RtY5wPb4N";
+    for text in [
+        format!("curl -H \"Authorization: Bearer {token}\" https://api.example.com"),
+        format!("authorization: bearer {token}"),
+        format!("{{\"headers\": {{\"Authorization\": \"Bearer {token}\"}}}}"),
+        format!("Authorization: Basic {token}=="),
+    ] {
+        let found = covered(&text);
+        assert_eq!(found.len(), 1, "{text}");
+        assert!(found[0].starts_with(token), "{text}: {found:?}");
+    }
+    for clean in [
+        "Authorization: Bearer $TOKEN",
+        "Authorization: Bearer ${API_TOKEN}",
+        "-H 'Authorization: Bearer <token>'",
+        "Authorization: Bearer YOUR_API_TOKEN",
+        "the Bearer token8f3kD92jLq0vXz7 goes in a header",
+    ] {
+        assert!(kinds(clean).is_empty(), "{clean}");
+    }
+}
+
+#[test]
+fn an_azure_connection_string() {
+    let key = "Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MGFiY2RlZg==";
+    let text = format!(
+        "\"AzureWebJobsStorage\": \"DefaultEndpointsProtocol=https;AccountName=app;AccountKey={key};EndpointSuffix=core.windows.net\""
+    );
+    assert_eq!(covered(&text), [key]);
+    let bus = format!(
+        "Endpoint=sb://ns.servicebus.windows.net/;SharedAccessKeyName=RootManageSharedAccessKey;SharedAccessKey={key}"
+    );
+    assert_eq!(covered(&bus), [key]);
+}
+
+#[test]
+fn a_placeholder_inside_a_secret_never_turns_it_off() {
+    // Placeholders get into files (the agent writes them); a key block or a URL password that
+    // holds one is still a secret, and goes whole, placeholder and all.
+    let block =
+        "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCQC7\n‹secret:x#0000›\n-----END PRIVATE KEY-----";
+    let scrubbed = scrubber().scrub(&format!("a\n{block}\nb")).text;
+    assert!(!scrubbed.contains("MIIEvQ") && !scrubbed.contains("‹secret:x#0000›"), "{scrubbed}");
+    assert!(scrubbed.starts_with("a\n‹secret:private-key#") && scrubbed.ends_with("›\nb"), "{scrubbed}");
+    let url = "postgres://app:‹secret:x#0000›Xk29vLq8Rt@db/app";
+    let scrubbed = scrubber().scrub(url).text;
+    assert!(!scrubbed.contains("Xk29vLq8Rt"), "{scrubbed}");
+    assert_eq!(placeholders_in(&scrubbed), 1, "one placeholder, not one inside another: {scrubbed}");
+    // A placeholder on its own is still left alone.
+    assert!(kinds("postgres://app:‹secret:url-password#ab12›@db/app").is_empty());
+}
+
 #[test]
 fn passwords_in_urls_and_connection_strings() {
     let text = "DATABASE_URL=postgres://app:hunter2@db.internal:5432/main\nredis://:s3cr3t@cache:6379";
@@ -125,6 +200,7 @@ fn high_entropy_values_assigned_to_secret_names() {
         format!("'auth_token' => '{value}'"),
         format!("export GITHUB_TOKEN={value}  # for CI"),
         format!("  api_key: {value}\r"),
+        format!("api_key = {value} ; prod"),
     ] {
         assert_eq!(covered(&text), [value], "{text}");
     }
@@ -150,6 +226,10 @@ fn what_a_coding_agent_reads_passes_untouched() {
         "fn f(password: &windows::core::PCWSTR, token: D3DVSD_TOKEN_STREAM2) {}\nlet secret = \"CLIENT_HANDSHAKE_TRAFFIC_SECRET\";\nGITHUB_TOKEN=YOUR-GITHUB-TOKEN-2",
         // References and placeholders in config.
         "API_KEY=${API_KEY}\nSECRET_TOKEN=<your-token>\npassword: {{ vault.password }}",
+        // C: an assignment ends with `;`.
+        "pNew->x1.xTokenize = fts5V1toV2Tokenize;\npGlobal->api.xCreateTokenizer = fts5CreateTokenizer;",
+        // Hashes under their names.
+        "commit_sha: \"9fceb02d0ae598e95dc970b74767f19372d61af8\"\nsha256sum = \"5f0e2c6ed6606019b4e29e69dbaba95b\"",
         // A file hash from the patch action.
         "--- end of file; hash: cb6112f1c4749bb872768a2125c60119597c2a657661a3618dc11c0a1f68e685 ---",
     ];

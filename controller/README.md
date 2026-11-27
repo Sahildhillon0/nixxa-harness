@@ -109,8 +109,10 @@ user's terminal, other sessions' jobs).
   chose, fully for the record), `finish_action` (every observation, its network URLs, before the
   UI, the agent and the store), `record_message` (Nixxa's notes), `begin` (the primer), `emit`
   (error words, `NotUndoable` reasons), `observe` (a job's end, for the UI), `resume_session`
-  (every stored message), and `for_record` (the stored form of the agent's own output). Each
-  secret found is one `Event::SecretRedacted` per placeholder.
+  (every stored message), and `for_record` (the stored form of the agent's own output; a
+  reasoning block that holds a secret, which can't be edited, isn't stored). Each secret found
+  is one `Event::SecretRedacted` per placeholder. What can't be checked (a value that doesn't
+  round-trip through JSON) is not kept, and the UI is told.
 - **Sensitive files** (`src/sensitive.rs`): the gate answers `Asking::Always` for `read_file` of
   `.env` and the like, so Auto asks.
 - **A placeholder written into a file:** the observation's `warnings` say so.
