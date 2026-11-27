@@ -15,9 +15,10 @@ files of one host directory with no isolation. The user picks the second at star
 directory", D-039); it refuses paths that leave the directory, hides the secrets the harness
 names from commands, and caps time (120 s default, 600 s max) and output (64 KiB per stream).
 
-**Cuts never split a token (Stage 7, D-074).** Wherever output is cut to fit a cap (a
-command's first 64 KiB, a job's last bytes, a patch's diff), the cut moves off any token, back to
-the last whitespace, quote, bracket, `,`, `;` or `|`, or forward past a tail's first token
+**Cuts keep whole lines and never split a token (Stage 7, D-074).** Wherever output is cut to
+fit a cap (a command's first 64 KiB, a job's last bytes, a patch's diff), the cut moves to a line
+break within 4 KiB (so a value keeps the name on its line), or else off any token, back to the
+last whitespace, quote, bracket, `,`, `;` or `|`, or forward past a tail's first token
 (`src/cut.rs`, shared with the daemon). The controller's scrubber runs after the cut, so a key is
 kept whole or not at all. `tests/escape.rs` `cut_output_never_ends_inside_a_key` checks it in the
 daemon.

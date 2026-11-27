@@ -175,9 +175,9 @@ async fn only_the_last_part_of_a_jobs_output_is_kept() {
     let job = start(&sb, "yes 'abcd efgh' | head -c 50002; echo END").await;
     assert_eq!(finished(&mut events, &job).await, (Some(0), true), "the job runs on, its output cut");
     let output = text(&sb, SandboxAction::JobOutput { job, tail_bytes: 1_000_000 }).await;
-    // The last 1000 bytes start inside "efgh": that token may be the end of one cut through, so
-    // it goes (D-074).
-    assert!(output.contains("--- stdout (last 997 bytes, earlier output dropped) ---\n\nabcd efgh\n"), "{output}");
+    // The last 1000 bytes start inside a line: that line may hold the end of a secret, or a
+    // value without its name, so it goes (D-074).
+    assert!(output.contains("--- stdout (last 996 bytes, earlier output dropped) ---\nabcd efgh\n"), "{output}");
     assert!(output.contains("abcd efgh\nabEND\n"), "{output}");
 }
 

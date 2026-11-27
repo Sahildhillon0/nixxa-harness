@@ -328,13 +328,15 @@ mod tests {
     fn the_output_shows_both_streams() {
         let (mut out, mut err) = (Tail::new(100), Tail::new(100));
         out.push(b"hello world\n");
-        err.push(b"warning: x\n");
-        let text = output_text("job j1 is running (0.0 s so far)", &out, &err, 4);
-        // The last 4 bytes are "rld\n" and ": x\n": a token that may have been cut through goes.
+        err.push(b"first warning: x\n");
+        out.push(b"second line\n");
+        let text = output_text("job j1 is running (0.0 s so far)", &out, &err, 16);
+        // The last 16 bytes: a line that may have been cut through goes ("ld\n"), and a token
+        // when the only line break ends the output ("irst").
         assert_eq!(
             text,
-            "job j1 is running (0.0 s so far)\n--- stdout (last 1 bytes, earlier output dropped) ---\n\n\
-             \n--- stderr (last 3 bytes, earlier output dropped) ---\n x\n"
+            "job j1 is running (0.0 s so far)\n--- stdout (last 12 bytes, earlier output dropped) ---\n\
+             second line\n\n--- stderr (last 12 bytes, earlier output dropped) ---\n warning: x\n"
         );
     }
 }

@@ -986,9 +986,9 @@ mod tests {
         };
         let (kept, note) = stdout.split_once("\n… [").expect("a note on what was cut");
         assert!(kept.starts_with("abcd efgh\nabcd efgh\n"));
-        // The cap falls inside "efgh": the cut moves back off the token (D-074).
-        assert_eq!(kept.len(), OUTPUT_CAP - 1);
-        assert!(kept.ends_with("abcd "), "{}", &kept[kept.len() - 20..]);
+        // The cap falls inside a line: the cut moves back to the line break (D-074).
+        assert_eq!(kept.len(), OUTPUT_CAP / 10 * 10);
+        assert!(kept.ends_with("abcd efgh\n"), "{}", &kept[kept.len() - 20..]);
         assert_eq!(note, format!("{} more bytes not shown]", 100_000 - kept.len()));
     }
 }
