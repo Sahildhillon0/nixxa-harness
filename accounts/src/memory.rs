@@ -4,7 +4,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use nixxa_contracts::{AccountInfo, AccountRef, Credential, Credentials, CredentialsError, ProviderId};
+use nixxa_contracts::{
+    AccountInfo, AccountRef, Credential, Credentials, CredentialsError, ProviderId, SecretFingerprints,
+};
 
 /// An in-memory [`Credentials`] fake.
 #[derive(Debug, Default)]
@@ -74,6 +76,14 @@ impl Credentials for MemoryCredentials {
 
     async fn validate(&self, account: &AccountRef) -> Result<(), CredentialsError> {
         self.get(account).await.map(|_| ())
+    }
+
+    async fn fingerprints(&self) -> Result<SecretFingerprints, CredentialsError> {
+        let mut prints = SecretFingerprints::new(crate::fingerprint::salt()?);
+        for (info, credential) in self.accounts.lock().unwrap().iter() {
+            crate::fingerprint::add(&mut prints, &info.account, credential);
+        }
+        Ok(prints)
     }
 }
 

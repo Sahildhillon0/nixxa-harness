@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use nixxa_contracts::{
     AccountInfo, AccountRef, AuthMethod, Credential, Credentials, CredentialsError, ProviderId, Secret,
+    SecretFingerprints,
 };
 
 use store::{MemoryStore, OsKeychain, SecretStore, StoreError};
@@ -378,6 +379,18 @@ impl Credentials for KeychainCredentials {
     async fn set_default(&self, account: &AccountRef) -> Result<(), CredentialsError> {
         let account = account.clone();
         self.blocking(move |inner| inner.set_default(&account)).await
+    }
+
+    async fn fingerprints(&self) -> Result<SecretFingerprints, CredentialsError> {
+        let salt = crate::fingerprint::salt()?;
+        self.blocking(move |inner| {
+            let mut prints = SecretFingerprints::new(salt);
+            for info in inner.all_or_env()? {
+                crate::fingerprint::add(&mut prints, &info.account, &inner.get(&info.account)?);
+            }
+            Ok(prints)
+        })
+        .await
     }
 
     async fn validate(&self, account: &AccountRef) -> Result<(), CredentialsError> {
