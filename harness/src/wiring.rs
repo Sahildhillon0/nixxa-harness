@@ -613,7 +613,8 @@ pub(crate) mod tests {
         assert!(last.contains("‹secret:aws-secret-key#") && last.contains("‹secret:aws-access-key#"), "{last}");
         // Nor the database, in any of its files.
         for entry in std::fs::read_dir(scratch.db().parent().unwrap()).unwrap().flatten() {
-            let bytes = std::fs::read(entry.path()).unwrap();
+            // SQLite removes `-wal` and `-shm` when its last connection closes, which may be now.
+            let Ok(bytes) = std::fs::read(entry.path()) else { continue };
             assert!(!leaks(&String::from_utf8_lossy(&bytes)), "{} holds the key", entry.path().display());
         }
         // And the user was told what was replaced, and where from.
