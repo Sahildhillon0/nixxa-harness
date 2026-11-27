@@ -16,6 +16,7 @@ version = "0.0.0"
 edition = "2024"
 rust-version = "1.85"
 repository = "https://github.com/Sahildhillon0/nixxa-harness"
+license = "MIT"
 publish = false
 
 [workspace.dependencies]
