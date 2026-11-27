@@ -99,7 +99,26 @@ user's terminal, other sessions' jobs).
   none), the cap, undo between turns only and after an open approval, a stale `seen`, jobs
   stopped first, and the note given once.
 
-Not yet: secret redaction and `AGENTS.md` policy (Stage 7, PRs B and C), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
+## Stage 7: secret redaction (D-074, D-076)
+
+- **The scrubber** (`src/scrub/`, `pub mod scrub`): `Scrubber::new()` per session (a random
+  HMAC key), shared with the harness through `ControllerConfig.scrubber`; `set_known` takes the
+  accounts' `SecretFingerprints`; `find`, `scrub` and `scrub_except` (the values the user sends as
+  they are). Detectors in `scrub/detect.rs`; their false-positive cases in `scrub/tests.rs`.
+- **Where it runs:** `record_user` (the user's message: scrubbed for the agent except what they
+  chose, fully for the record), `finish_action` (every observation, its network URLs, before the
+  UI, the agent and the store), `record_message` (Nixxa's notes), `begin` (the primer), `emit`
+  (error words, `NotUndoable` reasons), `observe` (a job's end, for the UI), `resume_session`
+  (every stored message), and `for_record` (the stored form of the agent's own output). Each
+  secret found is one `Event::SecretRedacted` per placeholder.
+- **Sensitive files** (`src/sensitive.rs`): the gate answers `Asking::Always` for `read_file` of
+  `.env` and the like, so Auto asks.
+- **A placeholder written into a file:** the observation's `warnings` say so.
+- **Tests:** `tests/redaction.rs`, one per way in, each with a recording brain and checking the
+  store and the events; break-to-fail for observations, resume, storage, fingerprints, keyed tags
+  and Auto asking. A survey of a real tree is the ignored `what_a_real_tree_would_have_redacted`.
+
+Not yet: `AGENTS.md` policy (Stage 7, PR C), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
 
 Tests: `cargo test -p nixxa-controller`. The fakes live in `tests/controller.rs` because the
 controller may depend only on `contracts`.

@@ -23,7 +23,12 @@ Linux, macOS and Windows. See
   directories left out and nothing followed (D-071); the controller takes one before every
   file-changing action and every turn, and runs `Command::Undo` between turns (D-072); `/undo`
   and `ctrl-z` show the diff and restore (D-073).
-- Next: PR B, secret redaction (#3); then PR C, the `AGENTS.md` policy (#5).
+- PR B, secret redaction: the controller's scrubber at every way into the agent's context and
+  the session's record, with keyed placeholders (D-074); fingerprints of the keys Nixxa holds
+  from `accounts` (D-075); cuts to fit the sandbox's caps that never split a token; reading
+  `.env` and the like asks even in Auto (D-076); the message's secrets shown before sending,
+  `alt+1`…`alt+9` to send one as it is, and a warning per redaction (D-077).
+- Next: PR C, the `AGENTS.md` policy (#5).
 
 **Stage 6 — Working in the sandbox: done.** Stage 3's Anthropic live checks are still
 pending. The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each

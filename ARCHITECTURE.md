@@ -345,6 +345,10 @@ sandbox action or knowledge call and records the interruption.
 ### Planned changes to the loop (§11)
 - **Before step 2:** everything entering the context (user text, observations, knowledge
   results) passes the **secret scrubber** (#3). What's stored is the scrubbed form too.
+  *Done in Stage 7 (D-074 to D-077):* the user's message (with the values they chose to send as
+  they are), every observation and its network URLs, Nixxa's notes, the primer, error words and a
+  resumed session's history; each secret found is an `Event::SecretRedacted`. Step 3 asks even
+  in Auto before reading a file that usually holds secrets.
 - **Step 3** gains two checks that run *before* any approval:
   - the **project policy** (#5): protected paths, denied commands;
   - in plan mode, **"is this in the approved plan?"** (#2). Anything outside the plan falls
@@ -523,7 +527,8 @@ recorded in the DESIGN.md decision log before it is built.
   shown, and approved, the first time they're used.
 - **Secret redaction is defence in depth, not a guarantee** (#3). The scrubber catches known
   key formats, high-entropy assignments and the exact secrets Nixxa itself holds (as
-  fingerprints from `accounts`). Reading files such as `.env` or `*.pem` asks first.
+  fingerprints from `accounts`). Reading files such as `.env` or `*.pem` asks first, even in
+  Auto. Encoded, split or computed secrets get through (D-074 to D-077).
 - **The ctrl+t terminal is the user, not the agent** (#16). It runs in the same place as the
   agent (inside the same sandbox for sandboxed places), so it has the same reach. What's typed
   there isn't approved or sent to the provider; it's recorded in the session log and shared
@@ -690,7 +695,7 @@ their stage.
   - in This directory, the user's own shell in that directory.
 - **It's you, not the agent:** nothing typed there is approved, scrubbed or sent to the
   provider. The session log records that a terminal was used, and a "share with the agent"
-  action sends a chosen part of its output as a message.
+  action sends a chosen part of its output as a message, scrubbed like any message (D-077).
 - **Daemon change:** it can't kill the user's shell when the agent's command ends, which is why
   Stage 6 moves the daemon to per-job tracking (§7).
 - **Done (D-066, D-067):** `Sandbox::open_terminal`; a PTY job in the daemon, the user's
@@ -741,6 +746,12 @@ their stage.
 - **Sensitive files:** reading `.env`, `*.pem`, `id_*` and similar asks first, even in Auto.
 - **If the agent writes a placeholder into a file,** it's warned that the file contains a
   placeholder, not the secret.
+- **Done (D-074 to D-077):** the scrubber in `controller/src/scrub/` at every way into the
+  context and the record; cuts to fit the sandbox's caps never split a token
+  (`sandbox/src/cut.rs`); `SecretFingerprints` from `accounts`; `Asking::Always` for the files in
+  `controller/src/sensitive.rs`; in the harness, the message's secrets shown before sending with
+  `alt+1`…`alt+9` to send one as it is, a warning per redaction in the conversation and the
+  activity pane, and logs holding only the kind and where from.
 
 ### #5 Project policy file: `AGENTS.md` (harness + controller + sandbox)
 - **Where it's read:** the harness reads `AGENTS.md` at the workspace root (the cross-tool
@@ -1001,6 +1012,10 @@ Every stage ends with something that runs and a checklist that must be true befo
     content-addressed store, taken by the controller before every file-changing action and at
     every turn; `/undo` and `ctrl-z` show the diff to now and restore between turns.
 - **Secret scrubbing and warnings (#3).**
+  - PR B (D-074 to D-077): done. The scrubber at every way into the context and the record,
+    fingerprints of the keys Nixxa holds, cuts that never split a token, `.env` and the like
+    asking even in Auto, the message preview with send-anyway per item, and a warning per
+    redaction.
 - **`AGENTS.md` policy (#5):** the prose goes into the agent's instructions, and the
   `nixxa-policy` block is enforced, including read-only mounts for protected paths.
 - **Exit:**
@@ -1011,7 +1026,14 @@ Every stage ends with something that runs and a checklist that must be true befo
     restores in Sandbox (empty), This directory, Work on my files and Work on a copy; and the
     live run did it through `/undo`;
   - a fake key planted in a file never reaches the provider (checked with a recording brain) and
-    the user is warned;
+    the user is warned: met by PR B. `tests/redaction.rs` plants an AWS key pair at every way in
+    (message, terminal share, file read, command and job output, job note, patch diff, listing,
+    error, network URL, knowledge result, primer, a resumed unscrubbed session) and checks every
+    request the brain got, the store and the events; the harness's
+    `stage_seven_a_planted_key_never_reaches_the_provider_or_the_database` reads a planted `.env`
+    in This directory with `read_file` and `cat` against the real SQLite file; and the live run
+    did it through a recording proxy in front of LM Studio (`read_file`, `cat`, a background job,
+    a terminal share);
   - with `protect = ["migrations/**"]`, both a patch and a `rm` command fail to change
     `migrations/`.
 
