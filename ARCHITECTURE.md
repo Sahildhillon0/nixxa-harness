@@ -733,8 +733,9 @@ their stage.
 - **What's scrubbed:** everything entering the brain's context: user messages, file reads,
   command output, knowledge results.
 - **Detectors:**
-  - known key formats: Anthropic, OpenAI, GitHub, AWS, GCP, Slack, Stripe, JWTs, PEM private
-    keys, connection strings with passwords;
+  - known key formats: Anthropic, OpenAI, GitHub, GitLab, Hugging Face, AWS, GCP, Slack,
+    Stripe, SendGrid, JWTs, PEM private keys (also base64-encoded), `Authorization` header
+    credentials, connection strings with passwords or account keys;
   - high-entropy values in `KEY=…`-style assignments;
   - exact matches of secrets Nixxa holds. `accounts` gives the controller salted fingerprints,
     never the secrets.
@@ -747,8 +748,8 @@ their stage.
 - **If the agent writes a placeholder into a file,** it's warned that the file contains a
   placeholder, not the secret.
 - **Done (D-074 to D-077):** the scrubber in `controller/src/scrub/` at every way into the
-  context and the record; cuts to fit the sandbox's caps never split a token
-  (`sandbox/src/cut.rs`); `SecretFingerprints` from `accounts`; `Asking::Always` for the files in
+  context and the record; cuts to fit the sandbox's caps keep whole lines and never split a
+  token (`sandbox/src/cut.rs`); reasoning that repeats a secret isn't stored; `SecretFingerprints` from `accounts`; `Asking::Always` for the files in
   `controller/src/sensitive.rs`; in the harness, the message's secrets shown before sending with
   `alt+1`…`alt+9` to send one as it is, a warning per redaction in the conversation and the
   activity pane, and logs holding only the kind and where from.
