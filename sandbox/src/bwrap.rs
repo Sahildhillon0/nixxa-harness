@@ -882,7 +882,7 @@ impl Sandbox for BwrapSandbox {
         let duration_ms = started.elapsed().as_millis() as u64;
         match reply? {
             Reply::Outcome { outcome, truncated } => {
-                Ok(Observation { action_id: id, outcome, duration_ms, truncated, network })
+                Ok(Observation { action_id: id, outcome, duration_ms, truncated, network, warnings: Vec::new() })
             }
             Reply::Timeout => Err(SandboxError::Timeout),
             // Stopped by a concurrent `reset`.

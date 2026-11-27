@@ -288,6 +288,10 @@ async fn keep_first(stream: Option<impl AsyncRead + Unpin>, cap: usize, overflow
             }
         }
     }
+    if cut {
+        // Never through a token (D-074).
+        kept.truncate(crate::cut::end(&kept));
+    }
     (kept, cut)
 }
 
