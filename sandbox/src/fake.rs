@@ -10,8 +10,8 @@ use tokio::sync::{broadcast, mpsc};
 
 use nixxa_contracts::{
     ActionId, CheckpointId, EntryState, FileChange, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal,
-    Outcome, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal,
-    TerminalEvent, TerminalSize, WorkspaceDiff,
+    Outcome, Protection, ProtectionKind, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError,
+    SandboxEvent, Terminal, TerminalEvent, TerminalSize, WorkspaceDiff, glob_matches,
 };
 
 use crate::job::{End, Table};
@@ -36,6 +36,8 @@ pub struct FakeSandbox {
     /// The policy set, reported back; the fake has no network to apply it to.
     network: Mutex<NetworkPolicy>,
     terminal: Arc<Mutex<Scripted>>,
+    /// Paths file actions must not change (#5).
+    protected: Mutex<crate::protect::Rules>,
 }
 
 impl Default for FakeSandbox {
@@ -47,6 +49,7 @@ impl Default for FakeSandbox {
             events: broadcast::channel(crate::events::CAPACITY).0,
             network: Mutex::default(),
             terminal: Arc::default(),
+            protected: Mutex::default(),
         }
     }
 }
@@ -300,6 +303,13 @@ impl Sandbox for FakeSandbox {
                 }
                 None => Outcome::Failed { message: "no such file".into() },
             },
+            SandboxAction::WriteFile { .. } | SandboxAction::Patch { .. }
+                if self.protected.lock().is_ok_and(|rules| rules.covering(&path).is_some()) =>
+            {
+                Outcome::Failed {
+                    message: format!("`{path}` is protected by the project policy, so it can't be changed"),
+                }
+            }
             SandboxAction::Patch { edits, expected_hash, .. } => match files.get(&path) {
                 None => Outcome::Failed { message: "no such file".into() },
                 Some(old) => match crate::patch::apply(old.as_bytes(), &edits, &expected_hash) {
@@ -357,8 +367,14 @@ impl Sandbox for FakeSandbox {
     }
 
     async fn restore(&self, checkpoint: &CheckpointId) -> Result<WorkspaceDiff, SandboxError> {
-        let target = self.taken(checkpoint)?;
+        let mut target = self.taken(checkpoint)?;
         let mut files = self.files.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?;
+        let rules = self.protected.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?.clone();
+        // Protected paths stay as they are.
+        target.retain(|path, _| rules.covering(path).is_none());
+        target.extend(
+            files.iter().filter(|(path, _)| rules.covering(path).is_some()).map(|(p, c)| (p.clone(), c.clone())),
+        );
         let undone = diff_files(&target, &files);
         *files = target;
         Ok(undone)
@@ -371,6 +387,18 @@ impl Sandbox for FakeSandbox {
             None => self.files.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?.clone(),
         };
         Ok(diff_files(&before, &after))
+    }
+
+    async fn protect(&self, rules: Vec<String>) -> Result<Protection, SandboxError> {
+        let files = self.files.lock().map_err(|_| SandboxError::Other("the fake broke".into()))?;
+        let matching =
+            |rule: &String| files.keys().filter(|path| glob_matches(rule, path)).cloned().collect::<Vec<_>>();
+        let mut kept: Vec<String> = rules.iter().flat_map(matching).collect();
+        kept.sort();
+        let unmatched = rules.iter().filter(|rule| matching(rule).is_empty()).cloned().collect();
+        *self.protected.lock().map_err(|_| SandboxError::Other("the fake broke".into()))? =
+            crate::protect::Rules::new(rules);
+        Ok(Protection { how: ProtectionKind::FileActions, kept, unmatched, gaps: Vec::new() })
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {

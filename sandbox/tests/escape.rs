@@ -109,7 +109,7 @@ fn assert_no_secret(what: &str, output: &str) {
 #[tokio::test]
 async fn absolute_paths_outside_the_workspace_fail() {
     let c = Canaries::plant("absolute");
-    let Some(sb) = common::sandbox(&c.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&c.workspace()).await else { return };
     for canary in c.all() {
         let p = s(&canary);
         let read = run(&sb, SandboxAction::ReadFile { path: p.clone() }).await.unwrap();
@@ -137,7 +137,7 @@ async fn symlinks_to_the_canaries_fail() {
         symlink(home, ws.join("home")).unwrap();
         links.push("home");
     }
-    let Some(sb) = common::sandbox(&ws) else { return };
+    let Some(sb) = common::policy_sandbox(&ws).await else { return };
     for link in links {
         let read = run(&sb, SandboxAction::ReadFile { path: link.into() }).await.unwrap();
         assert!(is_failed(&read), "ReadFile {link}: {read:?}");
@@ -155,7 +155,7 @@ async fn symlinks_to_the_canaries_fail() {
 #[tokio::test]
 async fn dot_dot_traversal_fails() {
     let c = Canaries::plant("dotdot");
-    let Some(sb) = common::sandbox(&c.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&c.workspace()).await else { return };
     for path in [
         "../outside/canary.txt",
         "./../outside/canary.txt",
@@ -198,7 +198,7 @@ async fn dot_dot_traversal_fails() {
 async fn proc_root_tricks_fail() {
     let c = Canaries::plant("procroot");
     symlink(format!("/proc/self/root{}", s(&c.outside)), c.workspace().join("magic")).unwrap();
-    let Some(sb) = common::sandbox(&c.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&c.workspace()).await else { return };
     for canary in c.all() {
         let p = s(&canary);
         for prefix in ["/proc/self/root", "/proc/1/root", "/proc/2/root", "/proc/thread-self/root"] {
@@ -225,7 +225,7 @@ async fn env_child() {
     }
     assert_eq!(std::env::var("NIXXA_CANARY_SECRET").as_deref(), Ok(SECRET), "the canary must be set in the parent");
     let scratch = Scratch::new("env");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let (code, env, _) = sh(&sb, "env").await;
     assert_eq!(code, Some(0));
     assert_no_secret("env", &env);
@@ -266,7 +266,7 @@ fn the_parent_environment_does_not_leak() {
 #[tokio::test]
 async fn host_processes_are_invisible() {
     let scratch = Scratch::new("pids");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let host_pid = std::process::id();
     let pids = sh_out(&sb, "for p in /proc/[0-9]*; do echo ${p#/proc/}; done").await;
     let pids: Vec<u32> = pids.lines().filter_map(|l| l.trim().parse().ok()).collect();
@@ -285,7 +285,7 @@ async fn host_processes_are_invisible() {
 #[tokio::test]
 async fn the_network_is_unreachable() {
     let scratch = Scratch::new("net");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     if sh(&sb, "command -v bash").await.0 != Some(0) {
         eprintln!("SKIPPED part of the network test: no bash inside for /dev/tcp");
         return;
@@ -323,7 +323,7 @@ async fn the_network_is_unreachable() {
 #[tokio::test]
 async fn the_sandbox_loopback_works() {
     let scratch = Scratch::new("loopback");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     if sh(&sb, "command -v python3").await.0 != Some(0) {
         eprintln!("SKIPPED the loopback test: no python3 inside");
         return;
@@ -355,7 +355,7 @@ async fn fork_bomb(cgroup: bool) {
     let mut config = common::config(&scratch.workspace());
     config.cgroup = cgroup;
     let limit = config.pids_max as usize;
-    let Some(sb) = common::sandbox_with(config) else { return };
+    let Some(sb) = common::policy_sandbox_with(config).await else { return };
     // Counting /proc and the busy wait use only shell builtins, so they work with no PIDs left.
     let bomb = "bomb() { bomb | bomb & }; bomb; \
                 i=0; while [ $i -lt 300000 ]; do i=$((i+1)); done; \
@@ -392,7 +392,7 @@ async fn memory_hog(cgroup: bool) {
     let scratch = Scratch::new("memory");
     let mut config = common::config(&scratch.workspace());
     config.cgroup = cgroup;
-    let Some(sb) = common::sandbox_with(config) else { return };
+    let Some(sb) = common::policy_sandbox_with(config).await else { return };
     let hog = SandboxAction::Exec {
         command: "awk 'BEGIN { s = \"xxxxxxxxxxxxxxxx\"; while (1) s = s s }'".into(),
         cwd: None,
@@ -414,7 +414,7 @@ async fn memory_hog(cgroup: bool) {
 #[tokio::test]
 async fn sleep_is_killed_by_the_timeout() {
     let scratch = Scratch::new("timeout");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let started = Instant::now();
     let action =
         SandboxAction::Exec { command: "sleep 1000".into(), cwd: None, timeout_ms: Some(1_000), background: false };
@@ -430,7 +430,7 @@ async fn huge_output_is_truncated() {
     let scratch = Scratch::new("output");
     let config = common::config(&scratch.workspace());
     let cap = config.output_cap as usize;
-    let Some(sb) = common::sandbox_with(config) else { return };
+    let Some(sb) = common::policy_sandbox_with(config).await else { return };
     for command in ["yes | head -c 50000000", "yes"] {
         let started = Instant::now();
         let obs = run(&sb, exec(command)).await.unwrap();
@@ -449,7 +449,7 @@ async fn huge_output_is_truncated() {
 #[tokio::test]
 async fn cut_output_never_ends_inside_a_key() {
     let scratch = Scratch::new("output-key");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let obs = run(&sb, exec("yes 'AKIAIOSFODNN7EXAMPLE x' | head -c 200000")).await.unwrap();
     assert!(obs.truncated);
     let Outcome::Exec { stdout, .. } = obs.outcome else { panic!("not exec") };
@@ -460,7 +460,7 @@ async fn cut_output_never_ends_inside_a_key() {
 #[tokio::test]
 async fn host_sockets_and_home_are_absent() {
     let scratch = Scratch::new("sockets");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let mut paths = vec![
         "/run/user".to_owned(),
         "/run/dbus/system_bus_socket".to_owned(),
@@ -489,7 +489,7 @@ async fn host_sockets_and_home_are_absent() {
 #[tokio::test]
 async fn ptrace_is_blocked() {
     let scratch = Scratch::new("ptrace");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.ptrace(0, 0, 0, 0), ctypes.get_errno())'").await;
     assert!(out.trim_end().ends_with(" 1"), "ptrace got through: {out}");
 }
@@ -497,7 +497,7 @@ async fn ptrace_is_blocked() {
 #[tokio::test]
 async fn keyctl_is_blocked() {
     let scratch = Scratch::new("keyctl");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     // SYS_add_key on x86_64 = 248.
     let out = syscall(&sb, &format!("{}, b\"user\", b\"nixxa\", b\"test\", 4, -3", nr::ADD_KEY)).await;
     assert!(out.trim_end().ends_with(" 1"), "keyctl got through: {out}");
@@ -506,7 +506,7 @@ async fn keyctl_is_blocked() {
 #[tokio::test]
 async fn unshare_is_blocked() {
     let scratch = Scratch::new("unshare");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     for cmd in ["unshare -U true", "unshare -n true"] {
         let (code, _, _) = sh(&sb, cmd).await;
         assert_ne!(code, Some(0), "{cmd} succeeded inside the sandbox");
@@ -521,7 +521,7 @@ async fn unshare_is_blocked() {
 #[tokio::test]
 async fn mount_calls_are_blocked() {
     let scratch = Scratch::new("mount");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let out = syscall(&sb, &format!("{OPEN_TREE}, -100, b\"/tmp\", 0")).await;
     assert!(out.trim_end().ends_with(" 1"), "open_tree got through: {out}");
     let (code, _, _) = sh(&sb, "mkdir -p /tmp/mnt && mount -t tmpfs tmpfs /tmp/mnt").await;
@@ -533,7 +533,7 @@ async fn mount_calls_are_blocked() {
 #[tokio::test]
 async fn clone_with_namespace_flags_is_blocked() {
     let scratch = Scratch::new("clone");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     // CLONE_NEWUSER | SIGCHLD
     let out = syscall(&sb, &format!("{}, 0x10000011, 0, 0, 0, 0", nr::CLONE)).await;
     assert!(out.trim_end().ends_with(" 1"), "clone(CLONE_NEWUSER) got through or failed for another reason: {out}");
@@ -542,7 +542,7 @@ async fn clone_with_namespace_flags_is_blocked() {
 #[tokio::test]
 async fn tiocsti_is_blocked() {
     let scratch = Scratch::new("tiocsti");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let out = sh_out(&sb, "python3 -c 'import ctypes, os; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.ioctl(1, 0x5412, b\"x\"), ctypes.get_errno())'").await;
     assert!(out.trim_end().ends_with(" 1"), "TIOCSTI got through: {out}");
 }
@@ -550,7 +550,7 @@ async fn tiocsti_is_blocked() {
 #[tokio::test]
 async fn io_uring_is_blocked() {
     let scratch = Scratch::new("io_uring");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let out = syscall(&sb, &format!("{IO_URING_SETUP}, 1, 0")).await;
     assert!(out.trim_end().ends_with(" 1"), "io_uring_setup got through: {out}");
 }
@@ -558,7 +558,7 @@ async fn io_uring_is_blocked() {
 #[tokio::test]
 async fn af_netlink_socket_is_blocked() {
     let scratch = Scratch::new("netlink");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let (code, _, _) = sh(&sb, "python3 -c 'import socket; socket.socket(16, 3, 0)'").await;
     assert_ne!(code, Some(0), "AF_NETLINK socket succeeded inside the sandbox");
 }
@@ -566,7 +566,7 @@ async fn af_netlink_socket_is_blocked() {
 #[tokio::test]
 async fn personality_is_blocked() {
     let scratch = Scratch::new("personality");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let out = sh_out(&sb, "python3 -c 'import ctypes; libc=ctypes.CDLL(\"libc.so.6\", use_errno=True); print(libc.personality(0x40000), ctypes.get_errno())'").await;
     assert!(out.trim_end().ends_with(" 1"), "personality got through: {out}");
 }
@@ -574,7 +574,7 @@ async fn personality_is_blocked() {
 #[tokio::test]
 async fn landlock_denies_writes_to_read_only_paths() {
     let scratch = Scratch::new("landlock");
-    let Some(sb) = common::sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = common::policy_sandbox(&scratch.workspace()).await else { return };
     let (code, _, _) = sh(&sb, "echo x > /dev/probe").await;
     assert_ne!(code, Some(0), "writing under /usr succeeded (Landlock inactive?)");
 }

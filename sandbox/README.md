@@ -23,6 +23,18 @@ last whitespace, quote, bracket, `,`, `;` or `|`, or forward past a tail's first
 kept whole or not at all. `tests/escape.rs` `cut_output_never_ends_inside_a_key` checks it in the
 daemon.
 
+**Protected paths (Stage 7, D-080).** `Sandbox::protect(rules)` takes the policy's `protect`
+globs (matched with `contracts`' `glob_matches`, ignoring case). Every backend refuses
+`WriteFile` and `Patch` on a protected path, as written and as it resolves through links inside
+the workspace (`src/protect.rs`), and a restore leaves protected paths as they are
+(`checkpoint/mod.rs`). `BwrapSandbox` also binds each existing match read-only over itself in
+`/workspace`, and each directory above it over itself, so neither it nor a parent can be removed,
+moved or renamed over; new rules restart the daemon (its jobs end as lost, the terminal closes).
+`Protection` reports what was kept, rules that matched nothing (gate only), and the gaps: a hard
+link made before, a matching symlink, more than 256 paths. `HostSandbox` mounts nothing: file
+actions only. `tests/protect.rs` tries every way round the mounts; the escape and terminal suites
+run with a policy active (`common::policy_sandbox`).
+
 Every backend runs **background jobs** (`Exec { background: true }`, then `JobStatus`,
 `JobOutput`, `JobStop`, and `SandboxEvent::JobFinished` through `subscribe()`, which says how the
 job ended in the same words `JobStatus` uses, or that it was lost with its sandbox), with the limits in

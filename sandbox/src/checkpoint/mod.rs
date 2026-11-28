@@ -247,6 +247,8 @@ struct Store {
     /// What the last snapshot learnt: path → (metadata, hash).
     known: HashMap<Vec<u8>, (Key, Hash)>,
     temp: u64,
+    /// Paths a restore leaves as they are (#5).
+    protected: crate::protect::Rules,
 }
 
 /// What a snapshot does with the contents it reads.
@@ -273,6 +275,11 @@ struct Walk<'s> {
 }
 
 impl Store {
+    /// Whether the workspace-relative `path` is protected, so a restore leaves it.
+    fn is_protected(&self, path: &[u8]) -> bool {
+        !self.protected.is_empty() && self.protected.covering(&String::from_utf8_lossy(path)).is_some()
+    }
+
     fn blob_path(&self, hash: &Hash) -> PathBuf {
         let hex = hex(hash);
         self.dir.join("objects").join(&hex[..2]).join(&hex[2..])
@@ -385,7 +392,24 @@ impl Store {
             return Err(SandboxError::NoCheckpoint(id.clone()));
         }
         let (now, peeked) = self.snapshot(Keep::Peek)?;
-        let undone = self.diff(&target, &now, &peeked);
+        let mut undone = self.diff(&target, &now, &peeked);
+        // Protected paths are left as they are, and the undo says so (#5).
+        if !self.protected.is_empty() {
+            let mut left = Vec::new();
+            undone.changes.retain(|change| match self.protected.covering(&change.path) {
+                Some(rule) => {
+                    left.push(format!("{rule} (protected by the project policy)"));
+                    false
+                }
+                None => true,
+            });
+            undone.not_covered.extend(left);
+            undone.not_covered.sort();
+            undone.not_covered.dedup();
+            if self.protected.covering("").is_some() {
+                return Ok(undone);
+            }
+        }
         let root = Dir::open_root(&self.workspace).map_err(|err| io_at("can't open", b"", &err))?;
         // Owner rights while working; the recorded mode at the end.
         root.set_mode(target.mode | 0o700).map_err(|err| io_at("can't change", b"", &err))?;
@@ -404,6 +428,9 @@ impl Store {
         // What shouldn't be here goes: not in the checkpoint, or not the same kind of thing.
         let entries = dir.list().map_err(|err| io_at("can't list", rel, &err))?;
         for (name, meta) in entries {
+            if self.is_protected(&child(rel, &name)) {
+                continue;
+            }
             let keep = match target.get(&name) {
                 Some(node) => node.kind() == meta.kind,
                 // Not covered, so left as it is.
@@ -415,6 +442,9 @@ impl Store {
         }
         for (name, node) in target {
             let path = child(rel, name);
+            if self.is_protected(&path) {
+                continue;
+            }
             let was = now.and_then(|now| now.get(name));
             match node {
                 Node::Dir { mode, tree } => {
@@ -879,9 +909,18 @@ impl Checkpoints {
             taken: Vec::new(),
             known: HashMap::new(),
             temp: 0,
+            protected: crate::protect::Rules::default(),
         };
         store.alive();
         Ok(Self { store: Arc::new(Mutex::new(Some(store))), dir: config.dir.clone() })
+    }
+
+    /// The paths a restore must leave as they are from now on.
+    pub(crate) fn set_protected(&self, rules: crate::protect::Rules) {
+        let mut guard = self.store.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(store) = guard.as_mut() {
+            store.protected = rules;
+        }
     }
 
     async fn run<T: Send + 'static>(
