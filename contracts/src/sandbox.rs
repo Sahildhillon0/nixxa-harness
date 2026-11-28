@@ -33,6 +33,34 @@ pub struct SandboxCapabilities {
     pub actions: Vec<SandboxActionKind>,
 }
 
+/// What [`Sandbox::protect`] covers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Protection {
+    /// How the paths are kept.
+    pub how: ProtectionKind,
+    /// The workspace-relative paths kept read-only (what existed when the rules were given).
+    pub kept: Vec<String>,
+    /// Rules that matched nothing then: only the controller's gate holds those.
+    pub unmatched: Vec<String>,
+    /// What the backend couldn't cover, in words for the user (a protected file with another
+    /// hard link in the workspace, too many paths).
+    pub gaps: Vec<String>,
+}
+
+/// How a backend keeps protected paths.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionKind {
+    /// Nothing is kept; the gate is the only enforcement.
+    #[default]
+    None,
+    /// File actions (`WriteFile`, `Patch`) to them fail, symlinks followed; commands can still
+    /// change them.
+    FileActions,
+    /// They are mounted read-only: no command or file action can change them.
+    ReadOnlyMounts,
+}
+
 /// Executes [`SandboxAction`]s in isolation and returns [`Observation`]s.
 ///
 /// Contract:
@@ -146,6 +174,18 @@ pub trait Sandbox: Send + Sync {
     async fn diff(&self, from: &CheckpointId, to: Option<&CheckpointId>) -> Result<WorkspaceDiff, SandboxError> {
         let _ = (from, to);
         Err(SandboxError::Unsupported("this sandbox has no checkpoints".into()))
+    }
+
+    /// Keeps the paths the path globs `rules` match ([`ProjectPolicy::protect`](crate::ProjectPolicy),
+    /// workspace-relative) from being changed by anything run in the sandbox, as far as the
+    /// backend can, replacing any rules given before, and says what that covers. A backend that
+    /// must restart to apply them ends its jobs and the user's terminal, as
+    /// [`reset`](Sandbox::reset) does. Restoring a checkpoint leaves protected paths as they are.
+    /// The default, for backends that can't protect anything, is [`SandboxError::Unsupported`]:
+    /// the controller's gate is then the only enforcement.
+    async fn protect(&self, rules: Vec<String>) -> Result<Protection, SandboxError> {
+        let _ = rules;
+        Err(SandboxError::Unsupported("this sandbox can't keep paths read-only".into()))
     }
 
     /// The sandbox's events from now on. Dropping the stream unsubscribes. The default, for

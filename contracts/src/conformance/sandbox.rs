@@ -9,8 +9,9 @@ use futures::stream::BoxStream;
 
 use super::id;
 use crate::{
-    CheckpointId, DomainRule, Edit, EntryState, JobId, NetworkAccess, NetworkPolicy, OpenTerminal, Outcome, Sandbox,
-    SandboxAction, SandboxActionKind, SandboxError, SandboxEvent, TerminalEvent, TerminalSize, WorkspaceDiff,
+    CheckpointId, DomainRule, Edit, EntryState, JobId, NetworkAccess, NetworkPolicy, OpenTerminal, Outcome,
+    ProtectionKind, Sandbox, SandboxAction, SandboxActionKind, SandboxError, SandboxEvent, TerminalEvent, TerminalSize,
+    WorkspaceDiff,
 };
 
 /// The job kinds a backend with jobs must list.
@@ -69,6 +70,7 @@ pub async fn run<S: Sandbox, F: Fn() -> S>(fresh: F) {
     checkpoints_restore_writes_and_patches(&fresh()).await;
     checkpoints_restore_what_commands_did(&fresh()).await;
     older_checkpoints_restore_after_newer(&fresh()).await;
+    protected_paths_stay_as_they_are(&fresh()).await;
 }
 
 async fn describes_itself(sandbox: &dyn Sandbox) {
@@ -776,4 +778,71 @@ async fn older_checkpoints_restore_after_newer(sandbox: &dyn Sandbox) {
     sandbox.restore(&two).await.expect("and the newer again");
     assert_eq!(read(sandbox, 957, "v.txt").await.expect("read").0, "2\n");
     assert_eq!(read(sandbox, 958, "two.txt").await.expect("read").0, "2\n");
+}
+
+/// With [`Sandbox::protect`], a protected file can't be written or patched (however its path
+/// is spelt), a command can't change it when the backend mounts it read-only, restoring a
+/// checkpoint taken before it was protected leaves it as it is, and clearing the rules frees it.
+async fn protected_paths_stay_as_they_are(sandbox: &dyn Sandbox) {
+    let caps = sandbox.capabilities();
+    let has = |k| caps.actions.contains(&k);
+    if !(has(SandboxActionKind::WriteFile) && has(SandboxActionKind::ReadFile)) {
+        return;
+    }
+    let write = |path: &str, content: &str| SandboxAction::WriteFile { path: path.into(), content: content.into() };
+    let written = |observation: &crate::Observation| matches!(observation.outcome, Outcome::Written { .. });
+    assert!(written(&sandbox.execute(id(950), write("kept/a.txt", "old\n")).await.expect("write")));
+    let checkpoint = if caps.checkpoints { Some(sandbox.checkpoint().await.expect("checkpoint")) } else { None };
+    assert!(written(&sandbox.execute(id(951), write("kept/a.txt", "hello nixxa\n")).await.expect("write")));
+    let protection = match sandbox.protect(vec!["kept/**".into(), "nowhere/**".into()]).await {
+        Err(SandboxError::Unsupported(_)) => return,
+        other => other.expect("protect"),
+    };
+    if protection.how == ProtectionKind::None {
+        return;
+    }
+    assert!(protection.kept.iter().any(|p| p == "kept" || p == "kept/a.txt"), "{protection:?}");
+    assert_eq!(protection.unmatched, ["nowhere/**"], "a rule matching nothing is said to");
+    let attempts = [
+        write("kept/a.txt", "changed\n"),
+        write("kept/new.txt", "new\n"),
+        write("./kept//a.txt", "changed\n"),
+        write("KEPT/a.txt", "changed\n"),
+        SandboxAction::Patch {
+            path: "kept/a.txt".into(),
+            edits: vec![Edit { search: "hello".into(), replace: "hi".into() }],
+            expected_hash: HELLO_HASH.into(),
+        },
+    ];
+    for (n, attempt) in attempts.into_iter().enumerate() {
+        let observation = sandbox.execute(id(952 + n as u32), attempt.clone()).await.expect("attempt");
+        assert!(
+            !matches!(observation.outcome, Outcome::Written { .. } | Outcome::Patched { .. }),
+            "{attempt:?} changed a protected path: {observation:?}"
+        );
+    }
+    if protection.how == ProtectionKind::ReadOnlyMounts && has(SandboxActionKind::Exec) {
+        let command = "rm -rf kept; mv kept gone; chmod 000 kept/a.txt; echo x > kept/a.txt; true";
+        let exec =
+            SandboxAction::Exec { command: command.into(), cwd: None, timeout_ms: Some(5_000), background: false };
+        sandbox.execute(id(960), exec).await.expect("exec");
+    }
+    assert!(
+        written(&sandbox.execute(id(961), write("free.txt", "free\n")).await.expect("write outside")),
+        "only protected paths are kept"
+    );
+    if let Some(checkpoint) = &checkpoint {
+        sandbox.restore(checkpoint).await.expect("restore");
+    }
+    let after = sandbox.execute(id(962), SandboxAction::ReadFile { path: "kept/a.txt".into() }).await.expect("read");
+    assert_eq!(
+        after.outcome,
+        Outcome::File { content: "hello nixxa\n".into(), hash: HELLO_HASH.into() },
+        "a protected file stays as it was protected, a restore included"
+    );
+    sandbox.protect(Vec::new()).await.expect("clear");
+    assert!(
+        written(&sandbox.execute(id(963), write("kept/a.txt", "changed\n")).await.expect("write after")),
+        "clearing the rules frees the path"
+    );
 }
