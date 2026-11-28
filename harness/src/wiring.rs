@@ -633,6 +633,7 @@ pub(crate) mod tests {
     }
 
     /// Proposes one queued action per step (`None`: done), and keeps every request.
+    #[cfg(target_os = "linux")]
     #[derive(Default)]
     struct Prober {
         steps: std::sync::Mutex<std::collections::VecDeque<Option<nixxa_contracts::SandboxAction>>>,
@@ -640,6 +641,7 @@ pub(crate) mod tests {
         n: std::sync::atomic::AtomicU32,
     }
 
+    #[cfg(target_os = "linux")]
     #[async_trait::async_trait]
     impl Brain for Prober {
         fn describe(&self) -> nixxa_contracts::BrainInfo {
