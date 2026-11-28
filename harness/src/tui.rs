@@ -24,7 +24,7 @@ use crate::settings::Settings;
 use crate::setup::Setup;
 use crate::wiring::{self, Models};
 use crate::workplace::{self, Workplace};
-use crate::{browser, logging, paths, ui};
+use crate::{browser, logging, paths, policy, ui};
 use nixxa_accounts::methods::SignInError;
 use nixxa_accounts::methods::openrouter::{OpenRouterConfig, OpenRouterSignIn};
 use nixxa_contracts::{Credential, Secret};
@@ -253,10 +253,12 @@ fn place_note(workplace: &Workplace, workspace: &WorkspaceInfo) -> String {
 /// Sets up the chosen place and, for the sandboxed ones, starts the sandbox and waits for its
 /// answer, so the status line shows the real backend before the first action and a start
 /// failure is reported here. The setup itself (a copy, probing systemd) runs on a blocking thread.
-async fn prepare(place: Place, workspace: WorkspaceInfo) -> Result<Workplace, String> {
+async fn prepare(place: Place, workspace: WorkspaceInfo) -> Result<(Workplace, workplace::PolicyRead), String> {
+    let shown = workspace.clone();
     let chosen = tokio::task::spawn_blocking(move || Workplace::new(place, &workspace))
         .await
         .map_err(|_| "setting up the workplace failed".to_string())??;
+    let read = chosen.apply_policy(&shown, policy::user_file()).await;
     if place.sandboxed() {
         let started = match tokio::time::timeout(SANDBOX_START, chosen.sandbox.health()).await {
             Ok(Ok(())) => Ok(()),
@@ -270,7 +272,7 @@ async fn prepare(place: Place, workspace: WorkspaceInfo) -> Result<Workplace, St
             return Err(why);
         }
     }
-    Ok(chosen)
+    Ok((chosen, read))
 }
 
 /// Runs the TUI until the user quits.
@@ -580,12 +582,19 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         });
                         let _ = terminal.draw(|frame| ui::draw(frame, &mut app));
                     }
-                    let ready = if demo { Ok(Workplace::fake()) } else { prepare(choice, workspace.clone()).await };
+                    let ready = if demo {
+                        let fake = Workplace::fake();
+                        let read = fake.apply_policy(&workspace, policy::user_file()).await;
+                        Ok((fake, read))
+                    } else {
+                        prepare(choice, workspace.clone()).await
+                    };
                     match ready {
-                        Ok(chosen) => {
+                        Ok((chosen, (sources, protection))) => {
                             tracing::info!(place = ?chosen.place, "workplace chosen");
                             app.here = chosen.place == Place::Here;
                             app.note(place_note(&chosen, &workspace));
+                            app.policy_in_force(sources, protection);
                             if let Some(why) = &chosen.undo_off {
                                 app.note(format!("Undo is off for this run: {why}."));
                             }
@@ -704,6 +713,35 @@ pub(crate) async fn run(settings: Settings) -> io::Result<()> {
                         let _ = link.ops.send(TermOp::Write(bytes));
                     }
                 }
+                Effect::ReadPolicy => {
+                    if let Some(place) = &workplace {
+                        let root = place.policy_root(&workspace);
+                        let ui_tx = ui_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let read = policy::Sources::read(root.as_deref(), policy::user_file().as_deref());
+                            let _ = ui_tx.send(UiEvent::PolicyRead(read));
+                        });
+                    }
+                }
+                Effect::AcceptPolicy { pending, remount } => {
+                    if let Some(place) = &workplace {
+                        place.set_policy(pending.policy.clone());
+                        if let Some(running) = &session {
+                            let _ = running.commands.send(Command::Policy(Box::new(pending.policy.clone()))).await;
+                        }
+                        let protect: Vec<String> = pending.policy.protect.iter().map(|r| r.pattern.clone()).collect();
+                        if remount {
+                            let (sandbox, ui_tx) = (place.sandbox.clone(), ui_tx.clone());
+                            let restarted = place.place.sandboxed() && !place.is_fake();
+                            tokio::spawn(async move {
+                                let result = sandbox.protect(protect).await.map_err(|err| err.to_string());
+                                let _ = ui_tx.send(UiEvent::Protected { result, restarted });
+                            });
+                        } else {
+                            app.note("The new policy is in force.");
+                        }
+                    }
+                }
                 Effect::Quit => quit = true,
             }
         }
@@ -764,7 +802,12 @@ fn receive(app: &mut App, event: UiEvent) -> Vec<Effect> {
     match event {
         UiEvent::Controller(event) => {
             logging::event(&event);
+            // A turn may have changed a policy file: read them again (#5).
+            let read = matches!(event, nixxa_contracts::Event::TurnDone { .. });
             app.apply(event);
+            if read {
+                return vec![Effect::ReadPolicy];
+            }
         }
         UiEvent::Approval(prompt) => app.ask(prompt),
         UiEvent::AutoApproved(id) => app.auto_approved(&id),
@@ -775,6 +818,8 @@ fn receive(app: &mut App, event: UiEvent) -> Vec<Effect> {
         UiEvent::NetworkSet(result) => return app.network_set(result),
         UiEvent::Sandbox(event) => app.sandbox_event(event),
         UiEvent::UndoDiff { checkpoint, result } => app.undo_diff(&checkpoint, result),
+        UiEvent::PolicyRead(sources) => app.policy_read(sources),
+        UiEvent::Protected { result, restarted } => app.protected(result, restarted),
         // Handled in the loop, which holds the sign-in state.
         UiEvent::SignInStarted(_) | UiEvent::SignedIn(_) => {}
     }

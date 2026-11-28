@@ -96,7 +96,11 @@ pub(crate) fn controller(
         Arc::new(FakeKnowledge),
         Arc::new(TuiApprovals::new(ui.tx.clone(), ui.auto.clone())),
         Arc::new(ChannelSink::new(ui.tx.clone(), ui.generation.clone())),
-        ControllerConfig::new(workspace, account, workplace.instructions(), scrubber),
+        {
+            let mut config = ControllerConfig::new(workspace, account, workplace.instructions(), scrubber);
+            config.policy = workplace.policy();
+            config
+        },
     )
 }
 
@@ -428,6 +432,8 @@ pub(crate) mod tests {
                     app.handle_key(key(KeyCode::Char('y')));
                 }
                 UiEvent::AccountSaved(_)
+                | UiEvent::PolicyRead(_)
+                | UiEvent::Protected { .. }
                 | UiEvent::NetworkSet(_)
                 | UiEvent::Sandbox(_)
                 | UiEvent::ModelsListed(_)
@@ -624,6 +630,140 @@ pub(crate) mod tests {
             assert!(warned.iter().any(|w| w.contains(from)), "no warning {from:?}: {warned:#?}");
         }
         assert!(app.happenings.iter().any(|(_, h)| matches!(h, crate::app::Happening::Redacted { .. })));
+    }
+
+    /// Proposes one queued action per step (`None`: done), and keeps every request.
+    #[derive(Default)]
+    struct Prober {
+        steps: std::sync::Mutex<std::collections::VecDeque<Option<nixxa_contracts::SandboxAction>>>,
+        contexts: std::sync::Mutex<Vec<nixxa_contracts::Context>>,
+        n: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl Brain for Prober {
+        fn describe(&self) -> nixxa_contracts::BrainInfo {
+            ScriptedBrain.describe()
+        }
+
+        async fn think(&self, context: nixxa_contracts::Context) -> Result<nixxa_contracts::BrainStream, BrainError> {
+            use nixxa_contracts::{Action, ActionId, ActionRequest, BrainEvent, Intent};
+            self.contexts.lock().unwrap().push(context);
+            let n = self.n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let intent = match self.steps.lock().unwrap().pop_front().flatten() {
+                Some(action) => Intent::Act {
+                    request: ActionRequest {
+                        id: ActionId::new(format!("p{n}")),
+                        action: Action::Sandbox { action },
+                        reason: None,
+                    },
+                },
+                None => Intent::Done { summary: "done".into() },
+            };
+            Ok(Box::pin(futures::stream::iter([Ok(BrainEvent::Intent { intent })])))
+        }
+    }
+
+    /// Stage 7 exit criterion (#5): with `protect = ["migrations/**"]` in AGENTS.md, a patch, an
+    /// `rm -rf` and an `mv` all fail to change `migrations/`, in the real sandbox, and the rule
+    /// is shown; the prose reaches the agent; the agent editing AGENTS.md changes nothing until
+    /// the user accepts.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stage_seven_protected_migrations_survive_a_patch_rm_and_mv() {
+        use nixxa_contracts::{Edit, SandboxAction};
+        let exe = std::env::current_exe().unwrap();
+        let daemon = exe.parent().and_then(Path::parent).map(|dir| dir.join("nixxa-sandboxd"));
+        let bwrap =
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).any(|d| d.join("bwrap").is_file());
+        let Some(daemon) = daemon.filter(|d| d.is_file() && bwrap) else {
+            eprintln!(
+                "SKIPPED: the Stage 7 policy exit test needs bwrap and a built nixxa-sandboxd (`cargo test --workspace`)"
+            );
+            return;
+        };
+        let scratch = Scratch::new("e2e7-policy");
+        let root = scratch.0.join("project");
+        let agents = "# Rules\n\nNever edit migrations by hand; add a new one with `make migration`.\n\n```nixxa-policy\nprotect = [\"migrations/**\"]\n```\n";
+        std::fs::write(root.join("AGENTS.md"), agents).unwrap();
+        std::fs::create_dir_all(root.join("migrations")).unwrap();
+        let sql = "create table users (id int);\n";
+        std::fs::write(root.join("migrations/001_init.sql"), sql).unwrap();
+        let workspace = scratch.workspace();
+        let place =
+            crate::workplace::sandboxed_with(Place::SandboxHere, &workspace, &daemon, &scratch.0.join("scratch"), None)
+                .expect("the sandbox");
+        let (sources, protection) = place.apply_policy(&workspace, None).await;
+        let protection = protection.expect("rules").expect("kept");
+        assert_eq!(protection.how, nixxa_contracts::ProtectionKind::ReadOnlyMounts);
+        assert_eq!(protection.kept, ["migrations"]);
+        let patch = SandboxAction::Patch {
+            path: "migrations/001_init.sql".into(),
+            edits: vec![Edit { search: "int".into(), replace: "bigint".into() }],
+            expected_hash: "0".repeat(64),
+        };
+        let exec = |command: &str| SandboxAction::Exec {
+            command: command.into(),
+            cwd: None,
+            timeout_ms: None,
+            background: false,
+        };
+        let new_agents = agents.replace("protect = [\"migrations/**\"]", "protect = []");
+        let brain = Arc::new(Prober::default());
+        brain.steps.lock().unwrap().extend([
+            Some(patch.clone()),
+            Some(exec("rm -rf migrations")),
+            Some(exec("mv migrations x")),
+            None,
+            Some(SandboxAction::WriteFile { path: "AGENTS.md".into(), content: new_agents }),
+            None,
+            Some(patch),
+            None,
+        ]);
+        let (ui_tx, mut ui) = mpsc::unbounded_channel();
+        let link = UiLink::new(ui_tx, AutoApprove::default());
+        let (store, _) = store(true, None).await;
+        let (_, account) = scripted();
+        let mut controller =
+            controller(brain.clone(), account, workspace.clone(), &place, store, &link, test_scrubber());
+        controller.start_session().await.unwrap();
+        let (commands, rx) = mpsc::channel(8);
+        let task = tokio::spawn(async move { controller.run(rx).await });
+        let mut app = App::new(false);
+        app.scrubber = Some(test_scrubber());
+        app.policy_in_force(sources, Some(Ok(protection)));
+        let unchanged = || {
+            assert_eq!(std::fs::read_to_string(root.join("migrations/001_init.sql")).unwrap(), sql);
+            assert!(!root.join("x").exists(), "migrations/ was moved");
+        };
+
+        // The patch is refused at the gate, unasked; rm and mv are asked (Ask mode), run, and fail.
+        let prompts = drive(&mut app, &mut ui, &commands, "change the users table").await;
+        assert_eq!(prompts, 2, "only the two commands were put to the user");
+        unchanged();
+        let first = serde_json::to_string(&brain.contexts.lock().unwrap()[0]).unwrap();
+        assert!(first.contains("Never edit migrations by hand"), "the prose reaches the agent: {first}");
+        assert!(first.contains("not the user's instructions"), "{first}");
+        let told = serde_json::to_string(brain.contexts.lock().unwrap().last().unwrap()).unwrap();
+        assert!(
+            told.contains("refused by the project policy") && told.contains("`migrations/**` (AGENTS.md:6)"),
+            "{told}"
+        );
+        let shown = format!("{:?}", app.activity);
+        assert!(shown.contains("`migrations/**` (AGENTS.md:6)"), "the user sees the rule: {shown}");
+
+        // The agent loosens AGENTS.md: the change waits for the user.
+        drive(&mut app, &mut ui, &commands, "update the rules").await;
+        app.policy_read(crate::policy::Sources::read(Some(&root), None));
+        assert!(app.policy.pending.is_some(), "the change is offered");
+        assert!(app.conversation.iter().any(|e| e.text.contains("A policy file changed")));
+        assert_eq!(place.policy().protect.len(), 1, "not in force until accepted");
+        drive(&mut app, &mut ui, &commands, "try again").await;
+        unchanged();
+        let told = serde_json::to_string(brain.contexts.lock().unwrap().last().unwrap()).unwrap();
+        assert!(told.contains("refused by the project policy"), "still refused: {told}");
+        commands.send(Command::Shutdown).await.unwrap();
+        task.await.unwrap();
     }
 
     /// One run of Nixxa against `store`: a controller (new or resumed) and a fresh screen.

@@ -13,6 +13,8 @@ mod network;
 mod notify;
 mod paths;
 mod place;
+mod policy;
+mod policy_view;
 mod ports;
 mod safe;
 mod sessions;

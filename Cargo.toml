@@ -45,6 +45,8 @@ sha2 = "0.10"
 similar = "2"
 serde_json = "1"
 thiserror = "2"
+# Policy files (#5): the `nixxa-policy` block of AGENTS.md and the user's policy.toml.
+toml = { version = "1.2", default-features = false, features = ["std", "serde", "parse"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing = "0.1"
 tracing-appender = "0.2"

@@ -49,6 +49,9 @@ pub(crate) struct NetworkPanel {
     pub(crate) confirm_open: bool,
     /// Newest last.
     pub(crate) requests: VecDeque<NetRequest>,
+    /// Hosts the project policy asks for, with where each request came from (#5): shown, and
+    /// added to the allowed hosts only when the user presses `r`.
+    pub(crate) requested: Vec<(DomainRule, String)>,
 }
 
 impl Default for NetworkPanel {
@@ -63,6 +66,7 @@ impl Default for NetworkPanel {
             error: None,
             confirm_open: false,
             requests: VecDeque::new(),
+            requested: Vec::new(),
         }
     }
 }
@@ -140,9 +144,22 @@ impl NetworkPanel {
                 self.adding = Some(String::new());
             }
             KeyCode::Char('d') | KeyCode::Delete => return self.remove_selected(),
+            KeyCode::Char('r') => return self.allow_requested(),
             _ => {}
         }
         PanelKey::Nothing
+    }
+
+    /// Adds the hosts the project asked for to the allowed hosts. Like any host added, they
+    /// are used only in Allow mode: this never turns the network on.
+    fn allow_requested(&mut self) -> PanelKey {
+        let new: Vec<DomainRule> =
+            self.requested.iter().map(|(rule, _)| rule.clone()).filter(|rule| !self.hosts.contains(rule)).collect();
+        if new.is_empty() {
+            return PanelKey::Nothing;
+        }
+        self.hosts.extend(new);
+        self.changed()
     }
 
     fn close(&mut self) -> PanelKey {
@@ -304,6 +321,22 @@ mod tests {
         assert_eq!(press(&mut panel, KeyCode::Enter), PanelKey::Nothing);
         assert!(panel.error.as_deref().is_some_and(|e| e.contains("top-level")), "{:?}", panel.error);
         assert_eq!(panel.adding.as_deref(), Some("*.com"), "kept for fixing");
+    }
+
+    #[test]
+    fn hosts_a_project_asks_for_are_only_a_request() {
+        let mut panel = NetworkPanel::default();
+        let npm = DomainRule::parse("registry.npmjs.org").unwrap();
+        panel.requested = vec![(npm.clone(), "AGENTS.md:4".into())];
+        // Asked for, not allowed: the policy stays Off, with no hosts.
+        assert_eq!(panel.policy(), NetworkPolicy::Off);
+        assert!(panel.hosts.is_empty());
+        // Accepted while Off: added, but the network stays off.
+        assert_eq!(press(&mut panel, KeyCode::Char('r')), PanelKey::Nothing);
+        assert_eq!(panel.hosts, std::slice::from_ref(&npm));
+        assert_eq!(panel.policy(), NetworkPolicy::Off);
+        assert_eq!(press(&mut panel, KeyCode::Char('2')), PanelKey::Apply(NetworkPolicy::Allow(vec![npm])));
+        assert_eq!(press(&mut panel, KeyCode::Char('r')), PanelKey::Nothing, "nothing new to add");
     }
 
     #[test]

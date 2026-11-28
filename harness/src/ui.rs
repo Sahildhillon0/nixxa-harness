@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::{Activity, ActivityState, App, Focus, Happening, Speaker};
 use crate::network::{self, Mode};
+use crate::policy_view::Tone;
 use crate::safe;
 use crate::sessions::ago;
 use crate::setup::{CHOICES, LM_STUDIO_URL, OLLAMA_URL, PRIVACY_NOTICE, PRIVACY_SHORT, SetupState, Source, Step};
@@ -112,6 +113,7 @@ pub(crate) fn draw(frame: &mut Frame, app: &mut App) {
     draw_setup(frame, app, theme, body);
     draw_sessions(frame, app, theme, body);
     draw_network(frame, app, theme, body);
+    draw_policy(frame, app, theme, body);
     draw_undo(frame, app, theme, body);
     draw_place(frame, app, theme, body);
     safe::scrub(frame.buffer_mut());
@@ -151,6 +153,9 @@ fn status_line(app: &App, theme: Theme) -> Line<'static> {
             }
         };
         part(&mut spans, network::status(&caps.network), style);
+    }
+    if let Some((text, tone)) = app.policy.status() {
+        part(&mut spans, text, tone_style(tone, theme));
     }
     if app.notifications.unseen > 0 {
         part(&mut spans, format!("● {} new", app.notifications.unseen), theme.pending().add_modifier(Modifier::BOLD));
@@ -548,8 +553,14 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         "type to search · ↑/↓ choose · enter resume · ctrl-u clear · esc close".to_string()
     } else if app.network.open && app.network.adding.is_some() {
         "type a host, *.domain or an IP, with :port if not 443/80 · enter add · esc cancel".to_string()
+    } else if app.network.open && !app.network.requested.is_empty() {
+        "1 off · 2 allow · 3 open · ↑/↓ choose · space preset on/off · a add host · r add the hosts the project asks for · d remove · esc close".to_string()
     } else if app.network.open {
         "1 off · 2 allow · 3 open · ↑/↓ choose · space preset on/off · a add host · d remove · esc close".to_string()
+    } else if app.policy.open && app.policy.pending.is_some() {
+        "y accept the change · n keep the policy in force · esc close".to_string()
+    } else if app.policy.open {
+        "esc close".to_string()
     } else if let Some(view) = &app.undo {
         if view.confirming {
             "enter restore these files · esc back".to_string()
@@ -579,7 +590,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
     } else {
         let key = if app.setup_available { " · ctrl-a model setup" } else { "" };
         format!(
-            "enter send · tab focus · shift-tab ask/auto · ctrl-t terminal · ctrl-n network · ctrl-s sessions{key} · ctrl-z undo · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
+            "enter send · tab focus · shift-tab ask/auto · ctrl-t terminal · ctrl-n network · ctrl-s sessions{key} · ctrl-z undo · ctrl-p policy · alt-enter newline · j/k move · ctrl-c interrupt (twice: quit)"
         )
     };
     let auto = app.mode == ApprovalMode::Auto;
@@ -588,6 +599,7 @@ fn hint_line(app: &mut App, theme: Theme, width: u16) -> Line<'static> {
         || app.setup.is_some()
         || app.sessions.is_some()
         || app.network.open
+        || app.policy.open
         || app.undo.is_some()
         || app.approval().is_some()
         || app.notice.is_some();
@@ -1050,6 +1062,18 @@ fn draw_network(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
                 let host = truncate(&safe::line(&rule.to_string()), inner.saturating_sub(6));
                 lines.push(Line::styled(format!("{}• {host}", if chosen { "› " } else { "  " }), style));
             }
+            if !panel.requested.is_empty() {
+                lines.push(Line::default());
+                lines.push(Line::styled(
+                    "Asked for by the project (only a request; r adds them to the allowed hosts)",
+                    theme.pending().add_modifier(Modifier::BOLD),
+                ));
+                for (rule, source) in &panel.requested {
+                    let added = if panel.hosts.contains(rule) { "  added" } else { "" };
+                    let text = format!("  • {}  ({}){added}", safe::line(&rule.to_string()), safe::line(source));
+                    lines.push(Line::styled(truncate(&text, inner), theme.pending()));
+                }
+            }
             if let Some(typed) = &panel.adding {
                 lines.push(Line::from(vec![
                     Span::styled("  Add  ", theme.dim()),
@@ -1092,6 +1116,38 @@ fn draw_network(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
     let block = Block::bordered().title(" Network ").border_style(theme.accent());
     frame.render_widget(Clear, area);
     frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+}
+
+/// The policy view (`ctrl+p`, #5), over the panes: the rules in force and where each came
+/// from, how protected paths are kept, and a change waiting for the user. Patterns, file names
+/// and problems come from files in the repository: every one goes through `safe::line`.
+fn draw_policy(frame: &mut Frame, app: &App, theme: Theme, over: Rect) {
+    if !app.policy.open {
+        return;
+    }
+    let width = over.width.min(110);
+    let inner = usize::from(width.saturating_sub(2));
+    let lines: Vec<Line> = app
+        .policy
+        .lines()
+        .into_iter()
+        .map(|(tone, text)| Line::styled(truncate(&safe::line(&text), inner), tone_style(tone, theme)))
+        .collect();
+    let area = Rect { x: over.x + (over.width - width) / 2, y: over.y, width, height: over.height };
+    let block = Block::bordered().title(" Policy ").border_style(theme.accent());
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+}
+
+fn tone_style(tone: Tone, theme: Theme) -> Style {
+    match tone {
+        Tone::Plain => Style::new(),
+        Tone::Dim => theme.dim(),
+        Tone::Heading => theme.dim().add_modifier(Modifier::BOLD),
+        Tone::Ok => theme.ok(),
+        Tone::Pending => theme.pending(),
+        Tone::Bad => theme.bad(),
+    }
 }
 
 /// Bytes, briefly.
