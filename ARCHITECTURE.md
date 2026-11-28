@@ -291,6 +291,16 @@ removes what was created since; an older checkpoint restores after a newer one; 
   Auto; `Observation.warnings` (serde default), what Nixxa adds about a result. The credentials
   suite checks that every key held is found exactly, that nothing of it shows in `Debug`, and
   that a replaced or removed key is no longer found (D-074 to D-077).
+- **The project policy (#5):** `ProjectPolicy` (`protect`, `ask_read`, `deny_commands`,
+  `ask_commands`, `checks`, `network`, `Budgets`, the `ProjectProse` of each `AGENTS.md`, and
+  `PolicyProblem`s), every `Rule` with its `RuleSource` (file, line, `RuleOrigin::User` or
+  `Project`), in `ControllerConfig.policy`; the glob matching (`glob_matches`, `glob_covers`) and
+  `command_matches` live with the type, so the gate, the sandbox and the harness agree.
+  `Sandbox::protect(rules)` → `Protection { how: ProtectionKind, kept, unmatched, gaps }`
+  (default `Unsupported`): protected paths can't be changed by file actions, nor by commands
+  when the backend mounts them read-only, and a restore leaves them. `RedactionSource::ProjectRules`.
+  The sandbox suite checks a protected file against writes and patches however its path is
+  spelt, commands on a mounting backend, a restore, and clearing the rules (D-078 to D-081).
 
 ### Planned contract changes (§11)
 These aren't in `contracts` yet. Each lands with the stage that needs it, as its own
@@ -302,7 +312,6 @@ These aren't in `contracts` yet. Each lands with the stage that needs it, as its
 | `Intent::Plan(Plan)`, `Content::Plan`, `Event::PlanProposed`, `ApprovalPort::ask_plan(plan)` → `PlanVerdict` | plan mode (#2) |
 | `Verdict` provenance (`user`, `auto`, `plan`, `policy:<rule>`, `ci`) on every `ActionRecord` | audit (#4), CI (#12) |
 | `Event::CheckResult`, `Event::NetworkRequest` | test loop (#7), network log (#1) |
-| `ProjectPolicy` (typed rules from `AGENTS.md`) in `ControllerConfig` | policy file (#5) |
 
 ---
 
@@ -350,7 +359,10 @@ sandbox action or knowledge call and records the interruption.
   resumed session's history; each secret found is an `Event::SecretRedacted`. Step 3 asks even
   in Auto before reading a file that usually holds secrets.
 - **Step 3** gains two checks that run *before* any approval:
-  - the **project policy** (#5): protected paths, denied commands;
+  - the **project policy** (#5): protected paths, denied commands. *Done in Stage 7 (D-080):*
+    a write or patch to a protected path and a refused command are denied before any approval,
+    in Ask, Auto and wake-up turns, with the rule and its source; `ask_read` and `ask_commands`
+    ask even in Auto; while a policy file can't be read, everything asks;
   - in plan mode, **"is this in the approved plan?"** (#2). Anything outside the plan falls
     back to Ask.
 - **Before step 4:** a **checkpoint** is taken before any action that can change files (#15).
@@ -590,7 +602,7 @@ recorded in the DESIGN.md decision log before it is built.
 | Add an editor or CI frontend (ACP, GitHub Action) | a frontend in `harness/` implementing `ApprovalPort` + `EventSink` (§11 #11, #12) |
 | Change the network allowlist presets or the proxy | `sandbox/` (proxy), `harness/` (settings UI) |
 | Add a secret detector | `controller/` (scrubber) |
-| Add a project-policy rule | `contracts` (`ProjectPolicy`) → `harness` (parsing `AGENTS.md`) → `controller` (enforcing) → `sandbox` (if it needs a mount) |
+| Add a project-policy rule | `contracts` (a `ProjectPolicy` field; path rules match with `glob_covers`) → `harness` (`policy.rs`: the `Raw` key, `check`, layering in `Layer::add`, the view's lists) → `controller` (`policy::gate`, and `project::instructions` so the agent is told) → `sandbox` (`Sandbox::protect` if it needs a mount) |
 | Add a slash command | `harness/` (built-in) or a Markdown template in `<config>/nixxa/commands` (user) |
 
 If a change needs more than one row, it is a contract change — see [AGENT.md](AGENT.md).
@@ -772,6 +784,16 @@ their stage.
   either.
 - **Layering:** user policy (`<config dir>/nixxa/policy.toml`) and, later, org policy (#14)
   layer on top; the strictest rule wins. A project file can never loosen anything (§7).
+- **Done (D-078 to D-081):** `harness/src/policy.rs` reads `AGENTS.md` (the fenced block only;
+  not `CLAUDE.md` or `.cursorrules`) and the user's `policy.toml`, never through a link, capped
+  and sanitised; a broken block makes every action ask. `controller/src/policy.rs` enforces at
+  the gate with normalised paths; command patterns are advisory. `Sandbox::protect` mounts
+  protected paths and the directories above them read-only in bubblewrap (the user's terminal
+  included), refuses file actions on them in every backend (symlinks resolved), and keeps
+  restores off them; This directory is gate-only for commands. The `network` key is a request
+  shown in `ctrl+n`; `checks` are kept for Stage 8; `steps_per_turn` caps a turn now, the other
+  budgets wait for Stage 14. A changed `AGENTS.md` waits for the user's `y` in `ctrl+p`, then
+  restarts the sandbox to mount the new paths.
 
 ### #2 Plan / dry-run mode (contracts + brain + controller + harness)
 - **The mode:** a third approval mode. `shift-tab` cycles Ask → Plan → Auto.
@@ -1019,6 +1041,12 @@ Every stage ends with something that runs and a checklist that must be true befo
     redaction.
 - **`AGENTS.md` policy (#5):** the prose goes into the agent's instructions, and the
   `nixxa-policy` block is enforced, including read-only mounts for protected paths.
+  - PR C (D-078 to D-081): done. `AGENTS.md` read on the host as untrusted input (never through
+    a link, capped, sanitised), layered with the user's `policy.toml` so the strictest wins; the
+    gate refuses writes to protected paths and refused commands before any approval; the
+    bubblewrap sandbox mounts protected paths, and the directories above them, read-only; a
+    changed `AGENTS.md` waits for the user; `ctrl+p` shows the policy and where each rule came
+    from.
 - **Exit:**
   - edits arrive as patches, and `/undo` restores the files, including after a command changed
     them: met by PR A. The conformance suite runs the patch rules and checkpoints over writes,
@@ -1036,7 +1064,15 @@ Every stage ends with something that runs and a checklist that must be true befo
     did it through a recording proxy in front of LM Studio (`read_file`, `cat`, a background job,
     a terminal share);
   - with `protect = ["migrations/**"]`, both a patch and a `rm` command fail to change
-    `migrations/`.
+    `migrations/`: met by PR C. The harness's
+    `stage_seven_protected_migrations_survive_a_patch_rm_and_mv` reads a real `AGENTS.md` and
+    runs a scripted agent in Work on my files: the patch is refused at the gate, `rm -rf
+    migrations` and `mv migrations x` run and fail against the read-only mounts, and the agent
+    loosening `AGENTS.md` changes nothing until the user accepts; `sandbox/tests/protect.rs`
+    tries every way round the mounts (a parent moved, renames over, `chmod`, truncation, hard
+    links, `/proc/self/fd`, the user's terminal); the escape and terminal suites run with a policy
+    active; and the live run did it with a local model.
+- **Stage 7 is done.**
 
 ### Stage 8 — Plan mode and the verify loop
 - **Plan mode (#2)** and the Ask → Plan → Auto cycle.
