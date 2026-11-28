@@ -136,6 +136,21 @@ struct MemSandbox {
     checkpoints: bool,
     checkpoint_bug: Option<CheckpointBug>,
     taken: Mutex<Vec<HashMap<String, String>>>,
+    /// Keeps protected paths from file actions. Not a bug.
+    protects: bool,
+    protect_bug: Option<ProtectBug>,
+    protected: Mutex<Vec<String>>,
+}
+
+/// One way to get protected paths wrong.
+#[derive(Clone, Copy, PartialEq)]
+enum ProtectBug {
+    /// Compares the path as written, so `./kept//a.txt` or `KEPT/a.txt` gets through.
+    Lexical,
+    /// A restore puts protected files back as they were in the checkpoint.
+    RestoreOverwrites,
+    /// Clearing the rules leaves the paths kept.
+    KeepsAfterClear,
 }
 
 /// One way to get patches wrong.
@@ -374,6 +389,26 @@ impl Drop for WedgingExec<'_> {
 }
 
 impl MemSandbox {
+    /// Whether a file action on `path` (as confined) or `written` (as the agent wrote it) is
+    /// kept by the protected paths.
+    fn is_protected(&self, path: &str, written: &str) -> bool {
+        let rules = self.protected.lock().unwrap();
+        if self.protect_bug == Some(ProtectBug::Lexical) {
+            return rules.iter().any(|rule| written.starts_with(rule.trim_end_matches("/**")));
+        }
+        let policy = ProjectPolicy {
+            protect: rules
+                .iter()
+                .map(|pattern| Rule {
+                    pattern: pattern.clone(),
+                    source: RuleSource { file: "test".into(), line: 1, origin: RuleOrigin::User },
+                })
+                .collect(),
+            ..ProjectPolicy::default()
+        };
+        policy.protecting(path).is_some()
+    }
+
     fn confine(&self, path: &str) -> Option<String> {
         if self.no_confinement {
             return Some(path.to_owned());
@@ -479,6 +514,7 @@ impl Sandbox for MemSandbox {
             | SandboxAction::Patch { path, .. }
             | SandboxAction::ListDir { path } => path,
         };
+        let written = path.clone();
         let Some(path) = self.confine(path) else {
             return Ok(Observation::failed(id, "path is outside the workspace"));
         };
@@ -494,6 +530,9 @@ impl Sandbox for MemSandbox {
                 }
                 None => Outcome::Failed { message: "no such file".into() },
             },
+            SandboxAction::WriteFile { .. } | SandboxAction::Patch { .. } if self.is_protected(&path, &written) => {
+                Outcome::Failed { message: "that path is protected".into() }
+            }
             SandboxAction::Patch { edits, expected_hash, .. } => match files.get(&path).cloned() {
                 None => Outcome::Failed { message: "no such file".into() },
                 Some(old) => {
@@ -553,6 +592,20 @@ impl Sandbox for MemSandbox {
     async fn health(&self) -> Result<(), SandboxError> {
         Ok(())
     }
+    async fn protect(&self, rules: Vec<String>) -> Result<Protection, SandboxError> {
+        if !self.protects {
+            return Err(SandboxError::Unsupported("no protection".into()));
+        }
+        let files = self.files.lock().unwrap();
+        let matching =
+            |rule: &String| files.keys().filter(|path| glob_matches(rule, path)).cloned().collect::<Vec<_>>();
+        let kept = rules.iter().flat_map(matching).collect();
+        let unmatched = rules.iter().filter(|rule| matching(rule).is_empty()).cloned().collect();
+        if !(rules.is_empty() && self.protect_bug == Some(ProtectBug::KeepsAfterClear)) {
+            *self.protected.lock().unwrap() = rules;
+        }
+        Ok(Protection { how: ProtectionKind::FileActions, kept, unmatched, gaps: Vec::new() })
+    }
     async fn checkpoint(&self) -> Result<CheckpointId, SandboxError> {
         if !self.checkpoints {
             return Err(SandboxError::Unsupported("no checkpoints".into()));
@@ -565,9 +618,15 @@ impl Sandbox for MemSandbox {
         if !self.checkpoints {
             return Err(SandboxError::Unsupported("no checkpoints".into()));
         }
-        let state = self.state(checkpoint)?;
+        let mut state = self.state(checkpoint)?;
         let undone = mem_workspace_diff(&state, &self.files.lock().unwrap());
         let mut files = self.files.lock().unwrap();
+        if self.protect_bug != Some(ProtectBug::RestoreOverwrites) {
+            let protected = self.protected.lock().unwrap().clone();
+            let kept = |path: &str| protected.iter().any(|rule| glob_matches(rule, path));
+            state.retain(|path, _| !kept(path));
+            state.extend(files.iter().filter(|(path, _)| kept(path)).map(|(p, c)| (p.clone(), c.clone())));
+        }
         if self.checkpoint_bug == Some(CheckpointBug::KeepsCreated) {
             files.extend(state);
         } else {
@@ -1189,4 +1248,33 @@ fn patches_and_diffs_round_trip() {
     let event = Event::Restored { checkpoint: CheckpointId::new("c1"), undone: diff };
     let back: Event = serde_json::from_value(serde_json::to_value(&event).unwrap()).unwrap();
     assert_eq!(back, event);
+}
+
+// ---------- Protected paths ----------
+
+#[test]
+fn mem_sandbox_with_protected_paths_conforms() {
+    block_on(conformance::sandbox::run(|| MemSandbox { protects: true, checkpoints: true, ..Default::default() }));
+}
+
+fn with_protect_bug(bug: ProtectBug) -> MemSandbox {
+    MemSandbox { protects: true, checkpoints: true, protect_bug: Some(bug), ..Default::default() }
+}
+
+#[test]
+#[should_panic(expected = "changed a protected path")]
+fn sandbox_suite_catches_a_protected_path_matched_as_written() {
+    block_on(conformance::sandbox::run(|| with_protect_bug(ProtectBug::Lexical)));
+}
+
+#[test]
+#[should_panic(expected = "a restore included")]
+fn sandbox_suite_catches_a_restore_that_overwrites_a_protected_path() {
+    block_on(conformance::sandbox::run(|| with_protect_bug(ProtectBug::RestoreOverwrites)));
+}
+
+#[test]
+#[should_panic(expected = "clearing the rules frees the path")]
+fn sandbox_suite_catches_rules_that_outlive_their_clearing() {
+    block_on(conformance::sandbox::run(|| with_protect_bug(ProtectBug::KeepsAfterClear)));
 }

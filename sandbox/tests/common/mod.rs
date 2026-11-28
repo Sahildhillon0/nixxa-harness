@@ -78,6 +78,25 @@ pub fn sandbox_with(config: BwrapConfig) -> Option<BwrapSandbox> {
     }
 }
 
+/// The directory every escape and terminal test's sandbox keeps read-only, so those suites run
+/// with a project policy active (#5).
+pub const KEPT: &str = "nixxa-policy-kept";
+
+/// [`sandbox`], with [`KEPT`] (holding `keep.txt`) protected.
+pub async fn policy_sandbox(workspace: &Path) -> Option<BwrapSandbox> {
+    policy_sandbox_with(config(workspace)).await
+}
+
+/// [`sandbox_with`], with [`KEPT`] (holding `keep.txt`) protected.
+pub async fn policy_sandbox_with(config: BwrapConfig) -> Option<BwrapSandbox> {
+    std::fs::create_dir_all(config.workspace.join(KEPT)).expect("the protected directory");
+    std::fs::write(config.workspace.join(KEPT).join("keep.txt"), "kept\n").expect("the protected file");
+    let sandbox = sandbox_with(config)?;
+    let protection = sandbox.protect(vec![format!("{KEPT}/**")]).await.expect("protect");
+    assert_eq!(protection.kept, [KEPT], "{protection:?}");
+    Some(sandbox)
+}
+
 static IDS: AtomicU32 = AtomicU32::new(0);
 
 pub fn next_id() -> ActionId {

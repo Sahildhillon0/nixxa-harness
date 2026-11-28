@@ -19,6 +19,7 @@ mod host_terminal;
 mod job;
 pub mod network;
 mod patch;
+mod protect;
 #[cfg(target_os = "linux")]
 mod protocol;
 #[cfg(target_os = "linux")]

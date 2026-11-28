@@ -173,5 +173,19 @@ approval port asks even in Auto when the controller says `Asking::Always`. Logs 
 where from; free text in them is scrubbed again. `stage_seven_a_planted_key_never_reaches_the_provider_or_the_database`
 is the exit criterion against the real SQLite file.
 
+**The project policy (D-078 to D-081):** `policy.rs` reads the `AGENTS.md` files where the agent
+works (the launch directory, or the copy; none in an empty sandbox) and the user's
+`<config dir>/nixxa/policy.toml`, on the host, never through a link, at most 64 KiB each,
+sanitised; the fenced `nixxa-policy` block is the rules (unknown keys and bad TOML are problems
+with their line, and make every action ask), the rest is prose. `Sources::policy` layers them, the
+strictest winning. `Workplace::apply_policy` puts the policy in force on the workplace (every
+session it starts gets it) and calls `Sandbox::protect` before the sandbox starts. After every
+turn the files are read again; a change is offered in `policy_view.rs` (`ctrl+p`: `y` accept, `n`
+keep), never applied by itself; accepted, it goes to the controller as `Command::Policy` and to
+the sandbox (which restarts to mount new paths). The hosts the project asks for are listed in
+`ctrl+n`, where `r` adds them to the allowed hosts. The status bar shows `policy: …`.
+`stage_seven_protected_migrations_survive_a_patch_rm_and_mv` is the exit criterion in the real
+sandbox.
+
 Not yet: plan mode (Stage 8), LOCKED and `m` (Stage 14), "allow all" / edit in the prompt (Stage 14),
 knowledge panel (Stage 10), slash commands other than `/undo` (Stage 11), tabs and worktrees (Stage 12), accounts screen (Stage 3/13), help overlay.

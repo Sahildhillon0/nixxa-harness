@@ -24,6 +24,7 @@
 mod jobs;
 mod network;
 mod policy;
+mod project;
 pub mod scrub;
 mod sensitive;
 
@@ -37,8 +38,8 @@ use tokio::sync::{mpsc, watch};
 use nixxa_contracts::{
     AccountRef, Action, ActionId, ActionRecord, ActionRequest, ApprovalPort, Brain, BrainEvent, CheckpointId, Content,
     Context, Event, EventSink, Intent, JobId, Knowledge, KnowledgeAction, Limits, Message, NewSession, Observation,
-    Outcome, Primer, RedactionSource, Role, Sandbox, SandboxAction, SandboxError, SandboxEvent, SessionId, SessionInfo,
-    Store, StoreError, Timestamp, TurnId, Verdict, WorkspaceDiff, WorkspaceInfo,
+    Outcome, Primer, ProjectPolicy, RedactionSource, Role, Sandbox, SandboxAction, SandboxError, SandboxEvent,
+    SessionId, SessionInfo, Store, StoreError, Timestamp, TurnId, Verdict, WorkspaceDiff, WorkspaceInfo,
 };
 
 use scrub::Scrubber;
@@ -121,6 +122,9 @@ pub enum Command {
         /// The newest checkpoint the user had seen.
         seen: Option<CheckpointId>,
     },
+    /// The user accepted a new project policy (#5, D-079): it replaces the one in force, and
+    /// the agent is told what changed. Between turns only, like [`Command::Note`].
+    Policy(Box<ProjectPolicy>),
 }
 
 /// Tunables for the agent loop.
@@ -143,6 +147,9 @@ pub struct ControllerConfig {
     /// The session's secret scrubber (D-074). The harness keeps the same one to show the user,
     /// before they send, what their message will have replaced.
     pub scrubber: Arc<Scrubber>,
+    /// The project policy in force (#5): the user's and the project's rules, layered by the
+    /// harness. Enforced at the gate; its prose goes into the instructions, scrubbed.
+    pub policy: ProjectPolicy,
 }
 
 impl ControllerConfig {
@@ -162,6 +169,7 @@ impl ControllerConfig {
             max_wakes: DEFAULT_MAX_WAKES,
             wake_delay: DEFAULT_WAKE_DELAY,
             scrubber,
+            policy: ProjectPolicy::default(),
         }
     }
 }
@@ -250,6 +258,8 @@ pub struct Controller {
     notes: Vec<String>,
     /// The newest checkpoint taken (D-072).
     newest: Option<CheckpointId>,
+    /// The policy's section of the instructions, its prose scrubbed (#5).
+    project_rules: String,
 }
 
 impl Controller {
@@ -277,6 +287,7 @@ impl Controller {
             jobs: jobs::Shared::default(),
             notes: Vec::new(),
             newest: None,
+            project_rules: String::new(),
         }
     }
 
@@ -413,6 +424,45 @@ impl Controller {
         Some(Message { content, ..message })
     }
 
+    /// The policy's section of the instructions. Its prose comes from the repository and goes
+    /// into every request, so it is scrubbed like any way in (D-074).
+    fn project_rules(&self) -> String {
+        let prose: Vec<(String, String, String)> = self
+            .config
+            .policy
+            .prose
+            .iter()
+            .map(|prose| {
+                let source = RedactionSource::ProjectRules { file: prose.file.clone() };
+                (prose.file.clone(), prose.dir.clone(), self.scrubbed(None, &prose.text, &source))
+            })
+            .collect();
+        project::instructions(&self.config.policy, &prose)
+    }
+
+    /// The user accepted a new policy: it is in force from the next action, and the agent is
+    /// told what changed.
+    async fn set_policy(&mut self, policy: ProjectPolicy) {
+        let changes = project::changes(&self.config.policy, &policy);
+        self.config.policy = policy;
+        self.project_rules = self.project_rules();
+        if changes.is_empty() {
+            return;
+        }
+        let text = format!(
+            "The user accepted a change to the project policy; it is in force from now on: {}. The policy in force is \
+             in your instructions.",
+            changes.join("; ")
+        );
+        self.note(text).await;
+    }
+
+    /// The most steps a turn may take: the controller's cap, or the policy's if lower.
+    fn max_steps(&self) -> u32 {
+        let budget = self.config.policy.budgets.steps_per_turn.map(|limit| limit.value);
+        budget.map_or(self.config.max_steps, |steps| steps.min(self.config.max_steps))
+    }
+
     /// Emits the session start events and gathers the primer. A failing primer is reported as
     /// an [`Event::Error`] and the session starts unprimed.
     async fn begin(&mut self, session: &SessionId) -> Primer {
@@ -422,6 +472,7 @@ impl Controller {
             brain: self.brain.describe(),
         });
         self.emit(Event::SandboxStatus { capabilities: self.sandbox.capabilities() });
+        self.project_rules = self.project_rules();
         for source in self.knowledge.sources().await {
             self.emit(Event::SourceStatus { source });
         }
@@ -477,6 +528,10 @@ impl Controller {
                     self.undo(to, seen).await;
                     continue;
                 }
+                Next::Command(Command::Policy(policy)) => {
+                    self.set_policy(*policy).await;
+                    continue;
+                }
                 Next::Command(Command::Interrupt) => continue,
                 Next::Command(Command::Shutdown) => break,
                 Next::Wake => {
@@ -500,7 +555,12 @@ impl Controller {
                     tokio::select! {
                         () = &mut turn_future => break,
                         command = commands.recv(), if listening => match command {
-                            Some(command @ (Command::UserMessage(_) | Command::Note(_) | Command::Undo { .. })) => {
+                            Some(
+                                command @ (Command::UserMessage(_)
+                                | Command::Note(_)
+                                | Command::Undo { .. }
+                                | Command::Policy(_)),
+                            ) => {
                                 queued.push_back(command)
                             }
                             Some(Command::Interrupt) => {
@@ -697,7 +757,7 @@ impl Controller {
             self.record_message(turn, message, true).await;
             return;
         }
-        for _ in 0..self.config.max_steps {
+        for _ in 0..self.max_steps() {
             match self.step(turn).await {
                 Flow::Continue => {}
                 Flow::Finish => return,
@@ -708,7 +768,7 @@ impl Controller {
                 }
             }
         }
-        let notice = format!("stopped: the step budget of {} for this turn ran out", self.config.max_steps);
+        let notice = format!("stopped: the step budget of {} for this turn ran out", self.max_steps());
         let message = Message::text(Role::System, notice, self.now());
         self.record_message(turn, message, true).await;
     }
@@ -827,7 +887,7 @@ impl Controller {
     /// interrupt while asking or running still closes the action with an observation, so the
     /// history never holds a proposal without its result.
     async fn act(&mut self, turn: &TurnId, request: ActionRequest) -> Flow {
-        let (verdict, asking) = policy::gate(&request);
+        let (verdict, asking) = policy::gate(&request, &self.config.policy, &self.config.workspace.root);
         let verdict = match verdict {
             Verdict::Ask(reason) => {
                 self.emit(Event::ApprovalNeeded {
@@ -1129,11 +1189,16 @@ impl Controller {
             session,
             account: self.config.account.clone(),
             model: None,
-            instructions: format!(
-                "{}\n\n{}",
-                self.config.instructions,
-                network::instructions(&self.sandbox.capabilities().network)
-            ),
+            instructions: [
+                self.config.instructions.as_str(),
+                self.project_rules.as_str(),
+                &network::instructions(&self.sandbox.capabilities().network),
+            ]
+            .iter()
+            .filter(|part| !part.is_empty())
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n\n"),
             primer,
             messages,
             sandbox_actions: self.sandbox.capabilities().actions,

@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nixxa_contracts::{Sandbox, WorkspaceInfo};
+use nixxa_contracts::{ProjectPolicy, Sandbox, WorkspaceInfo};
 use nixxa_sandbox::JobLimits;
 use nixxa_sandbox::checkpoint::{CheckpointConfig, DEFAULT_CAP};
 use nixxa_sandbox::fake::FakeSandbox;
@@ -81,6 +81,10 @@ const SECRET_ENV: [&str; 1] = ["ANTHROPIC_API_KEY"];
 #[cfg(target_os = "linux")]
 const DAEMON: &str = "nixxa-sandboxd";
 
+/// The policy files as read, and what the sandbox keeps of them (none when nothing is
+/// protected).
+pub(crate) type PolicyRead = (crate::policy::Sources, Option<Result<nixxa_contracts::Protection, String>>);
+
 /// Where the agent works. One per run: sessions started after an account switch share it.
 #[derive(Clone)]
 pub(crate) struct Workplace {
@@ -90,6 +94,9 @@ pub(crate) struct Workplace {
     pub(crate) copy: Option<PathBuf>,
     /// Why there is no undo here, when there isn't (no data directory for its store).
     pub(crate) undo_off: Option<String>,
+    /// The policy in force here (#5): every session this workplace starts gets it, and a change
+    /// the user accepts reaches the next ones too.
+    policy: Arc<std::sync::Mutex<ProjectPolicy>>,
     fake: bool,
 }
 
@@ -101,6 +108,7 @@ impl Workplace {
             sandbox: Arc::new(FakeSandbox::default()),
             copy: None,
             undo_off: None,
+            policy: Arc::default(),
             fake: true,
         }
     }
@@ -119,6 +127,47 @@ impl Workplace {
         };
         workplace.undo_off = undo_off;
         Ok(workplace)
+    }
+
+    /// Where the project's `AGENTS.md` files are read from: the launch directory, or the copy;
+    /// none in an empty sandbox (D-078).
+    pub(crate) fn policy_root(&self, workspace: &WorkspaceInfo) -> Option<PathBuf> {
+        match self.place {
+            _ if self.fake => None,
+            Place::Sandbox => None,
+            Place::Here | Place::SandboxHere => Some(workspace.root.clone()),
+            Place::SandboxCopy => self.copy.clone(),
+        }
+    }
+
+    /// The policy in force.
+    pub(crate) fn policy(&self) -> ProjectPolicy {
+        self.policy.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Puts `policy` in force for the sessions started from now on.
+    pub(crate) fn set_policy(&self, policy: ProjectPolicy) {
+        *self.policy.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = policy;
+    }
+
+    /// Reads the policy files (the project's, from where the agent works, and the user's at
+    /// `user`), puts the policy in force here, and has the sandbox keep its protected paths:
+    /// before the sandbox starts, so its first daemon has the mounts (#5, D-080).
+    pub(crate) async fn apply_policy(&self, workspace: &WorkspaceInfo, user: Option<PathBuf>) -> PolicyRead {
+        let root = self.policy_root(workspace);
+        let sources =
+            tokio::task::spawn_blocking(move || crate::policy::Sources::read(root.as_deref(), user.as_deref()))
+                .await
+                .unwrap_or_default();
+        let in_force = sources.policy();
+        let protect: Vec<String> = in_force.protect.iter().map(|rule| rule.pattern.clone()).collect();
+        self.set_policy(in_force);
+        let protection = if protect.is_empty() {
+            None
+        } else {
+            Some(self.sandbox.protect(protect).await.map_err(|err| err.to_string()))
+        };
+        (sources, protection)
     }
 
     /// Whether this is the in-memory demo sandbox (`--fake`).
@@ -151,7 +200,14 @@ fn here(workspace: &WorkspaceInfo, checkpoints: Option<CheckpointConfig>) -> Res
         checkpoints,
     };
     let sandbox = HostSandbox::new(config).map_err(|err| format!("can't work in this directory: {err}"))?;
-    Ok(Workplace { place: Place::Here, sandbox: Arc::new(sandbox), copy: None, undo_off: None, fake: false })
+    Ok(Workplace {
+        place: Place::Here,
+        sandbox: Arc::new(sandbox),
+        copy: None,
+        undo_off: None,
+        policy: Arc::default(),
+        fake: false,
+    })
 }
 
 /// `<data dir>/nixxa/checkpoints`, where each run's checkpoint store goes.
@@ -227,7 +283,7 @@ fn sandboxed(
 
 /// A sandboxed place, with the daemon binary and scratch root given.
 #[cfg(target_os = "linux")]
-fn sandboxed_with(
+pub(crate) fn sandboxed_with(
     place: Place,
     workspace: &WorkspaceInfo,
     daemon: &Path,
@@ -258,7 +314,7 @@ fn sandboxed_with(
             let _ = std::fs::remove_dir_all(&dir);
         }
     })?;
-    Ok(Workplace { place, sandbox, copy, undo_off: None, fake: false })
+    Ok(Workplace { place, sandbox, copy, undo_off: None, policy: Arc::default(), fake: false })
 }
 
 #[cfg(target_os = "linux")]
@@ -367,11 +423,7 @@ impl Protected {
             Platform::Windows => var("USERPROFILE"),
             Platform::Linux | Platform::Mac => var("HOME"),
         };
-        let config = match os {
-            Platform::Linux => var("XDG_CONFIG_HOME").or_else(|| home.as_ref().map(|h| h.join(".config"))),
-            Platform::Mac => home.as_ref().map(|h| h.join("Library").join("Application Support")),
-            Platform::Windows => var("APPDATA"),
-        };
+        let config = paths::config_dir(os, env);
         let mut inside: Vec<PathBuf> =
             [config.map(|c| c.join("nixxa")), paths::data_dir(os, env).map(|d| d.join("nixxa"))]
                 .into_iter()

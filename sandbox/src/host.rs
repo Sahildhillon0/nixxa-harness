@@ -33,8 +33,9 @@ use tokio::process::{Child, Command};
 use tokio::sync::broadcast;
 
 use nixxa_contracts::{
-    ActionId, CheckpointId, DirEntry, Edit, JobId, NetworkAccess, Observation, OpenTerminal, Outcome, Sandbox,
-    SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, TerminalSize, WorkspaceDiff,
+    ActionId, CheckpointId, DirEntry, Edit, JobId, NetworkAccess, Observation, OpenTerminal, Outcome, Protection,
+    ProtectionKind, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent,
+    TerminalSize, WorkspaceDiff,
 };
 
 use crate::JobLimits;
@@ -91,6 +92,8 @@ pub struct HostSandbox {
     checkpoints: Option<Checkpoints>,
     /// Numbers temporary files.
     temp: std::sync::atomic::AtomicU64,
+    /// Paths file actions must not change (#5). Commands can: nothing here is mounted.
+    protected: Mutex<crate::protect::Rules>,
 }
 
 /// Shell pids of the running jobs, by job.
@@ -135,7 +138,13 @@ impl HostSandbox {
             terminal: crate::host_terminal::Slot::default(),
             checkpoints,
             temp: std::sync::atomic::AtomicU64::new(0),
+            protected: Mutex::default(),
         })
+    }
+
+    /// Why a file action on `path` must not run: it is protected (#5).
+    fn refused(&self, path: &str) -> Option<String> {
+        self.protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner).refuse(&self.root, path)
     }
 
     /// The host path for a workspace-relative, `/`-separated path, if it stays inside the root.
@@ -565,13 +574,19 @@ impl Sandbox for HostSandbox {
                 let Some(path) = self.resolve(&path) else { return outside() };
                 self.read(&path).await
             }
-            SandboxAction::WriteFile { path, content } => {
-                let Some(path) = self.resolve(&path) else { return outside() };
-                self.write(&path, content).await
+            SandboxAction::WriteFile { path: shown, content } => {
+                let Some(path) = self.resolve(&shown) else { return outside() };
+                match self.refused(&shown) {
+                    Some(why) => failed(why),
+                    None => self.write(&path, content).await,
+                }
             }
             SandboxAction::Patch { path: shown, edits, expected_hash } => {
                 let Some(path) = self.resolve(&shown) else { return outside() };
-                self.patch(&path, &shown, &edits, &expected_hash).await
+                match self.refused(&shown) {
+                    Some(why) => failed(why),
+                    None => self.patch(&path, &shown, &edits, &expected_hash).await,
+                }
             }
             SandboxAction::ListDir { path } => {
                 let Some(path) = self.resolve(&path) else { return outside() };
@@ -579,6 +594,23 @@ impl Sandbox for HostSandbox {
             }
         };
         Ok(Observation::new(id, outcome))
+    }
+
+    /// File actions to protected paths fail; commands aren't stopped (This directory has no
+    /// mounts, D-080).
+    async fn protect(&self, rules: Vec<String>) -> Result<Protection, SandboxError> {
+        let root = self.root.clone();
+        let walked = rules.clone();
+        let plan =
+            tokio::task::spawn_blocking(move || crate::protect::plan(&root, &walked, ProtectionKind::FileActions))
+                .await
+                .map_err(|err| SandboxError::Other(format!("looking for protected paths failed: {err}")))?;
+        let rules = crate::protect::Rules::new(rules);
+        if let Some(checkpoints) = &self.checkpoints {
+            checkpoints.set_protected(rules.clone());
+        }
+        *self.protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = rules;
+        Ok(plan.protection)
     }
 
     async fn health(&self) -> Result<(), SandboxError> {

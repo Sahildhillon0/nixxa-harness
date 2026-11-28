@@ -35,6 +35,24 @@ pub(crate) fn db_path() -> Option<PathBuf> {
     data_dir(Platform::current(), &|name| std::env::var_os(name)).map(|dir| dir.join("nixxa").join("nixxa.db"))
 }
 
+/// The user's own policy (#5, D-079): `<config dir>/nixxa/policy.toml`.
+pub(crate) fn policy_path() -> Option<PathBuf> {
+    config_dir(Platform::current(), &|name| std::env::var_os(name)).map(|dir| dir.join("nixxa").join("policy.toml"))
+}
+
+/// The per-user config directory:
+/// * Linux: `$XDG_CONFIG_HOME`, else `~/.config`;
+/// * macOS: `~/Library/Application Support`;
+/// * Windows: `%APPDATA%`.
+pub(crate) fn config_dir(os: Platform, env: &dyn Fn(&str) -> Option<OsString>) -> Option<PathBuf> {
+    let var = |name: &str| env(name).map(PathBuf::from).filter(|path| path.is_absolute());
+    match os {
+        Platform::Linux => var("XDG_CONFIG_HOME").or_else(|| var("HOME").map(|home| home.join(".config"))),
+        Platform::Mac => var("HOME").map(|home| home.join("Library").join("Application Support")),
+        Platform::Windows => var("APPDATA"),
+    }
+}
+
 /// The per-user data directory:
 /// * Linux: `$XDG_DATA_HOME`, else `~/.local/share`;
 /// * macOS: `~/Library/Application Support`;
@@ -103,6 +121,15 @@ mod tests {
         if let Some(path) = db_path() {
             assert!(path.ends_with(Path::new("nixxa").join("nixxa.db")));
         }
+    }
+
+    #[test]
+    fn the_users_policy_lives_in_the_config_directory() {
+        let linux = env(&[("XDG_CONFIG_HOME", abs("cfg")), ("HOME", abs("home"))]);
+        assert_eq!(config_dir(Platform::Linux, &linux), Some(abs("cfg")));
+        let home = env(&[("HOME", abs("home"))]);
+        assert_eq!(config_dir(Platform::Linux, &home), Some(abs("home").join(".config")));
+        assert_eq!(config_dir(Platform::Windows, &env(&[("APPDATA", abs("roaming"))])), Some(abs("roaming")));
     }
 
     #[test]

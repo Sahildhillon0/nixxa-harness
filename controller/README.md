@@ -120,7 +120,24 @@ user's terminal, other sessions' jobs).
   store and the events; break-to-fail for observations, resume, storage, fingerprints, keyed tags
   and Auto asking. A survey of a real tree is the ignored `what_a_real_tree_would_have_redacted`.
 
-Not yet: `AGENTS.md` policy (Stage 7, PR C), plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
+## Stage 7: the project policy (D-079, D-080)
+
+- **The gate** (`src/policy.rs`), before any approval and in every mode, wake-up turns included:
+  a write or patch to a path `ControllerConfig.policy` protects, and a command matching
+  `deny_commands`, are refused with the rule and its source; `ask_read` and `ask_commands` ask
+  with `Asking::Always`; while the policy has problems, everything asks with `Asking::Always`.
+  Paths are normalised first (`project::workspace_path`: `/workspace/…`, the host root, `./`,
+  `//`, `..`); symlinks are the sandbox's to resolve.
+- **The instructions** (`src/project.rs`): the policy's prose, scrubbed (`RedactionSource::ProjectRules`),
+  inside `<project-rules>` tags labelled as data from the repository, then the rules in force.
+- **`Command::Policy`**, between turns: the policy the user accepted replaces the one in force,
+  and the agent is told what changed. `budgets.steps_per_turn` caps a turn when lower than
+  `max_steps`.
+- **Tests:** `tests/policy.rs` (refused before approval in Auto, in a wake-up turn, commands
+  refused or asked, the prose labelled and scrubbed, an accepted change, the step budget, a broken
+  policy); break-to-fail for the gate check, path normalisation and the broken policy.
+
+Not yet: plan mode and the test loop (Stage 8), token/time/cost budgets and LOCKED (Stage 14), retries, session write-back (Stage 10).
 
 Tests: `cargo test -p nixxa-controller`. The fakes live in `tests/controller.rs` because the
 controller may depend only on `contracts`.

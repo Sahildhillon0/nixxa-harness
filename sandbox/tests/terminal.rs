@@ -16,7 +16,7 @@ use nixxa_contracts::{
 };
 use nixxa_sandbox::bwrap::BwrapSandbox;
 
-use common::{Scratch, exec, run, sandbox, sh, sh_out};
+use common::{Scratch, exec, policy_sandbox, run, sh, sh_out};
 
 const SIZE: TerminalSize = TerminalSize { cols: 120, rows: 40 };
 
@@ -112,7 +112,7 @@ async fn start(sb: &BwrapSandbox, command: &str) -> JobId {
 #[tokio::test]
 async fn the_terminal_runs_in_the_same_sandbox() {
     let scratch = Scratch::new("term-same");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut term = Term::open(&sb).await;
     term.type_line("echo from-the-user > made-in-terminal.txt").await;
     let shown = term.run("pwd; hostname; cat made-in-terminal.txt").await;
@@ -128,7 +128,7 @@ async fn the_terminal_runs_in_the_same_sandbox() {
 #[tokio::test]
 async fn the_terminal_survives_everything_the_agent_does() {
     let scratch = Scratch::new("term-survives");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut term = Term::open(&sb).await;
     term.run("KEPT=since-the-start").await;
 
@@ -159,7 +159,7 @@ async fn the_terminal_survives_everything_the_agent_does() {
 #[tokio::test]
 async fn closing_kills_the_terminals_whole_tree_and_nothing_else() {
     let scratch = Scratch::new("term-close");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let job = start(&sb, "sleep 411").await;
     let mut term = Term::open(&sb).await;
     // A child, a grandchild in a new session, and one that ignores hangups.
@@ -182,7 +182,7 @@ async fn closing_kills_the_terminals_whole_tree_and_nothing_else() {
 #[tokio::test]
 async fn closing_kills_the_tree_itself_not_the_orphan_sweep() {
     let scratch = Scratch::new("term-close-now");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut term = Term::open(&sb).await;
     // In a new session and holding nothing of the terminal: nothing about the terminal ending
     // waits for it.
@@ -201,7 +201,7 @@ async fn closing_kills_the_tree_itself_not_the_orphan_sweep() {
 #[tokio::test]
 async fn exit_and_reset_close_it_with_a_reason() {
     let scratch = Scratch::new("term-exit");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut term = Term::open(&sb).await;
     term.type_line("exit 5").await;
     assert_eq!(term.closed().await, "the shell exited with code 5");
@@ -214,7 +214,7 @@ async fn exit_and_reset_close_it_with_a_reason() {
 #[tokio::test]
 async fn daemon_death_closes_it_with_a_reason() {
     let scratch = Scratch::new("term-daemon");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut term = Term::open(&sb).await;
     term.run("true").await;
     // PID 2 is the daemon.
@@ -228,7 +228,7 @@ async fn daemon_death_closes_it_with_a_reason() {
 #[tokio::test]
 async fn one_terminal_at_a_time() {
     let scratch = Scratch::new("term-one");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let _term = Term::open(&sb).await;
     let second = sb.open_terminal(SIZE).await;
     assert!(
@@ -241,7 +241,7 @@ async fn one_terminal_at_a_time() {
 #[tokio::test]
 async fn the_agent_cannot_see_the_terminal() {
     let scratch = Scratch::new("term-agent");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut events = sb.subscribe();
     let mut term = Term::open(&sb).await;
     term.run("sleep 1 & wait").await;
@@ -270,7 +270,7 @@ async fn the_agent_cannot_see_the_terminal() {
 #[tokio::test]
 async fn the_terminals_requests_are_its_own_never_the_agents() {
     let scratch = Scratch::new("term-net");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     sb.set_network(NetworkPolicy::Allow(vec![DomainRule::parse("crates.io").unwrap()])).await.unwrap();
     let mut events = sb.subscribe();
     let mut term = Term::open(&sb).await;
@@ -296,7 +296,7 @@ async fn the_terminals_requests_are_its_own_never_the_agents() {
 #[tokio::test]
 async fn the_terminal_has_no_secret_environment_and_no_host_files() {
     let scratch = Scratch::new("term-secrets");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let secret = "nixxa-terminal-canary-51e7";
     std::fs::create_dir_all(scratch.base.join("outside")).unwrap();
     let outside = scratch.base.join("outside/canary.txt");
@@ -325,7 +325,7 @@ async fn the_terminal_has_no_secret_environment_and_no_host_files() {
 #[tokio::test]
 async fn the_agent_cannot_plant_start_up_files_or_read_the_history() {
     let scratch = Scratch::new("term-home");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     // The review's probe: start-up files in the commands' home that would log every line typed.
     let plant = "for f in .bash_profile .bash_login .profile .bashrc .bash_logout; do \
                  printf '%s\\n' 'PROMPT_COMMAND=\"history 1 >> /tmp/keys\"; echo planted > /tmp/planted' > \"$HOME/$f\"; done; \
@@ -357,7 +357,7 @@ async fn the_agent_cannot_plant_start_up_files_or_read_the_history() {
 #[tokio::test]
 async fn the_agents_commands_cannot_reach_the_terminal() {
     let scratch = Scratch::new("term-reach");
-    let Some(sb) = sandbox(&scratch.workspace()) else { return };
+    let Some(sb) = policy_sandbox(&scratch.workspace()).await else { return };
     let mut term = Term::open(&sb).await;
     let shown = term.run("echo \"pts=$(tty) shell=$$\"").await;
     let (pts, shell) = (value(&shown, "pts"), value(&shown, "shell"));

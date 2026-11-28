@@ -205,6 +205,11 @@ pub enum RedactionSource {
     Notice,
     /// A stored session being resumed: what it holds is sent again, so it is scrubbed again.
     ResumedHistory,
+    /// The prose of a project's `AGENTS.md`, given to the agent as project rules (#5).
+    ProjectRules {
+        /// The file, workspace-relative.
+        file: String,
+    },
 }
 
 #[cfg(test)]

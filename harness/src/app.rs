@@ -23,6 +23,7 @@ use nixxa_contracts::{AccountInfo, AuthMethod, NetworkAccess, NetworkPolicy, San
 use crate::network::{self, Mode, NetworkPanel, PanelKey};
 use crate::notify::{Alert, Channels, Finished, Notifications};
 use crate::place::{Place, PlacePicker};
+use crate::policy_view::{Pending, PolicyKey, PolicyView};
 use crate::sessions::{ListKey, SessionList};
 use crate::setup::Setup;
 use crate::terminal::{self, PaneKey, TerminalPane};
@@ -124,7 +125,17 @@ fn redaction_from(source: &RedactionSource) -> String {
         RedactionSource::ActionResult { action } => format!("the result of action {action}"),
         RedactionSource::Notice => "a note from Nixxa".into(),
         RedactionSource::ResumedHistory => "the resumed session's history".into(),
+        RedactionSource::ProjectRules { file } => format!("the project rules in `{file}`"),
     }
+}
+
+/// The hosts a policy asks for, with where each request came from, for the network panel.
+fn requested_hosts(policy: &nixxa_contracts::ProjectPolicy) -> Vec<(nixxa_contracts::DomainRule, String)> {
+    policy
+        .network
+        .iter()
+        .filter_map(|rule| Some((nixxa_contracts::DomainRule::parse(&rule.pattern).ok()?, rule.source.to_string())))
+        .collect()
 }
 
 /// Whether a character key types its character. A ctrl shortcut doesn't, except ctrl+alt:
@@ -172,6 +183,14 @@ pub(crate) enum Effect {
     TerminalInput(Vec<u8>),
     /// Ask the sandbox what changed since this checkpoint, for the undo view.
     UndoDiff(nixxa_contracts::CheckpointId),
+    /// Read the policy files again, to see whether they changed (#5).
+    ReadPolicy,
+    /// Put the policy change the user accepted in force: tell the controller and, when the
+    /// protected paths changed (`remount`), the sandbox.
+    AcceptPolicy {
+        pending: Box<Pending>,
+        remount: bool,
+    },
 }
 
 /// Everything the TUI shows.
@@ -223,6 +242,8 @@ pub(crate) struct App {
     pub(crate) sessions: Option<SessionList>,
     /// The network settings (`ctrl+n`) and the recent requests.
     pub(crate) network: NetworkPanel,
+    /// The policy in force and where each rule came from (`ctrl+p`, #5).
+    pub(crate) policy: PolicyView,
     /// The user's terminal (`ctrl+t`).
     pub(crate) terminal: TerminalPane,
     /// Job ends and wake-ups, each with how many actions came before it (where it goes in the
@@ -280,6 +301,7 @@ impl App {
             root: PathBuf::new(),
             sessions: None,
             network: NetworkPanel::default(),
+            policy: PolicyView::default(),
             terminal: TerminalPane::default(),
             happenings: Vec::new(),
             notifications: Notifications::new(Channels::default(), Instant::now()),
@@ -822,11 +844,19 @@ impl App {
         if self.network.open {
             return self.network_key(key);
         }
+        if self.policy.open {
+            return self.policy_key(key);
+        }
         if self.undo.is_some() {
             return self.undo_key(key);
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('z') {
             return self.open_undo();
+        }
+        // Over an approval prompt too: the rule behind it may be the answer.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('p') {
+            self.policy.open = true;
+            return vec![Effect::ReadPolicy];
         }
         // Over an approval prompt too: allowing a host may be the answer to it.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('n') {
@@ -902,6 +932,84 @@ impl App {
                 vec![Effect::Resume(id)]
             }
         }
+    }
+
+    fn policy_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        let before: Vec<String> = self.policy.policy.protect.iter().map(|r| r.pattern.clone()).collect();
+        match self.policy.key(key) {
+            PolicyKey::Accept => match self.policy.accept() {
+                Some(pending) => {
+                    self.network.requested = requested_hosts(&pending.policy);
+                    let after: Vec<String> = pending.policy.protect.iter().map(|r| r.pattern.clone()).collect();
+                    vec![Effect::AcceptPolicy { pending: Box::new(pending), remount: before != after }]
+                }
+                None => Vec::new(),
+            },
+            PolicyKey::Nothing | PolicyKey::Close => Vec::new(),
+        }
+    }
+
+    /// The policy in force when the workplace was set up (#5): what the sandbox keeps, the
+    /// files that couldn't be read (said loudly), and the network the project asks for.
+    pub(crate) fn policy_in_force(
+        &mut self,
+        sources: crate::policy::Sources,
+        protection: Option<Result<nixxa_contracts::Protection, String>>,
+    ) {
+        let policy = sources.policy();
+        for problem in &policy.problems {
+            self.note(format!(
+                "✗ Policy problem, {}: {}. Until it's fixed, every action asks, even in Auto (ctrl+p shows the policy).",
+                problem.source, problem.message
+            ));
+        }
+        let files = sources.project.len() + usize::from(sources.user.is_some());
+        if files > 0 && policy.problems.is_empty() {
+            let protect = policy.protect.len();
+            let kept = match &protection {
+                Some(Ok(p)) if p.how == nixxa_contracts::ProtectionKind::ReadOnlyMounts => "read-only in the sandbox",
+                _ if protect > 0 => "refused at the gate only: commands here can still change them",
+                _ => "",
+            };
+            let paths = if protect > 0 { format!(", {protect} protected path rule(s), {kept}") } else { String::new() };
+            self.note(format!("Project policy read from {files} file(s){paths}. ctrl+p shows it."));
+        }
+        if !policy.network.is_empty() {
+            self.note(format!(
+                "The project asks for network access to {}. Nothing is allowed unless you choose to (ctrl+n, then r).",
+                policy.network.iter().map(|r| r.pattern.clone()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        self.network.requested = requested_hosts(&policy);
+        self.policy.sources = sources;
+        self.policy.policy = policy;
+        self.policy.protection = protection;
+    }
+
+    /// The policy files as read just now: a change waits for the user.
+    pub(crate) fn policy_read(&mut self, sources: crate::policy::Sources) {
+        if let Some(pending) = self.policy.offer(sources) {
+            let changes = pending.changes.join("; ");
+            self.note(format!(
+                "A policy file changed ({changes}). It isn't in force: ctrl+p to look, then y to accept or n to keep the \
+                 policy as it is."
+            ));
+        }
+    }
+
+    /// The sandbox applied the accepted policy's protected paths, or couldn't.
+    pub(crate) fn protected(&mut self, result: Result<nixxa_contracts::Protection, String>, restarted: bool) {
+        match &result {
+            Ok(_) if restarted => self.note(
+                "The new policy is in force. The sandbox restarted to apply the protected paths: its jobs and the \
+                 terminal ended.",
+            ),
+            Ok(_) => self.note("The new policy is in force."),
+            Err(why) => {
+                self.note(format!("The new policy is in force at the gate; the sandbox couldn't apply it: {why}."))
+            }
+        }
+        self.policy.protection = Some(result);
     }
 
     fn network_key(&mut self, key: KeyEvent) -> Vec<Effect> {

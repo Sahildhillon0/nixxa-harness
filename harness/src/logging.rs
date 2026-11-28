@@ -168,6 +168,7 @@ fn source_kind(source: &RedactionSource) -> &'static str {
         RedactionSource::ActionResult { .. } => "action-result",
         RedactionSource::Notice => "notice",
         RedactionSource::ResumedHistory => "resumed-history",
+        RedactionSource::ProjectRules { .. } => "project-rules",
     }
 }
 

@@ -36,6 +36,11 @@ pub(crate) enum UiEvent {
     Sandbox(nixxa_contracts::SandboxEvent),
     /// What changed since a checkpoint, for the undo view, or why it couldn't be told.
     UndoDiff { checkpoint: nixxa_contracts::CheckpointId, result: Result<nixxa_contracts::WorkspaceDiff, String> },
+    /// The policy files, read again (#5).
+    PolicyRead(crate::policy::Sources),
+    /// The sandbox applied an accepted policy's protected paths (restarting to mount them), or
+    /// why not.
+    Protected { result: Result<nixxa_contracts::Protection, String>, restarted: bool },
 }
 
 /// Which session the UI shows. Each controller's sink is tied to the generation it was made in;

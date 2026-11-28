@@ -35,7 +35,7 @@ Replace one, and the rest never notice.
 > finishes, the agent is told, and if it was waiting it carries on by itself; if you're away, a
 > desktop notification and the bell say so.
 >
-> **Stage 7 — Safe edits: in progress.** The agent edits files with **patches** against the
+> **Stage 7 — Safe edits: done.** The agent edits files with **patches** against the
 > version it read: an edit made on a stale read fails instead of overwriting newer changes. Before every
 > edit and command, and at the start of every turn, Nixxa takes a **checkpoint** of the
 > workspace; **`/undo`** (or `ctrl-z`) shows what going back would change, and restores it, also
@@ -44,6 +44,13 @@ Replace one, and the rest never notice.
 > reads, command and job output, notes) are replaced by placeholders such as
 > `‹secret:aws-access-key#3f2a›`, and what's saved is the redacted form; you see each one, and
 > can send one of your own as it is, explicitly. Reading `.env` and the like asks even in Auto.
+> A repository's **`AGENTS.md`** gives the agent the project's rules in words, and a
+> ` ```nixxa-policy ` block of rules Nixxa enforces: `protect = ["migrations/**"]` refuses any
+> edit there before you're even asked, and in the sandbox mounts the folder read-only so no
+> command (`rm -rf`, `mv`) can change it either. A repository can only make Nixxa stricter: it
+> can't turn the network on (the hosts it asks for are a request you see in `ctrl+n`), raise a
+> budget, turn on Auto or drop a rule from your own `policy.toml`. If the agent edits `AGENTS.md`,
+> nothing changes until you accept it in `ctrl+p`, which shows every rule and where it came from.
 
 ---
 
@@ -131,7 +138,7 @@ criteria (see [ARCHITECTURE.md § Stages](ARCHITECTURE.md#stages)).
 | 4 | Real sandbox | Out-of-process isolated sandbox on Linux (bubblewrap + Landlock + seccomp) | done |
 | 5 | Real memory | SQLite store, session resume, transcript search | done |
 | 6 | Working in the sandbox | **Network allowlist** through a logging host-side proxy (crates.io, npm, PyPI…, or open), the **`ctrl+t` terminal**, background jobs and notifications | **done** |
-| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | **in progress** (patches and undo, secret redaction done) |
+| 7 | Safe edits | **Patch** action and **undo** (checkpoints), **secret redaction**, the **`AGENTS.md`** project policy | **done** |
 | 8 | Plan mode & verify loop | Approve a whole **plan** (dry run) instead of each step; the **test/lint loop** within a budget | planned |
 | 9 | Code intelligence | **LSP diagnostics**, a **repo map**, **CodeGraph** + **Context7** | planned |
 | 10 | Knowledge — personal | MCP client, **Obsidian vault** + **claude-mem**, cross-OS discovery, session write-back | planned |

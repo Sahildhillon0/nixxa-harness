@@ -14,9 +14,9 @@ Linux, macOS and Windows. See
 
 ## Current stage
 
-**Stage 7 — Safe edits: in progress.** Stage 6 is done.
+**Stage 7 — Safe edits: done.** Next: Stage 8 (plan mode and the verify loop).
 
-**Stage 7 so far:**
+**Stage 7:**
 - PR A, patches and undo: `SandboxAction::Patch` against the file's SHA-256 (the `edit_file`
   tool), all edits or none, never through a link, in every backend (D-070); checkpoints in a
   content-addressed store on the host, outside the workspace, with a cap, a fixed list of build
@@ -28,7 +28,13 @@ Linux, macOS and Windows. See
   from `accounts` (D-075); cuts to fit the sandbox's caps that never split a token; reading
   `.env` and the like asks even in Auto (D-076); the message's secrets shown before sending,
   `alt+1`…`alt+9` to send one as it is, and a warning per redaction (D-077).
-- Next: PR C, the `AGENTS.md` policy (#5).
+- PR C, the `AGENTS.md` policy: the fenced `nixxa-policy` block of `AGENTS.md`, read on the
+  host as untrusted input (never through a link, capped, sanitised; a broken block makes every
+  action ask) and its prose given to the agent as labelled project rules (D-078); layered with
+  the user's `policy.toml` so the strictest wins, a changed file waiting for the user (D-079);
+  the gate refusing writes to protected paths and refused commands before any approval, and
+  `Sandbox::protect` mounting protected paths and their parents read-only (D-080); the `ctrl+p`
+  view (D-081).
 
 **Stage 6 — Working in the sandbox: done.** Stage 3's Anthropic live checks are still
 pending. The roadmap was re-planned on 2026-11-23 (D-060): see ARCHITECTURE.md §11 for where each

@@ -7,6 +7,11 @@
 //! of the host is mounted: no home directory, `/run/user`, D-Bus, keyring, X11 or Wayland
 //! sockets, `/sys` or host `/tmp`.
 //!
+//! Paths the project policy protects (#5, D-080) are bound read-only over themselves inside
+//! the workspace, and each directory above one is bound over itself too: a mount point can't be
+//! renamed or removed, so neither the path nor a parent of it can be moved away. New rules
+//! restart the daemon, since mounts are fixed when it starts.
+//!
 //! When the user's systemd instance can create scopes (cgroup v2 delegation), the whole sandbox
 //! runs in a transient scope (`systemd-run --user --scope`) with `MemoryMax`, `MemorySwapMax=0`
 //! and `TasksMax`. Otherwise only the per-process rlimits apply, and the backend name says so.
@@ -43,9 +48,9 @@ use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 
 use nixxa_contracts::{
-    ActionId, CheckpointId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, Outcome, Sandbox,
-    SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent, Terminal, TerminalEvent,
-    TerminalSize, WorkspaceDiff,
+    ActionId, CheckpointId, JobId, NetworkAccess, NetworkPolicy, Observation, OpenTerminal, Outcome, Protection,
+    ProtectionKind, Sandbox, SandboxAction, SandboxActionKind, SandboxCapabilities, SandboxError, SandboxEvent,
+    Terminal, TerminalEvent, TerminalSize, WorkspaceDiff,
 };
 
 use crate::JobLimits;
@@ -222,6 +227,8 @@ struct Inner {
     generation: AtomicU64,
     /// The last id given to a terminal.
     terminals: AtomicU64,
+    /// The protected-path rules, and the paths they kept read-only when given (#5).
+    protected: StdMutex<(crate::protect::Rules, Vec<(String, PathBuf)>)>,
 }
 
 type Jobs = Arc<StdMutex<HashMap<JobId, Instant>>>;
@@ -295,6 +302,7 @@ impl BwrapSandbox {
                 proxy,
                 generation: AtomicU64::new(0),
                 terminals: AtomicU64::new(0),
+                protected: StdMutex::default(),
             }),
         })
     }
@@ -403,11 +411,38 @@ impl Inner {
         // can't plant start-up files there or read its history.
         args.extend(["--tmpfs".into(), TERMINAL_HOME.into(), "--bind".into()]);
         args.extend([host_str(&self.workspace), "/workspace".into(), "--chdir".into(), "/workspace".into()]);
+        args.extend(self.protected_mounts());
         args.extend(["--ro-bind".into(), host_str(&self.daemon), DAEMON_INSIDE.into()]);
         if let Some(dir) = self.proxy.dir() {
             args.extend(["--ro-bind".into(), host_str(dir), PROXY_INSIDE.into()]);
         }
         args.push(DAEMON_INSIDE.into());
+        args
+    }
+
+    /// The mounts that keep protected paths (#5): each directory above one bound over itself,
+    /// shallowest first, so it can't be renamed or removed; then each path read-only. `-try`,
+    /// because a path removed on the host since the rules were given has nothing to keep.
+    fn protected_mounts(&self) -> Vec<String> {
+        let protected = self.protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut pinned: Vec<String> = Vec::new();
+        for (rel, _) in &protected.1 {
+            let parts: Vec<&str> = rel.split('/').collect();
+            for depth in 1..parts.len() {
+                let above = parts[..depth].join("/");
+                if !pinned.contains(&above) {
+                    pinned.push(above);
+                }
+            }
+        }
+        let mut args = Vec::new();
+        for above in pinned {
+            let host = host_str(&self.workspace.join(&above));
+            args.extend(["--bind-try".into(), host, format!("/workspace/{above}")]);
+        }
+        for (rel, host) in &protected.1 {
+            args.extend(["--ro-bind-try".into(), host_str(host), format!("/workspace/{rel}")]);
+        }
         args
     }
 
@@ -871,6 +906,13 @@ impl Sandbox for BwrapSandbox {
                 let message = format!("the patch is too large (its edits pass {} bytes)", config.file_cap);
                 return Ok(Observation::failed(id, message));
             }
+            SandboxAction::WriteFile { path, .. } | SandboxAction::Patch { path, .. } => {
+                let refused = self.inner.protected.lock().map(|p| p.0.refuse(&self.inner.workspace, path));
+                if let Ok(Some(why)) = refused {
+                    return Ok(Observation::failed(id, why));
+                }
+                (QUICK_TIMEOUT, false)
+            }
             _ => (QUICK_TIMEOUT, false),
         };
         let _turn = if foreground { Some(self.inner.foreground.lock().await) } else { None };
@@ -899,6 +941,26 @@ impl Sandbox for BwrapSandbox {
             Reply::Done => Ok(()),
             other => Err(SandboxError::Unavailable(format!("unexpected answer to a ping: {other:?}"))),
         }
+    }
+
+    /// Works out the read-only mounts, then restarts a running daemon so they apply: its jobs
+    /// and the user's terminal end with it (D-080).
+    async fn protect(&self, rules: Vec<String>) -> Result<Protection, SandboxError> {
+        let root = self.inner.workspace.clone();
+        let walked = rules.clone();
+        let plan =
+            tokio::task::spawn_blocking(move || crate::protect::plan(&root, &walked, ProtectionKind::ReadOnlyMounts))
+                .await
+                .map_err(|err| SandboxError::Other(format!("looking for protected paths failed: {err}")))?;
+        let rules = crate::protect::Rules::new(rules);
+        if let Some(checkpoints) = &self.inner.checkpoints {
+            checkpoints.set_protected(rules.clone());
+        }
+        *self.inner.protected.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = (rules, plan.kept);
+        if let Some(conn) = self.inner.current().await {
+            self.inner.discard(&conn).await;
+        }
+        Ok(plan.protection)
     }
 
     async fn reset(&self) -> Result<(), SandboxError> {
